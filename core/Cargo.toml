@@ -42,6 +42,28 @@ chrono = { version = "0.4", features = ["serde"] }
 # Error handling
 thiserror = "2"
 
+# WASM bindings (optional, enabled for browser builds)
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+
+[features]
+default = []
+wasm = ["wasm-bindgen", "js-sys", "getrandom_02/js", "getrandom/wasm_js"]
+
+# Need both getrandom versions with JS support for WASM
+[dependencies.getrandom_02]
+version = "0.2"
+optional = true
+package = "getrandom"
+
+[dependencies.getrandom]
+version = "0.3"
+optional = true
+
+[dependencies.base64ct]
+version = "1"
+features = ["alloc"]
+
 [dev-dependencies]
 # For test assertions
 assert_matches = "1.5"

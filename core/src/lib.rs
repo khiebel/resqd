@@ -8,3 +8,6 @@ pub mod crypto;
 pub mod erasure;
 pub mod canary;
 pub mod error;
+
+#[cfg(feature = "wasm")]
+pub mod wasm;
