@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RESQD Alpha — Internal Planning Portal</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --bg: #0a0e1a;
+            --card: rgba(15, 20, 40, 0.9);
+            --blue: #00d4ff;
+            --purple: #7c3aed;
+            --text: #e2e8f0;
+            --dim: #94a3b8;
+            --border: rgba(0, 212, 255, 0.15);
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            padding: 40px 20px;
+        }
+        .container { max-width: 900px; margin: 0 auto; }
+        h1 {
+            font-size: 28px;
+            margin-bottom: 8px;
+            background: linear-gradient(135deg, #fff, var(--blue));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .subtitle { color: var(--dim); margin-bottom: 40px; font-size: 14px; }
+        .badge {
+            display: inline-block;
+            background: rgba(124,58,237,0.2);
+            border: 1px solid var(--purple);
+            color: var(--purple);
+            padding: 2px 10px;
+            border-radius: 12px;
+            font-size: 11px;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            margin-left: 12px;
+        }
+        .section {
+            margin-bottom: 36px;
+        }
+        .section h2 {
+            font-size: 18px;
+            color: var(--blue);
+            margin-bottom: 16px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--border);
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+            gap: 16px;
+        }
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 20px;
+            transition: border-color 0.2s, transform 0.2s;
+            text-decoration: none;
+            color: var(--text);
+            display: block;
+        }
+        .card:hover {
+            border-color: var(--blue);
+            transform: translateY(-2px);
+        }
+        .card-icon { font-size: 24px; margin-bottom: 10px; }
+        .card h3 { font-size: 15px; margin-bottom: 6px; color: #fff; }
+        .card p { font-size: 13px; color: var(--dim); }
+        .card .tag {
+            display: inline-block;
+            font-size: 10px;
+            padding: 2px 8px;
+            border-radius: 8px;
+            margin-top: 10px;
+            letter-spacing: 0.5px;
+        }
+        .tag-pdf { background: rgba(255,100,100,0.15); color: #ff6464; }
+        .tag-md { background: rgba(100,255,100,0.15); color: #64ff64; }
+        .tag-audio { background: rgba(100,100,255,0.15); color: #6464ff; }
+        .tag-web { background: rgba(255,200,100,0.15); color: #ffc864; }
+        .status {
+            margin-top: 40px;
+            padding: 20px;
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            font-size: 13px;
+        }
+        .status h3 { color: var(--blue); margin-bottom: 10px; }
+        .status ul { list-style: none; padding: 0; }
+        .status li { padding: 4px 0; color: var(--dim); }
+        .status li::before { content: "- "; color: var(--blue); }
+        audio {
+            width: 100%;
+            margin-top: 12px;
+            border-radius: 8px;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>RESQD Alpha Portal <span class="badge">Internal</span></h1>
+    <p class="subtitle">Planning documents, strategy, and project materials — resqd.ai</p>
+
+    <div class="section">
+        <h2>Strategy Documents</h2>
+        <div class="grid">
+            <a href="/alpha/docs/RESQD-Marketing-Strategy.pdf" class="card">
+                <div class="card-icon">&#x1f4ca;</div>
+                <h3>Marketing Strategy</h3>
+                <p>Brand positioning, messaging framework, launch strategy, channel plan, pricing, growth metrics, visual identity.</p>
+                <span class="tag tag-pdf">PDF</span>
+            </a>
+            <a href="/alpha/docs/RESQD-User-Personas.pdf" class="card">
+                <div class="card-icon">&#x1f465;</div>
+                <h3>User Personas & Segments</h3>
+                <p>8 detailed personas, feature priority matrix, beta acquisition strategy, persona prioritization.</p>
+                <span class="tag tag-pdf">PDF</span>
+            </a>
+            <a href="/alpha/docs/beta-strategy.md" class="card">
+                <div class="card-icon">&#x1f680;</div>
+                <h3>Beta User Strategy</h3>
+                <p>How to find 100 beta testers across segments. Channels, outreach templates, community targets.</p>
+                <span class="tag tag-md">Markdown</span>
+            </a>
+            <a href="/alpha/docs/platform-strategy.md" class="card">
+                <div class="card-icon">&#x1f4f1;</div>
+                <h3>Platform Availability</h3>
+                <p>Web, iOS, Android, Desktop, browser extension, MCP, bank integrations. Requirements and timeline.</p>
+                <span class="tag tag-md">Markdown</span>
+            </a>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Technical Documents</h2>
+        <div class="grid">
+            <a href="/alpha/docs/test-plan.md" class="card">
+                <div class="card-icon">&#x1f9ea;</div>
+                <h3>Test Plan</h3>
+                <p>Unit, integration, security, performance, E2E, and chaos tests. Full test case IDs and file structure.</p>
+                <span class="tag tag-md">Markdown</span>
+            </a>
+            <a href="/alpha/docs/architecture.md" class="card">
+                <div class="card-icon">&#x1f3d7;</div>
+                <h3>Architecture Overview</h3>
+                <p>Rust core, WASM, multi-cloud erasure coding, blockchain, canary system, key management.</p>
+                <span class="tag tag-md">Markdown</span>
+            </a>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Marketing Assets</h2>
+        <div class="grid">
+            <div class="card">
+                <div class="card-icon">&#x1f399;</div>
+                <h3>Pitch Podcast</h3>
+                <p>"Why Your Digital Life Needs a Quantum Vault" — 8-minute pitch covering the problem, solution, and differentiator.</p>
+                <audio controls src="/assets/resqd-pitch.mp3"></audio>
+                <span class="tag tag-audio">MP3</span>
+            </div>
+            <a href="/" class="card">
+                <div class="card-icon">&#x1f310;</div>
+                <h3>Landing Page</h3>
+                <p>Stealth mode landing page with waitlist. Live at resqd.ai.</p>
+                <span class="tag tag-web">Live</span>
+            </a>
+            <a href="/alpha/podcast-script.md" class="card">
+                <div class="card-icon">&#x1f4dd;</div>
+                <h3>Podcast Script</h3>
+                <p>Full script for the pitch podcast. Use for video narration or investor meetings.</p>
+                <span class="tag tag-md">Markdown</span>
+            </a>
+        </div>
+    </div>
+
+    <div class="status">
+        <h3>Project Status — April 2026</h3>
+        <ul>
+            <li>Domain: resqd.ai registered (Cloudflare)</li>
+            <li>Rust crypto core: 41 tests passing (BLAKE3, XChaCha20, ML-KEM-768, canary, erasure coding)</li>
+            <li>WASM build: 259KB browser module with TypeScript types</li>
+            <li>GCP: Account active, service account created, pending WIF setup</li>
+            <li>Next: Multi-cloud storage layer, Base L2 smart contract, Next.js frontend</li>
+            <li>Timeline: 12-week MVP (3 months to functional web app)</li>
+        </ul>
+    </div>
+</div>
+</body>
+</html>
