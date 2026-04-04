@@ -1,0 +1,50 @@
+[package]
+name = "resqd-core"
+version = "0.1.0"
+edition = "2024"
+description = "Quantum-hardened cryptographic core for RESQD digital vault"
+license = "AGPL-3.0"
+
+[dependencies]
+# Hashing — BLAKE3 (patent-distinct from SHA-256)
+blake3 = "1"
+
+# AEAD encryption — XChaCha20-Poly1305 (patent-distinct from AES-256-CBC)
+chacha20poly1305 = "0.10"
+
+# Post-quantum key encapsulation — ML-KEM-768 (patent-distinct from RSA)
+ml-kem = { version = "0.2", features = ["std"] }
+hybrid-array = "0.2"
+
+# Post-quantum signatures — ML-DSA-65
+# ml-dsa not yet stable — add when 0.1.0 releases
+# ml-dsa = { version = "0.1.0-rc.8", features = ["std"] }
+
+# Key derivation
+argon2 = "0.5"
+
+# Erasure coding — Reed-Solomon
+reed-solomon-erasure = "6"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Random number generation
+rand = "0.9"
+
+# Hex encoding for display
+hex = "0.4"
+
+# Timestamps
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "2"
+
+[dev-dependencies]
+# For test assertions
+assert_matches = "1.5"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
