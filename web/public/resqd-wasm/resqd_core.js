@@ -334,7 +334,129 @@ export function kem_generate() {
         wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
     }
 }
-const import1 = { now: () => Date.now() }; // patched: env shim for browser
+
+/**
+ * Generate a fresh X25519 identity keypair. Returns
+ * `{"public_b64": "...", "private_b64": "..."}`. The caller is
+ * responsible for sealing the private half under the master key before
+ * persisting anywhere.
+ * @returns {string}
+ */
+export function x25519_generate_identity() {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        const ret = wasm.x25519_generate_identity();
+        var ptr1 = ret[0];
+        var len1 = ret[1];
+        if (ret[3]) {
+            ptr1 = 0; len1 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred2_0 = ptr1;
+        deferred2_1 = len1;
+        return getStringFromWasm0(ptr1, len1);
+    } finally {
+        wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+    }
+}
+
+/**
+ * Derive the public half from a private X25519 scalar. Used by
+ * `resqd-recover` to verify a recovery kit's public key matches the
+ * sealed private key.
+ * @param {string} private_b64
+ * @returns {string}
+ */
+export function x25519_public_from_private(private_b64) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const ptr0 = passStringToWasm0(private_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.x25519_public_from_private(ptr0, len0);
+        var ptr2 = ret[0];
+        var len2 = ret[1];
+        if (ret[3]) {
+            ptr2 = 0; len2 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred3_0 = ptr2;
+        deferred3_1 = len2;
+        return getStringFromWasm0(ptr2, len2);
+    } finally {
+        wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
+ * Recipient-side mirror of [`x25519_sender_wrap_key`]. Returns the same
+ * 32-byte value that the sender computed (ECDH is symmetric).
+ * @param {string} recipient_private_b64
+ * @param {string} sender_public_b64
+ * @param {string} asset_id
+ * @returns {string}
+ */
+export function x25519_recipient_wrap_key(recipient_private_b64, sender_public_b64, asset_id) {
+    let deferred5_0;
+    let deferred5_1;
+    try {
+        const ptr0 = passStringToWasm0(recipient_private_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(sender_public_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(asset_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.x25519_recipient_wrap_key(ptr0, len0, ptr1, len1, ptr2, len2);
+        var ptr4 = ret[0];
+        var len4 = ret[1];
+        if (ret[3]) {
+            ptr4 = 0; len4 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred5_0 = ptr4;
+        deferred5_1 = len4;
+        return getStringFromWasm0(ptr4, len4);
+    } finally {
+        wasm.__wbindgen_free(deferred5_0, deferred5_1, 1);
+    }
+}
+
+/**
+ * Sender-side: derive the wrap key used to encrypt a per-asset key for
+ * a specific recipient and asset. Asset id is mixed in as HKDF `info`
+ * so each (sender, recipient, asset) triple gets a domain-separated
+ * wrap key.
+ * @param {string} sender_private_b64
+ * @param {string} recipient_public_b64
+ * @param {string} asset_id
+ * @returns {string}
+ */
+export function x25519_sender_wrap_key(sender_private_b64, recipient_public_b64, asset_id) {
+    let deferred5_0;
+    let deferred5_1;
+    try {
+        const ptr0 = passStringToWasm0(sender_private_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(recipient_public_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(asset_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.x25519_sender_wrap_key(ptr0, len0, ptr1, len1, ptr2, len2);
+        var ptr4 = ret[0];
+        var len4 = ret[1];
+        if (ret[3]) {
+            ptr4 = 0; len4 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred5_0 = ptr4;
+        deferred5_1 = len4;
+        return getStringFromWasm0(ptr4, len4);
+    } finally {
+        wasm.__wbindgen_free(deferred5_0, deferred5_1, 1);
+    }
+}
+import * as import1 from "env"
 
 function __wbg_get_imports() {
     const import0 = {

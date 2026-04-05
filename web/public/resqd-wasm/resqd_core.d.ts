@@ -88,6 +88,35 @@ export function kem_encapsulate(public_key_b64: string): string;
  */
 export function kem_generate(): string;
 
+/**
+ * Generate a fresh X25519 identity keypair. Returns
+ * `{"public_b64": "...", "private_b64": "..."}`. The caller is
+ * responsible for sealing the private half under the master key before
+ * persisting anywhere.
+ */
+export function x25519_generate_identity(): string;
+
+/**
+ * Derive the public half from a private X25519 scalar. Used by
+ * `resqd-recover` to verify a recovery kit's public key matches the
+ * sealed private key.
+ */
+export function x25519_public_from_private(private_b64: string): string;
+
+/**
+ * Recipient-side mirror of [`x25519_sender_wrap_key`]. Returns the same
+ * 32-byte value that the sender computed (ECDH is symmetric).
+ */
+export function x25519_recipient_wrap_key(recipient_private_b64: string, sender_public_b64: string, asset_id: string): string;
+
+/**
+ * Sender-side: derive the wrap key used to encrypt a per-asset key for
+ * a specific recipient and asset. Asset id is mixed in as HKDF `info`
+ * so each (sender, recipient, asset) triple gets a domain-separated
+ * wrap key.
+ */
+export function x25519_sender_wrap_key(sender_private_b64: string, recipient_public_b64: string, asset_id: string): string;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
@@ -107,6 +136,10 @@ export interface InitOutput {
     readonly kem_decapsulate: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly kem_encapsulate: (a: number, b: number) => [number, number, number, number];
     readonly kem_generate: () => [number, number, number, number];
+    readonly x25519_generate_identity: () => [number, number, number, number];
+    readonly x25519_public_from_private: (a: number, b: number) => [number, number, number, number];
+    readonly x25519_recipient_wrap_key: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+    readonly x25519_sender_wrap_key: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly __wbindgen_exn_store: (a: number) => void;
     readonly __externref_table_alloc: () => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;

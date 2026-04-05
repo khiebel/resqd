@@ -21,7 +21,7 @@
  *   re-prompting for biometrics on every asset operation.
  */
 
-import { API_URL } from "./resqdCrypto";
+import { API_URL, getCrypto, base64ToBytes, bytesToBase64 } from "./resqdCrypto";
 
 /** Fixed 32-byte salt for the PRF `eval.first` input. Public by design. */
 export const PRF_SALT = new Uint8Array([
@@ -31,6 +31,8 @@ export const PRF_SALT = new Uint8Array([
 ]);
 
 const MASTER_KEY_STORAGE = "resqd_master_key";
+const X25519_PRIVKEY_STORAGE = "resqd_x25519_privkey";
+const X25519_PUBKEY_STORAGE = "resqd_x25519_pubkey";
 
 export interface SessionUser {
   user_id: string;
@@ -157,6 +159,140 @@ export function loadMasterKey(): Uint8Array | null {
 
 export function clearMasterKey(): void {
   sessionStorage.removeItem(MASTER_KEY_STORAGE);
+  sessionStorage.removeItem(X25519_PRIVKEY_STORAGE);
+  sessionStorage.removeItem(X25519_PUBKEY_STORAGE);
+}
+
+/** Stash the unwrapped X25519 private identity (standard base64). Lives in
+ *  sessionStorage next to the master key so sharing operations don't need
+ *  to re-prompt for biometrics on every action. */
+export function saveX25519Privkey(privB64: string, pubB64: string): void {
+  sessionStorage.setItem(X25519_PRIVKEY_STORAGE, privB64);
+  sessionStorage.setItem(X25519_PUBKEY_STORAGE, pubB64);
+}
+
+export function loadX25519Identity(): { privB64: string; pubB64: string } | null {
+  const priv = sessionStorage.getItem(X25519_PRIVKEY_STORAGE);
+  const pub = sessionStorage.getItem(X25519_PUBKEY_STORAGE);
+  return priv && pub ? { privB64: priv, pubB64: pub } : null;
+}
+
+/**
+ * Ensure the logged-in user has a long-term X25519 identity, and cache
+ * the unwrapped private half in sessionStorage. Called immediately
+ * after every successful passkey ceremony — registration or login —
+ * while the caller still holds the fresh PRF-derived master key in
+ * memory. On return, `loadX25519Identity()` will yield a usable pair.
+ *
+ * Three cases:
+ *
+ * 1. **Existing identity on the server.** Fetch `/auth/me`, unwrap the
+ *    sealed privkey with the master key, stash both halves in session.
+ *
+ * 2. **No identity yet.** Generate a fresh keypair in WASM, seal the
+ *    privkey under the master key via the standard XChaCha20 envelope,
+ *    `PUT /auth/me/identity`. Conditional on server side so a second
+ *    parallel tab racing the same mint will lose with 409 — in that
+ *    case we refetch and use whatever's now on file.
+ *
+ * 3. **Master key doesn't yet wrap the stored privkey** (should never
+ *    happen in practice — would mean the master key rotated, which we
+ *    don't support). Logs a warning and continues without identity.
+ */
+async function ensureIdentity(masterKey: Uint8Array): Promise<void> {
+  try {
+    const crypto = await getCrypto();
+
+    const meResp = await fetch(`${API_URL}/auth/me`, { credentials: "include" });
+    if (!meResp.ok) return;
+    const me = (await meResp.json()) as {
+      pubkey_x25519_b64?: string | null;
+      wrapped_privkey_x25519_b64?: string | null;
+    };
+
+    if (me.pubkey_x25519_b64 && me.wrapped_privkey_x25519_b64) {
+      try {
+        const wrappedJson = atob(me.wrapped_privkey_x25519_b64);
+        const privBytes = crypto.decrypt_data(masterKey, wrappedJson);
+        saveX25519Privkey(bytesToBase64(privBytes), me.pubkey_x25519_b64);
+        return;
+      } catch (e) {
+        console.warn(
+          "stored x25519 privkey does not unwrap under current master key:",
+          e,
+        );
+        return;
+      }
+    }
+
+    // Mint path. `x25519_generate_identity` returns JSON with base64
+    // halves; the public half is uploaded in the clear and the
+    // private half is sealed under the master key first.
+    const identJson = crypto.x25519_generate_identity();
+    const ident = JSON.parse(identJson) as {
+      public_b64: string;
+      private_b64: string;
+    };
+    const privBytes = base64ToBytes(ident.private_b64);
+    const wrappedJson = crypto.encrypt_data(masterKey, privBytes);
+    const wrappedB64 = btoa(wrappedJson);
+
+    const putResp = await fetch(`${API_URL}/auth/me/identity`, {
+      method: "PUT",
+      credentials: "include",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        pubkey_x25519_b64: ident.public_b64,
+        wrapped_privkey_x25519_b64: wrappedB64,
+      }),
+    });
+
+    if (putResp.ok) {
+      saveX25519Privkey(ident.private_b64, ident.public_b64);
+      return;
+    }
+
+    // 409 = we lost a race with another tab. Refetch and use whatever
+    // the server now holds (should be the other tab's keypair, which
+    // is ALSO wrapped under the same master key since master keys are
+    // stable per user, so it unwraps fine here).
+    if (putResp.status === 409) {
+      const meResp2 = await fetch(`${API_URL}/auth/me`, {
+        credentials: "include",
+      });
+      if (meResp2.ok) {
+        const me2 = (await meResp2.json()) as {
+          pubkey_x25519_b64?: string | null;
+          wrapped_privkey_x25519_b64?: string | null;
+        };
+        if (me2.pubkey_x25519_b64 && me2.wrapped_privkey_x25519_b64) {
+          try {
+            const wrappedJson2 = atob(me2.wrapped_privkey_x25519_b64);
+            const privBytes2 = crypto.decrypt_data(masterKey, wrappedJson2);
+            saveX25519Privkey(
+              bytesToBase64(privBytes2),
+              me2.pubkey_x25519_b64,
+            );
+            return;
+          } catch (e) {
+            console.warn("race-winner x25519 privkey does not unwrap:", e);
+          }
+        }
+      }
+      return;
+    }
+
+    console.warn(
+      "x25519 identity mint failed:",
+      putResp.status,
+      await putResp.text(),
+    );
+  } catch (e) {
+    // Identity is optional — a failure here leaves the user able to
+    // use their own vault (master-key crypto is unaffected) but unable
+    // to share. Surface as a console warning only.
+    console.warn("ensureIdentity failed:", e);
+  }
 }
 
 export function isPasskeySupported(): boolean {
@@ -243,7 +379,9 @@ export async function registerWithPasskey(email: string): Promise<SessionUser> {
     }),
   });
   if (!finishResp.ok) throw new Error(await readError(finishResp));
-  return (await finishResp.json()) as SessionUser;
+  const session = (await finishResp.json()) as SessionUser;
+  await ensureIdentity(prfKey);
+  return session;
 }
 
 /** Log in with an existing passkey. */
@@ -289,7 +427,9 @@ export async function loginWithPasskey(email: string): Promise<SessionUser> {
     }),
   });
   if (!finishResp.ok) throw new Error(await readError(finishResp));
-  return (await finishResp.json()) as SessionUser;
+  const session = (await finishResp.json()) as SessionUser;
+  await ensureIdentity(prfKey);
+  return session;
 }
 
 /** Start a conditional-UI sign-in. Runs navigator.credentials.get() with
@@ -349,7 +489,9 @@ export async function loginWithPasskeyConditional(
   if (!cred) return null;
 
   const prfKey = extractPrfKey(cred);
-  if (prfKey) saveMasterKey(prfKey);
+  if (prfKey) {
+    saveMasterKey(prfKey);
+  }
 
   const finishResp = await fetch(`${API_URL}/auth/login/finish_discoverable`, {
     method: "POST",
@@ -361,7 +503,9 @@ export async function loginWithPasskeyConditional(
     }),
   });
   if (!finishResp.ok) return null;
-  return (await finishResp.json()) as SessionUser;
+  const session = (await finishResp.json()) as SessionUser;
+  if (prfKey) await ensureIdentity(prfKey);
+  return session;
 }
 
 export async function fetchMe(): Promise<SessionUser | null> {

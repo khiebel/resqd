@@ -16,6 +16,10 @@ export const hash_commit: (a: number, b: number, c: number, d: number) => [numbe
 export const kem_decapsulate: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const kem_encapsulate: (a: number, b: number) => [number, number, number, number];
 export const kem_generate: () => [number, number, number, number];
+export const x25519_generate_identity: () => [number, number, number, number];
+export const x25519_public_from_private: (a: number, b: number) => [number, number, number, number];
+export const x25519_recipient_wrap_key: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+export const x25519_sender_wrap_key: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
 export const __wbindgen_exn_store: (a: number) => void;
 export const __externref_table_alloc: () => number;
 export const __wbindgen_externrefs: WebAssembly.Table;

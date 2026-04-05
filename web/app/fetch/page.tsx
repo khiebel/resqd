@@ -3,8 +3,13 @@
 import { Suspense, useCallback, useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import Link from "next/link";
-import { getCrypto, bytesToBase64, API_URL } from "../lib/resqdCrypto";
-import { loadMasterKey, fetchMe } from "../lib/passkey";
+import {
+  getCrypto,
+  bytesToBase64,
+  base64ToBytes,
+  API_URL,
+} from "../lib/resqdCrypto";
+import { loadMasterKey, fetchMe, loadX25519Identity } from "../lib/passkey";
 
 type FetchState =
   | { phase: "idle" }
@@ -32,8 +37,17 @@ interface ShardedFetchResponse {
   canary_sequence: number;
   canary_hash_hex: string;
   ttl_seconds: number;
-  /** Present for authed assets — per-asset key sealed under user master. */
+  /**
+   * Role in which the caller is reading this asset. `"owner"` means
+   * the wrapped key is sealed under the caller's master key; `"sharee"`
+   * means it's sealed under the ECDH-derived share wrap key and
+   * `sender_pubkey_x25519_b64` will be present.
+   */
+  role?: "owner" | "sharee";
+  /** Per-asset key — wrapping depends on `role`. */
   wrapped_key_b64?: string;
+  /** For sharee fetches only. */
+  sender_pubkey_x25519_b64?: string;
 }
 
 /** Unwrap the {v:1, name, mime} plaintext frame the upload page writes. */
@@ -120,16 +134,46 @@ function FetchInner() {
         }
 
         // ───────── UNWRAP PER-ASSET KEY ─────────
-        // Legacy assets (pre-auth) have no wrapped key; fall back to the
-        // master key as the direct decryption key for those. New assets
-        // always have a wrapped key that we unseal here.
+        //
+        // Three cases:
+        //
+        // 1. Legacy asset (no wrapped key, owner role implicit) — the
+        //    master key IS the direct decryption key. Pre-auth upload.
+        //
+        // 2. Owner fetch (role === "owner" or unset, wrapped_key_b64
+        //    present) — the wrapped key is sealed under the caller's
+        //    master key. Standard unwrap.
+        //
+        // 3. Sharee fetch (role === "sharee") — the wrapped key is
+        //    sealed under the ECDH-derived share wrap key, NOT the
+        //    master key. Recompute that wrap key from our own X25519
+        //    privkey + the sender's pubkey, mix the asset_id into the
+        //    HKDF info for per-asset domain separation.
         const crypto = await getCrypto();
         let assetKey: Uint8Array;
-        if (manifest.wrapped_key_b64) {
+        if (!manifest.wrapped_key_b64) {
+          assetKey = masterKey;
+        } else if (manifest.role === "sharee") {
+          if (!manifest.sender_pubkey_x25519_b64) {
+            throw new Error("sharee fetch missing sender_pubkey_x25519_b64");
+          }
+          const ident = loadX25519Identity();
+          if (!ident) {
+            throw new Error(
+              "X25519 identity not loaded — log out and back in to establish one",
+            );
+          }
+          const wrapKeyB64 = crypto.x25519_recipient_wrap_key(
+            ident.privB64,
+            manifest.sender_pubkey_x25519_b64,
+            manifest.asset_id,
+          );
+          const wrapKey = base64ToBytes(wrapKeyB64);
+          const wrappedJson = atob(manifest.wrapped_key_b64);
+          assetKey = crypto.decrypt_data(wrapKey, wrappedJson);
+        } else {
           const wrappedJson = atob(manifest.wrapped_key_b64);
           assetKey = crypto.decrypt_data(masterKey, wrappedJson);
-        } else {
-          assetKey = masterKey;
         }
 
         const total = manifest.shards.length;

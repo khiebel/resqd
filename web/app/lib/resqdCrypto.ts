@@ -19,6 +19,32 @@ interface WasmApi {
   erasure_encode: (data: Uint8Array) => string;
   /** Reconstruct original bytes from shards (JSON array of base64|null). */
   erasure_reconstruct: (shards_json: string, original_len: number) => Uint8Array;
+  /**
+   * Generate a fresh long-term X25519 identity keypair. Returns a JSON
+   * string of shape `{"public_b64": "...", "private_b64": "..."}` —
+   * both halves are raw 32-byte scalars encoded as standard base64.
+   * The caller is responsible for sealing the private half under the
+   * master key before sending it to the server.
+   */
+  x25519_generate_identity: () => string;
+  /** Re-derive the X25519 public half from a private scalar (base64). */
+  x25519_public_from_private: (private_b64: string) => string;
+  /**
+   * Sender side: derive the 32-byte wrap key used to seal the per-asset
+   * key for a specific recipient, with per-asset domain separation via
+   * HKDF-SHA256 over the X25519 shared secret. Returns base64.
+   */
+  x25519_sender_wrap_key: (
+    sender_private_b64: string,
+    recipient_public_b64: string,
+    asset_id: string,
+  ) => string;
+  /** Recipient side: mirror of `x25519_sender_wrap_key`. */
+  x25519_recipient_wrap_key: (
+    recipient_private_b64: string,
+    sender_public_b64: string,
+    asset_id: string,
+  ) => string;
 }
 
 /** Shape of the JSON string returned by `erasure_encode`. */
