@@ -183,6 +183,24 @@ export async function registerWithPasskey(email: string): Promise<SessionUser> {
   const begin = await beginResp.json();
 
   const creationOptions = toCreationOptions(begin.creation_options);
+
+  // Force a *discoverable* (resident) credential. webauthn-rs 0.5 defaults
+  // to residentKey: "discouraged" on start_passkey_registration, which
+  // means some platform authenticators create a non-discoverable
+  // credential that can't be surfaced in fresh browser windows or across
+  // devices via iCloud Keychain sync. Forcing "required" here is the
+  // difference between "click a button and your passkey shows up" and
+  // "wait, where did my passkey go".
+  (creationOptions as unknown as {
+    authenticatorSelection: Record<string, unknown>;
+  }).authenticatorSelection = {
+    ...((creationOptions as unknown as {
+      authenticatorSelection?: Record<string, unknown>;
+    }).authenticatorSelection ?? {}),
+    requireResidentKey: true,
+    residentKey: "required",
+  };
+
   // Inject PRF extension. WebAuthn spec says the authenticator returns a
   // symmetric secret derived from `eval.first`; PRF outputs are stable
   // for a given (credential, salt) pair, so this is what gives us a
