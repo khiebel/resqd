@@ -33,14 +33,17 @@
         "dynamodb:PutItem",
         "dynamodb:UpdateItem",
         "dynamodb:DeleteItem",
-        "dynamodb:Query"
+        "dynamodb:Query",
+        "dynamodb:Scan"
       ],
       "Resource": [
         "arn:aws:dynamodb:us-east-1:465457334560:table/resqd-users",
         "arn:aws:dynamodb:us-east-1:465457334560:table/resqd-users/index/*",
         "arn:aws:dynamodb:us-east-1:465457334560:table/resqd-auth-challenges",
         "arn:aws:dynamodb:us-east-1:465457334560:table/resqd-api-tokens",
-        "arn:aws:dynamodb:us-east-1:465457334560:table/resqd-api-tokens/index/*"
+        "arn:aws:dynamodb:us-east-1:465457334560:table/resqd-api-tokens/index/*",
+        "arn:aws:dynamodb:us-east-1:465457334560:table/resqd-rings",
+        "arn:aws:dynamodb:us-east-1:465457334560:table/resqd-rings/index/*"
       ]
     }
   ]

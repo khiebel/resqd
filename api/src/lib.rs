@@ -16,6 +16,7 @@
 
 pub mod auth;
 pub mod handlers;
+pub mod rings;
 pub mod state;
 
 pub use state::{AppConfig, AppState};
@@ -116,6 +117,18 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/vault/{id}/shares/{recipient_email}",
             axum::routing::delete(handlers::delete_share),
         )
+        // Family rings. Phase 3.
+        .route("/rings", get(rings::list_rings).post(rings::create_ring))
+        .route("/rings/{id}", get(rings::get_ring))
+        .route(
+            "/rings/{id}/members",
+            post(rings::invite_member),
+        )
+        .route(
+            "/rings/{id}/members/{email}",
+            axum::routing::delete(rings::remove_member),
+        )
+        .route("/rings/{id}/me", get(rings::my_membership))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(

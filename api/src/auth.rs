@@ -72,6 +72,7 @@ pub struct AuthConfig {
     pub users_table: String,
     pub challenges_table: String,
     pub tokens_table: String,
+    pub rings_table: String,
     pub session_ttl_secs: u64,
     pub cookie_domain: Option<String>,
     pub cookie_secure: bool,
@@ -111,6 +112,8 @@ impl AuthConfig {
             .unwrap_or_else(|_| "resqd-auth-challenges".into());
         let tokens_table =
             std::env::var("RESQD_TOKENS_TABLE").unwrap_or_else(|_| "resqd-api-tokens".into());
+        let rings_table =
+            std::env::var("RESQD_RINGS_TABLE").unwrap_or_else(|_| "resqd-rings".into());
 
         let cookie_domain = std::env::var("RESQD_COOKIE_DOMAIN").ok();
         let cookie_secure = std::env::var("RESQD_COOKIE_SECURE")
@@ -134,6 +137,7 @@ impl AuthConfig {
             users_table,
             challenges_table,
             tokens_table,
+            rings_table,
             session_ttl_secs: 7 * 24 * 3600,
             cookie_domain,
             cookie_secure,
