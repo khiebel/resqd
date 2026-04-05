@@ -536,7 +536,7 @@ export default function RingsPage() {
               <p className="text-xs text-slate-500 mt-2">
                 Members can view all ring assets. Owner &amp; Adult can
                 also upload and delete. Child is read-only. Executor
-                unlocks only after an estate trigger (coming soon).
+                unlocks only after an estate trigger fires.
               </p>
             </section>
           )}

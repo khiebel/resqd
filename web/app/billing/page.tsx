@@ -65,9 +65,9 @@ const TIERS: Tier[] = [
     tagline: "Built for families and estates.",
     storage: "50 GB",
     features: [
-      "Up to 5 family members (coming soon)",
-      "Shared vault folders (coming soon)",
-      "Estate triggers + scheduled unlock (coming soon)",
+      "Family rings with Owner / Adult / Child / Executor roles",
+      "Read-only asset sharing + ring-owned uploads",
+      "Estate triggers — inactivity or scheduled unlock for heirs",
       "Everything in Vault",
       "Priority support (24h)",
     ],

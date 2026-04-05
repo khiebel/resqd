@@ -265,9 +265,9 @@ function Pricing() {
       tagline: "Built for families and estates.",
       features: [
         "50 GB storage",
-        "Up to 5 family members (coming soon)",
-        "Estate triggers & scheduled unlock (coming soon)",
-        "Shared vault folders (coming soon)",
+        "Family rings with Owner / Adult / Child / Executor roles",
+        "Estate triggers — inactivity or scheduled unlock for heirs",
+        "Read-only asset sharing + ring-owned uploads",
         "Priority support (24h)",
       ],
       cta: "Choose Heirloom",

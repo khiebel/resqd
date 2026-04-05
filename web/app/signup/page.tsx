@@ -85,6 +85,15 @@ export default function SignupPage() {
           </p>
         </div>
 
+        <div className="bg-slate-900 border border-slate-800 rounded-lg p-3 text-xs text-slate-400 leading-relaxed">
+          <b className="text-slate-300">Cross-browser tip:</b> when your
+          browser asks where to save the passkey, choose{" "}
+          <b className="text-slate-300">iCloud Keychain</b> (not Google
+          Password Manager). iCloud syncs across Safari, Chrome, and
+          every Apple device so you can sign in anywhere. Google Password
+          Manager only works in Chrome.
+        </div>
+
         <button
           type="submit"
           disabled={
