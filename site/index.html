@@ -315,7 +315,7 @@
             <img src="/assets/icon.png" alt="RESQD">
             <span>RESQD</span>
         </a>
-        <span class="nav-tag">Stealth Mode</span>
+        <a href="https://app.resqd.ai/signup/" class="btn-primary" style="padding: 10px 22px; font-size: 14px;">Create a vault</a>
     </nav>
 
     <section class="hero">
@@ -326,12 +326,11 @@
             verifies integrity on the blockchain, and uses post-quantum cryptography
             to <strong>prove</strong> no one has ever seen your secrets.
         </p>
-        <form class="waitlist" id="waitlist-form-1" data-source="hero" autocomplete="off">
-            <input type="email" placeholder="Enter your email for early access" name="email" id="email-input" required>
-            <input type="text" name="website" tabindex="-1" autocomplete="off" style="position:absolute;left:-9999px;" aria-hidden="true">
-            <button type="submit">Join Waitlist</button>
-        </form>
-        <p class="waitlist-note" id="waitlist-note-1">Be first to rescue your digital life. No spam, ever.</p>
+        <div class="cta-group">
+            <a href="https://app.resqd.ai/signup/" class="btn-primary">Create your vault — free</a>
+            <a href="https://app.resqd.ai/login/" class="btn-secondary">Sign in</a>
+        </div>
+        <p class="waitlist-note">Alpha is open. No credit card. No password. Sign up with your fingerprint.</p>
         <img src="/assets/hero.png" alt="RESQD Quantum Shield" class="hero-image">
     </section>
 
@@ -438,13 +437,12 @@
 
     <section class="section" style="text-align: center; padding-bottom: 80px;">
         <h2 class="section-title">Ready to Rescue Your Digital Life?</h2>
-        <p class="section-sub">Join the waitlist for early access. Alpha launching soon.</p>
-        <form class="waitlist" id="waitlist-form-2" data-source="cta" autocomplete="off" style="margin-top: 30px;">
-            <input type="email" placeholder="your@email.com" name="email" id="email-input-2" required>
-            <input type="text" name="website" tabindex="-1" autocomplete="off" style="position:absolute;left:-9999px;" aria-hidden="true">
-            <button type="submit">Get Early Access</button>
-        </form>
-        <p class="waitlist-note" id="waitlist-note-2" style="margin-top: 16px;"></p>
+        <p class="section-sub">Alpha is open. Create your vault in under a minute — your fingerprint is the only key you'll ever need.</p>
+        <div class="cta-group" style="margin-top: 30px;">
+            <a href="https://app.resqd.ai/signup/" class="btn-primary">Create your vault — free</a>
+            <a href="https://app.resqd.ai/" class="btn-secondary">See the app</a>
+        </div>
+        <p class="waitlist-note" style="margin-top: 16px;">100 MB free tier. Full security stack. No credit card.</p>
     </section>
 </div>
 
@@ -454,57 +452,6 @@
         <p style="margin-top: 8px;">Built with post-quantum cryptography. Your secrets stay secret — forever.</p>
     </div>
 </footer>
-
-<script>
-(function () {
-  async function submitWaitlist(form, noteEl) {
-    const email = form.querySelector('input[name="email"]').value.trim();
-    const website = form.querySelector('input[name="website"]').value;
-    const source = form.dataset.source || 'landing';
-    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      noteEl.textContent = 'Please enter a valid email.';
-      noteEl.style.color = '#ff6b6b';
-      return;
-    }
-    const btn = form.querySelector('button');
-    const origLabel = btn.textContent;
-    btn.disabled = true;
-    btn.textContent = 'Joining…';
-    try {
-      const res = await fetch('/api/waitlist', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, source, website })
-      });
-      const data = await res.json().catch(() => ({}));
-      if (res.ok && data.ok) {
-        noteEl.textContent = data.dedup
-          ? "You're already on the list — we'll be in touch."
-          : "You're on the list. We'll be in touch when alpha opens.";
-        noteEl.style.color = '#4ade80';
-        form.querySelector('input[name="email"]').value = '';
-      } else {
-        noteEl.textContent = 'Something went wrong. Please try again.';
-        noteEl.style.color = '#ff6b6b';
-      }
-    } catch (e) {
-      noteEl.textContent = 'Network error. Please try again.';
-      noteEl.style.color = '#ff6b6b';
-    } finally {
-      btn.disabled = false;
-      btn.textContent = origLabel;
-    }
-  }
-  document.getElementById('waitlist-form-1').addEventListener('submit', function (e) {
-    e.preventDefault();
-    submitWaitlist(this, document.getElementById('waitlist-note-1'));
-  });
-  document.getElementById('waitlist-form-2').addEventListener('submit', function (e) {
-    e.preventDefault();
-    submitWaitlist(this, document.getElementById('waitlist-note-2'));
-  });
-})();
-</script>
 
 </body>
 </html>

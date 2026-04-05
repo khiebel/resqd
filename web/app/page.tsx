@@ -379,9 +379,12 @@ function Footer() {
     <footer className="border-t border-slate-900 text-xs text-slate-500">
       <div className="mx-auto max-w-6xl px-6 py-8 flex flex-wrap items-center justify-between gap-4">
         <div>© 2026 RESQD. All rights reserved.</div>
-        <div className="flex gap-6">
+        <div className="flex gap-6 flex-wrap">
           <a href="#how" className="hover:text-slate-300">How it works</a>
           <a href="#pricing" className="hover:text-slate-300">Pricing</a>
+          <Link href="/security-model/" className="hover:text-slate-300">Security</Link>
+          <Link href="/privacy/" className="hover:text-slate-300">Privacy</Link>
+          <Link href="/terms/" className="hover:text-slate-300">Terms</Link>
           <span className="text-slate-700">·</span>
           <Link href="/login/" className="hover:text-slate-300">Sign in</Link>
         </div>
