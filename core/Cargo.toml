@@ -16,6 +16,21 @@ chacha20poly1305 = "0.10"
 ml-kem = { version = "0.2", features = ["std"] }
 hybrid-array = "0.2"
 
+# Classical ECDH for user-to-user asset sharing. X25519 is paired with
+# ML-KEM inside the existing hybrid KEM when we ship per-asset PQ keys;
+# for now it's used directly to derive per-recipient share wrap keys in
+# the read-only sharing flow and to give each user a stable long-term
+# public identity (stored on the server, sealed privkey under master).
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+
+# HKDF-SHA256 for deriving share wrap keys from X25519 shared secrets.
+# We deliberately use SHA-256 here rather than BLAKE3 because HKDF-SHA256
+# is the de-facto interoperable choice for cross-implementation share
+# formats — the resqd-recover CLI and any future third-party readers can
+# implement it from any standard crypto library.
+hkdf = "0.12"
+sha2 = "0.10"
+
 # Post-quantum signatures — ML-DSA-65
 # ml-dsa not yet stable — add when 0.1.0 releases
 # ml-dsa = { version = "0.1.0-rc.8", features = ["std"] }

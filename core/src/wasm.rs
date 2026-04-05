@@ -9,7 +9,7 @@
 
 use wasm_bindgen::prelude::*;
 
-use crate::crypto::{hash, encrypt, kem, keys};
+use crate::crypto::{hash, encrypt, kem, keys, share};
 use crate::erasure;
 use crate::canary::CanaryChain;
 
@@ -155,6 +155,87 @@ pub fn kem_decapsulate(secret_key_b64: &str, ciphertext_b64: &str) -> Result<Str
     let ss = kem::decapsulate(&sk, &ct)
         .map_err(|e| JsError::new(&e.to_string()))?;
     Ok(base64_encode(&ss))
+}
+
+// ── X25519 identity + ECDH share wrap keys ───────────────────────────
+//
+// Every user has a long-term X25519 identity used for read-only asset
+// sharing. These helpers let the browser:
+//
+// 1. Mint a fresh identity at first login post-migration.
+// 2. Derive a wrap key for a specific recipient+asset on the send side.
+// 3. Derive the matching wrap key on the receive side.
+//
+// The wrap key is always 32 bytes and is fed to `encrypt_data` /
+// `decrypt_data` exactly like any other symmetric key.
+
+/// Generate a fresh X25519 identity keypair. Returns
+/// `{"public_b64": "...", "private_b64": "..."}`. The caller is
+/// responsible for sealing the private half under the master key before
+/// persisting anywhere.
+#[wasm_bindgen]
+pub fn x25519_generate_identity() -> Result<String, JsError> {
+    let kp = share::IdentityKeypair::generate();
+    #[derive(serde::Serialize)]
+    struct Out {
+        public_b64: String,
+        private_b64: String,
+    }
+    let out = Out {
+        public_b64: base64_encode(&kp.public),
+        private_b64: base64_encode(&kp.private),
+    };
+    serde_json::to_string(&out).map_err(|e| JsError::new(&e.to_string()))
+}
+
+/// Derive the public half from a private X25519 scalar. Used by
+/// `resqd-recover` to verify a recovery kit's public key matches the
+/// sealed private key.
+#[wasm_bindgen]
+pub fn x25519_public_from_private(private_b64: &str) -> Result<String, JsError> {
+    let priv_bytes = base64_decode(private_b64)?;
+    let priv32 = share::parse_key32(&priv_bytes, "x25519 private")
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    let kp = share::IdentityKeypair::from_private(priv32);
+    Ok(base64_encode(&kp.public))
+}
+
+/// Sender-side: derive the wrap key used to encrypt a per-asset key for
+/// a specific recipient and asset. Asset id is mixed in as HKDF `info`
+/// so each (sender, recipient, asset) triple gets a domain-separated
+/// wrap key.
+#[wasm_bindgen]
+pub fn x25519_sender_wrap_key(
+    sender_private_b64: &str,
+    recipient_public_b64: &str,
+    asset_id: &str,
+) -> Result<String, JsError> {
+    let sp = base64_decode(sender_private_b64)?;
+    let rp = base64_decode(recipient_public_b64)?;
+    let sp32 = share::parse_key32(&sp, "sender private")
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    let rp32 = share::parse_key32(&rp, "recipient public")
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    let k = share::sender_wrap_key(&sp32, &rp32, asset_id);
+    Ok(base64_encode(&k))
+}
+
+/// Recipient-side mirror of [`x25519_sender_wrap_key`]. Returns the same
+/// 32-byte value that the sender computed (ECDH is symmetric).
+#[wasm_bindgen]
+pub fn x25519_recipient_wrap_key(
+    recipient_private_b64: &str,
+    sender_public_b64: &str,
+    asset_id: &str,
+) -> Result<String, JsError> {
+    let rp = base64_decode(recipient_private_b64)?;
+    let sp = base64_decode(sender_public_b64)?;
+    let rp32 = share::parse_key32(&rp, "recipient private")
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    let sp32 = share::parse_key32(&sp, "sender public")
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    let k = share::recipient_wrap_key(&rp32, &sp32, asset_id);
+    Ok(base64_encode(&k))
 }
 
 // ── Erasure Coding ───────────────────────────────────────────────────

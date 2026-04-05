@@ -10,8 +10,10 @@ pub mod hash;
 pub mod encrypt;
 pub mod kem;
 pub mod keys;
+pub mod share;
 
 pub use hash::*;
 pub use encrypt::*;
 pub use kem::*;
 pub use keys::*;
+pub use share::*;
