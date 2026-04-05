@@ -9,6 +9,7 @@ import {
   bytesToB64u,
   type SessionUser,
 } from "../lib/passkey";
+import { exportRecoveryKit, type ExportProgress } from "../lib/recoveryKit";
 
 interface TokenSummary {
   token_hash: string;
@@ -44,6 +45,18 @@ export default function SettingsPage() {
   const [justCreated, setJustCreated] = useState<CreateTokenResponse | null>(null);
   const [masterKeyB64, setMasterKeyB64] = useState<string | null>(null);
   const [keyVisible, setKeyVisible] = useState(false);
+  const [kitProgress, setKitProgress] = useState<ExportProgress | null>(null);
+  const [kitBusy, setKitBusy] = useState(false);
+
+  const onExportKit = async () => {
+    setKitBusy(true);
+    setKitProgress({ phase: "init" });
+    try {
+      await exportRecoveryKit((p) => setKitProgress(p));
+    } finally {
+      setKitBusy(false);
+    }
+  };
 
   useEffect(() => {
     (async () => {
@@ -332,6 +345,102 @@ export default function SettingsPage() {
             to re-derive it from your passkey.
           </div>
         )}
+      </section>
+
+      {/* ─────────────── Recovery Kit ─────────────── */}
+
+      <section className="mt-10">
+        <h2 className="text-xl font-semibold mb-1">
+          Recovery Kit — data of last resort
+        </h2>
+        <p className="text-xs text-slate-500 mb-4 leading-relaxed">
+          The guarantee nobody else makes: even if RESQD itself
+          disappears — servers gone, domain lapsed, business dead — you
+          can still get your data back. Download a Recovery Kit and
+          store it somewhere safe (encrypted external drive, safe
+          deposit box, printed QR bundle, whatever you trust). Feed
+          it to the open-source{" "}
+          <code className="text-slate-300">resqd-recover</code> CLI and
+          every file is reconstructed on your own machine with zero
+          dependency on us.
+        </p>
+        <p className="text-xs text-slate-500 mb-4 leading-relaxed">
+          The kit is a single JSON file containing your master key,
+          long-term identity, every file&apos;s unwrapped per-asset
+          key, and the raw ciphertext shards. It also includes files
+          people have <span className="text-slate-300">shared with you</span> —
+          if the sender later unshares, or if either of you loses your
+          accounts, the snapshot you downloaded today still decrypts.
+        </p>
+        <div className="bg-amber-950/30 border border-amber-900 rounded-lg p-3 mb-4 text-xs text-amber-300 leading-relaxed">
+          ⚠ The kit contains your master key in plaintext. Treat it like
+          a printed passphrase — encrypt it, store it offline, don&apos;t
+          email it to yourself. Anyone with the kit can read every file
+          in it.
+        </div>
+
+        <button
+          onClick={onExportKit}
+          disabled={kitBusy || !masterKeyB64}
+          className="rounded-lg bg-violet-500 text-slate-50 font-semibold px-5 py-2.5 text-sm disabled:opacity-30"
+        >
+          {kitBusy ? "Building Recovery Kit…" : "Download Recovery Kit"}
+        </button>
+
+        {kitProgress && (
+          <div className="mt-4 bg-slate-900 border border-slate-800 rounded-lg p-3 text-xs text-slate-300 font-mono">
+            {kitProgress.phase === "init" && "Initializing…"}
+            {kitProgress.phase === "listing" && "Listing vault…"}
+            {kitProgress.phase === "asset" && (
+              <>
+                Exporting asset {kitProgress.current}/{kitProgress.total}:{" "}
+                <span className="text-slate-500">{kitProgress.label?.slice(0, 16)}…</span>
+              </>
+            )}
+            {kitProgress.phase === "shard" && (
+              <>
+                Downloading shards — {kitProgress.label}
+              </>
+            )}
+            {kitProgress.phase === "finalizing" && "Finalizing kit…"}
+            {kitProgress.phase === "done" && (
+              <span className="text-green-400">
+                ✓ Recovery Kit downloaded ({kitProgress.total} assets)
+              </span>
+            )}
+            {kitProgress.phase === "error" && (
+              <span className="text-red-400">Error: {kitProgress.error}</span>
+            )}
+          </div>
+        )}
+
+        <details className="mt-4 bg-slate-900 border border-slate-800 rounded-lg p-3 text-xs text-slate-400">
+          <summary className="cursor-pointer text-slate-300">
+            What&apos;s inside the kit?
+          </summary>
+          <ul className="mt-2 space-y-1 list-disc list-inside leading-relaxed">
+            <li>Your user id, email, and the PRF-derived vault master key</li>
+            <li>
+              Your long-term X25519 identity (both halves — lets you decrypt
+              files people shared with you)
+            </li>
+            <li>
+              Every asset you own or have been shared, with its unwrapped
+              per-asset XChaCha20 key and all six Reed-Solomon ciphertext
+              shards
+            </li>
+            <li>
+              The file format spec version and a URL to the
+              <code className="mx-1 text-slate-300">resqd-recover</code>
+              CLI source
+            </li>
+            <li>
+              Links to three recovery paths: DIY (free, open-source tool),
+              concierge (paid, coming), and heir claim (paid, coming, for
+              posthumous access)
+            </li>
+          </ul>
+        </details>
       </section>
     </main>
   );
