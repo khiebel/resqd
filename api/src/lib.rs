@@ -104,6 +104,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(handlers::fetch).delete(handlers::delete_asset),
         )
         .route("/vault/{id}/verify", get(handlers::verify))
+        // Read-only asset sharing. Owner-only on create/list/delete.
+        .route(
+            "/vault/{id}/shares",
+            get(handlers::list_shares).post(handlers::create_share),
+        )
+        .route(
+            "/vault/{id}/shares/{recipient_email}",
+            axum::routing::delete(handlers::delete_share),
+        )
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
         .layer(cors)

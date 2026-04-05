@@ -36,6 +36,94 @@ fn asset_id_from_sidecar_key(key: &str) -> Option<&str> {
     name.strip_suffix(".json")
 }
 
+// ── Share sidecars ───────────────────────────────────────────────────
+//
+// Shares are implemented entirely in raw-S3 sidecars — no new DynamoDB
+// table. A share has two sidecar faces:
+//
+// 1. `_shares/{asset_id}/{recipient_user_id}.json` — scoped to the
+//    asset. Lets the owner list "who is this shared with" with one
+//    `list_prefix` call, and drives the DELETE path (unshare) when the
+//    owner only knows the recipient email/user_id, not the share
+//    contents.
+//
+// 2. `_shared_with/{recipient_user_id}/{asset_id}.json` — scoped to
+//    the recipient. Drives the recipient's "Shared with me" vault
+//    listing with one `list_prefix` call, mirroring the existing
+//    `_owner/{user_id}/...` pattern. Contains the recipient-specific
+//    wrapped per-asset key and the sender's pubkey so the client can
+//    ECDH-derive and unwrap without a second round trip.
+//
+// Both sidecars carry the same opaque encrypted-meta blob (sealed
+// under the *sender's* master key, re-encrypted under the ECDH wrap
+// key so the recipient can actually decrypt it) so the recipient's
+// list view can show a real filename without fetching the asset
+// manifest. The share flow is read-only: the sender encrypts content
+// once for the recipient, the server stores that ciphertext, the
+// recipient decrypts. Nothing about the sidecar lets a recipient
+// modify, delete, or re-share the underlying asset — those paths
+// check `asset.owner_id == caller.user_id` and reject sharees.
+
+fn share_sidecar_owner_key(asset_id: &str, recipient_user_id: &str) -> String {
+    format!("_shares/{asset_id}/{recipient_user_id}.json")
+}
+
+fn share_sidecar_recipient_key(recipient_user_id: &str, asset_id: &str) -> String {
+    format!("_shared_with/{recipient_user_id}/{asset_id}.json")
+}
+
+/// Parse an asset_id out of a `_shared_with/{uid}/{id}.json` sidecar key.
+fn asset_id_from_shared_with_key(key: &str) -> Option<&str> {
+    let name = key.rsplit('/').next()?;
+    name.strip_suffix(".json")
+}
+
+/// Persisted shape of an owner-side share sidecar at
+/// `_shares/{asset_id}/{recipient_user_id}.json`. Minimal — it's just
+/// the index entry the owner needs to enumerate / revoke shares.
+/// Everything the recipient needs to actually read the asset lives in
+/// the recipient-side sidecar.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct OwnerShareRecord {
+    asset_id: String,
+    recipient_user_id: String,
+    recipient_email: String,
+    /// Unix seconds the share was created. Used for UI sort order.
+    created_at: u64,
+}
+
+/// Persisted shape of the recipient-side sidecar at
+/// `_shared_with/{recipient_user_id}/{asset_id}.json`. Self-contained:
+/// everything the recipient needs to decrypt and read the asset lives
+/// here, because the recipient is never allowed to read the owner's
+/// original asset manifest (which carries the owner's wrapped key).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct RecipientShareRecord {
+    asset_id: String,
+    /// user_id and email of the sharing user. Display-name is surfaced
+    /// in the recipient's UI ("shared by <owner>") and the user_id is
+    /// used by the fetch path to look up the sender's pubkey on the
+    /// read side.
+    sender_user_id: String,
+    sender_email: String,
+    /// Sender's long-term X25519 public identity, base64. Copied here
+    /// so the recipient can ECDH-derive the wrap key without calling
+    /// `/users/lookup` every read.
+    sender_pubkey_x25519_b64: String,
+    /// The per-asset XChaCha20 key, wrapped under the ECDH-derived
+    /// share wrap key (HKDF(`ECDH(a_priv, b_pub)`, info=`resqd-share-v1
+    /// || 0x00 || asset_id`)). The recipient recomputes the same wrap
+    /// key from their own privkey + the sender's pubkey and unwraps.
+    wrapped_key_for_recipient_b64: String,
+    /// `{name, mime}` JSON sealed under the SAME ECDH-derived wrap key
+    /// as the per-asset key, so the recipient can surface the real
+    /// filename in their "Shared with me" listing without decrypting
+    /// the whole asset. Optional — sender may choose to omit.
+    #[serde(default)]
+    encrypted_meta_for_recipient_b64: Option<String>,
+    created_at: u64,
+}
+
 /// Number of shards the client erasure-codes into. Mirrors
 /// `resqd_core::erasure::TOTAL_SHARDS` but declared here so the handler
 /// doesn't need to pull the erasure module in.
@@ -148,26 +236,62 @@ pub struct ShardedFetchResponse {
     pub canary_sequence: u64,
     pub canary_hash_hex: String,
     pub ttl_seconds: u64,
-    /// Base64-encoded per-asset key wrapped under the user's master key.
-    /// Present when the asset was committed with a wrapped key. The
-    /// client unwraps this locally with its PRF-derived master key to
-    /// recover the per-asset XChaCha20 key.
+    /// How the caller came to see this asset: `"owner"` when the
+    /// caller is the registered owner (the wrapped_key is sealed
+    /// under their own master key) or `"sharee"` when the caller is
+    /// a recipient of a share (the wrapped_key is the
+    /// ECDH-wrap-key-sealed copy from the share sidecar and
+    /// `sender_pubkey_x25519_b64` must be present).
+    pub role: &'static str,
+    /// Base64-encoded per-asset key. For `role == "owner"` this is
+    /// wrapped under the caller's master key. For `role == "sharee"`
+    /// this is wrapped under the ECDH-derived share wrap key — the
+    /// caller must recompute that wrap key via
+    /// `HKDF(ECDH(their_privkey, sender_pubkey), "resqd-share-v1 ||
+    /// 0x00 || asset_id")` before unwrapping.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wrapped_key_b64: Option<String>,
-    /// Client-encrypted `{name, mime}` JSON sealed under the master key.
+    /// Client-encrypted `{name, mime}` JSON. Same wrapping rules as
+    /// `wrapped_key_b64` — sealed under the master key when the
+    /// caller is the owner, sealed under the share wrap key when the
+    /// caller is a sharee.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encrypted_meta_b64: Option<String>,
+    /// Sender's long-term X25519 public identity, base64. Only
+    /// present on sharee fetches — owners don't need it since they
+    /// unwrap under their own master key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_pubkey_x25519_b64: Option<String>,
 }
 
 /// Entry in the `GET /vault` listing response. `encrypted_meta_b64`
 /// is the same opaque blob the client sent at commit time — the server
 /// just passes it back so the browser can decrypt the filename locally.
+///
+/// When `role == "sharee"` the item was surfaced via the
+/// `_shared_with/{caller_user_id}/...` sidecar, and the caller cannot
+/// perform any mutating action on it — the vault UI hides Delete and
+/// Share controls for shared items, and the API rejects those calls
+/// at the handler level regardless.
 #[derive(Serialize)]
 pub struct VaultListItem {
     pub asset_id: String,
     pub created_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encrypted_meta_b64: Option<String>,
+    /// `"owner"` or `"sharee"`. Default on existing rows (which predate
+    /// sharing) is `"owner"`.
+    pub role: &'static str,
+    /// For sharees only: the email of the sender. Lets the UI say
+    /// "shared by <sender>" without another round trip.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_by_email: Option<String>,
+    /// For sharees only: sender's X25519 pubkey, copied straight out
+    /// of the share sidecar. Lets the Recovery Kit export assemble a
+    /// sharee-decryptable record for this asset without a second round
+    /// trip to `/users/lookup`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_pubkey_x25519_b64: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -598,16 +722,64 @@ pub async fn fetch(
             let manifest: AssetManifest = serde_json::from_slice(&m)
                 .map_err(|e| ApiError::Internal(anyhow::anyhow!("decode manifest: {e}")))?;
 
-            // Ownership check: if the asset has an owner, the caller
-            // must be authenticated as that owner. Pre-auth assets
-            // (owner_id = None) remain publicly accessible by id so
-            // the alpha's test uploads don't break.
-            if let Some(owner) = &manifest.owner_id {
-                match &user {
-                    Some(u) if &u.user_id == owner => {}
-                    _ => return Err(ApiError::NotFound),
+            // Access check:
+            //
+            // - Owner: reads the manifest's master-key-wrapped per-asset
+            //   key directly. `role = "owner"`.
+            // - Sharee: must have a `_shared_with/{user_id}/{asset_id}`
+            //   sidecar. The sidecar's `wrapped_key_for_recipient_b64`
+            //   is returned IN PLACE OF the owner's wrapped key, along
+            //   with the sender's pubkey so the client can ECDH-derive
+            //   the share wrap key before unwrapping. `role = "sharee"`.
+            // - Anyone else: 404, same as "not found".
+            //
+            // Pre-auth assets (owner_id = None) remain publicly
+            // accessible for legacy compatibility.
+            use resqd_storage::ObjectStore;
+            let (role, wrapped_key_b64, encrypted_meta_b64, sender_pubkey): (
+                &'static str,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ) = match (&manifest.owner_id, &user) {
+                (Some(owner), Some(u)) if u.user_id == *owner => (
+                    "owner",
+                    manifest.wrapped_key_b64.clone(),
+                    manifest.encrypted_meta_b64.clone(),
+                    None,
+                ),
+                (Some(_), Some(u)) => {
+                    // Non-owner — look for a share sidecar.
+                    let key = share_sidecar_recipient_key(&u.user_id, &asset_id);
+                    match state.s3.get(&key).await {
+                        Ok(bytes) => {
+                            let rec: RecipientShareRecord =
+                                serde_json::from_slice(&bytes).map_err(|e| {
+                                    ApiError::Internal(anyhow::anyhow!(
+                                        "decode share sidecar: {e}"
+                                    ))
+                                })?;
+                            (
+                                "sharee",
+                                Some(rec.wrapped_key_for_recipient_b64),
+                                rec.encrypted_meta_for_recipient_b64,
+                                Some(rec.sender_pubkey_x25519_b64),
+                            )
+                        }
+                        Err(resqd_storage::StorageError::NotFound(_)) => {
+                            return Err(ApiError::NotFound);
+                        }
+                        Err(e) => return Err(ApiError::Storage(e)),
+                    }
                 }
-            }
+                (Some(_), None) => return Err(ApiError::NotFound),
+                (None, _) => (
+                    "owner",
+                    manifest.wrapped_key_b64.clone(),
+                    manifest.encrypted_meta_b64.clone(),
+                    None,
+                ),
+            };
 
             let mut slots = Vec::with_capacity(TOTAL_SHARDS);
             for i in 0..TOTAL_SHARDS {
@@ -635,8 +807,10 @@ pub async fn fetch(
                 canary_sequence: new_commitment.sequence,
                 canary_hash_hex: new_commitment.hash.to_hex(),
                 ttl_seconds: PRESIGN_TTL.as_secs(),
-                wrapped_key_b64: manifest.wrapped_key_b64.clone(),
-                encrypted_meta_b64: manifest.encrypted_meta_b64.clone(),
+                role,
+                wrapped_key_b64,
+                encrypted_meta_b64,
+                sender_pubkey_x25519_b64: sender_pubkey,
             };
             Ok((
                 [
@@ -802,9 +976,6 @@ pub async fn list_vault(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
 ) -> ApiResult<Json<VaultListResponse>> {
-    let prefix = format!("_owner/{}/", user.user_id);
-    let keys = state.s3.list_prefix(&prefix).await?;
-
     #[derive(Deserialize)]
     struct OwnerSidecar {
         #[serde(default)]
@@ -813,9 +984,22 @@ pub async fn list_vault(
         encrypted_meta_b64: Option<String>,
     }
 
+    // Fan out both prefix listings in parallel — they're independent
+    // S3 ListObjectsV2 calls.
+    let owner_prefix = format!("_owner/{}/", user.user_id);
+    let shared_prefix = format!("_shared_with/{}/", user.user_id);
+    let (owned_keys_res, shared_keys_res) = tokio::join!(
+        state.s3.list_prefix(&owner_prefix),
+        state.s3.list_prefix(&shared_prefix),
+    );
+    let owned_keys = owned_keys_res?;
+    let shared_keys = shared_keys_res?;
+
     use futures::future::join_all;
     use resqd_storage::ObjectStore;
-    let fetches = keys.into_iter().map(|(key, modified)| {
+
+    // Owner items.
+    let owned_fetches = owned_keys.into_iter().map(|(key, modified)| {
         let s3 = state.s3.clone();
         async move {
             let asset_id = asset_id_from_sidecar_key(&key)?.to_string();
@@ -832,12 +1016,47 @@ pub async fn list_vault(
                 asset_id,
                 created_at,
                 encrypted_meta_b64: sidecar.and_then(|s| s.encrypted_meta_b64),
+                role: "owner",
+                shared_by_email: None,
+                sender_pubkey_x25519_b64: None,
             })
         }
     });
-    let mut assets: Vec<VaultListItem> =
-        join_all(fetches).await.into_iter().flatten().collect();
-    // Newest first.
+
+    // Sharee items — read the full RecipientShareRecord so we can
+    // surface the sender's email + pubkey in the listing (drives the
+    // "shared by" UI and the Recovery Kit export path).
+    let shared_fetches = shared_keys.into_iter().map(|(key, modified)| {
+        let s3 = state.s3.clone();
+        async move {
+            let asset_id = asset_id_from_shared_with_key(&key)?.to_string();
+            let body = s3.get(&key).await.ok()?;
+            let rec: RecipientShareRecord = serde_json::from_slice(&body).ok()?;
+            let created_at = if rec.created_at > 0 {
+                rec.created_at
+            } else {
+                modified.map(|s| s as u64).unwrap_or(0)
+            };
+            Some(VaultListItem {
+                asset_id,
+                created_at,
+                encrypted_meta_b64: rec.encrypted_meta_for_recipient_b64,
+                role: "sharee",
+                shared_by_email: Some(rec.sender_email),
+                sender_pubkey_x25519_b64: Some(rec.sender_pubkey_x25519_b64),
+            })
+        }
+    });
+
+    let (owned_items, shared_items) =
+        tokio::join!(join_all(owned_fetches), join_all(shared_fetches));
+
+    let mut assets: Vec<VaultListItem> = owned_items
+        .into_iter()
+        .flatten()
+        .chain(shared_items.into_iter().flatten())
+        .collect();
+    // Newest first, independent of role.
     assets.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
     Ok(Json(VaultListResponse {
@@ -845,6 +1064,323 @@ pub async fn list_vault(
         count: assets.len(),
         assets,
     }))
+}
+
+// ────────────────────────────────────────────────────────────────────
+//                          Share handlers
+// ────────────────────────────────────────────────────────────────────
+
+/// Request body for `POST /vault/{id}/shares`. All fields are produced
+/// client-side — the server is zero-knowledge of both the per-asset key
+/// and the wrap key. `sender_pubkey_x25519_b64` is copied from the
+/// caller's own session (browser state) rather than looked up on the
+/// server so the pinned value is exactly what the client is using; the
+/// server still validates that it matches the caller's stored pubkey so
+/// sharees can't be tricked into ECDH-ing against an attacker-chosen
+/// pubkey.
+#[derive(Deserialize)]
+pub struct CreateShareRequest {
+    pub recipient_email: String,
+    /// Sender's own X25519 pubkey, base64. MUST match the value the
+    /// server has on file for the caller — we reject otherwise.
+    pub sender_pubkey_x25519_b64: String,
+    /// Per-asset key sealed under the ECDH-derived share wrap key.
+    pub wrapped_key_for_recipient_b64: String,
+    /// `{name, mime}` sealed under the same wrap key. Optional — the
+    /// sender can choose to withhold the filename hint, in which case
+    /// the sharee's list view just shows `asset_id`.
+    #[serde(default)]
+    pub encrypted_meta_for_recipient_b64: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct CreateShareResponse {
+    pub asset_id: String,
+    pub recipient_user_id: String,
+    pub recipient_email: String,
+    pub created_at: u64,
+}
+
+#[derive(Serialize)]
+pub struct ShareSummary {
+    pub recipient_user_id: String,
+    pub recipient_email: String,
+    pub created_at: u64,
+}
+
+#[derive(Serialize)]
+pub struct ListSharesResponse {
+    pub asset_id: String,
+    pub count: usize,
+    pub shares: Vec<ShareSummary>,
+}
+
+/// `POST /vault/{id}/shares` — grant read-only access to another user.
+///
+/// **Owner-only.** The caller MUST be the registered owner of the asset;
+/// sharees cannot re-share.
+///
+/// Writes two sidecars:
+/// - `_shares/{asset_id}/{recipient_user_id}.json` (owner-facing index)
+/// - `_shared_with/{recipient_user_id}/{asset_id}.json` (recipient's
+///   self-contained read record)
+///
+/// Read-only by construction: the recipient's sidecar contains the
+/// *wrapped per-asset key* but not any credential that would let them
+/// write to S3. Presigned upload URLs are minted only for the owner in
+/// `/vault/init`, and `POST /vault/{id}/commit`, `DELETE /vault/{id}`
+/// both gate on `asset.owner_id == caller.user_id`. A recipient trying
+/// to mutate the asset will see 404, matching the semantics of an
+/// asset they don't own.
+pub async fn create_share(
+    State(state): State<Arc<AppState>>,
+    user: crate::auth::AuthUser,
+    Path(asset_id): Path<String>,
+    Json(req): Json<CreateShareRequest>,
+) -> ApiResult<Json<CreateShareResponse>> {
+    let auth = state
+        .auth
+        .as_ref()
+        .ok_or(ApiError::Auth(crate::auth::AuthError::Unauthorized))?;
+
+    // Load the asset manifest to verify the caller is the owner. The
+    // ownership check happens BEFORE the recipient lookup so we don't
+    // even leak "this asset exists" to non-owners via a slow-path
+    // email-probe.
+    let manifest_bytes = match state.vault.get(&manifest_key(&asset_id)).await {
+        Ok(b) => b,
+        Err(resqd_storage::StorageError::NotFound(_)) => return Err(ApiError::NotFound),
+        Err(e) => return Err(ApiError::Storage(e)),
+    };
+    let manifest: AssetManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("decode manifest: {e}")))?;
+    match manifest.owner_id.as_deref() {
+        Some(owner) if owner == user.user_id => {}
+        // Collapsed 404 even for "you're not the owner" so the endpoint
+        // doesn't leak asset existence to non-owners.
+        _ => return Err(ApiError::NotFound),
+    }
+
+    // Verify the pubkey the caller pinned into this share request
+    // actually matches their stored identity. This closes a foot-gun
+    // where a compromised client would otherwise be able to sneak an
+    // attacker-controlled pubkey into every share record, giving the
+    // attacker the wrap key on the recipient's read path.
+    let caller_row = crate::auth::get_user_by_email(auth, &user.email)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("caller row missing")))?;
+    let stored_pk = caller_row
+        .pubkey_x25519_b64
+        .as_deref()
+        .ok_or(ApiError::BadRequest(
+            "mint an X25519 identity via /auth/me/identity before sharing".into(),
+        ))?;
+    if stored_pk != req.sender_pubkey_x25519_b64 {
+        return Err(ApiError::BadRequest(
+            "sender_pubkey_x25519_b64 does not match the caller's stored identity".into(),
+        ));
+    }
+
+    // Resolve recipient by email. Recipient must have minted an
+    // identity themselves — otherwise we have no pubkey to wrap
+    // against, and presumably the client already did this lookup via
+    // /users/lookup before calling us, so a missing recipient here is
+    // a race (deleted account) and treated as 404.
+    let recipient_email = req.recipient_email.trim().to_ascii_lowercase();
+    if recipient_email.is_empty() || !recipient_email.contains('@') {
+        return Err(ApiError::BadRequest("recipient_email required".into()));
+    }
+    if recipient_email == user.email {
+        return Err(ApiError::BadRequest(
+            "cannot share an asset with yourself".into(),
+        ));
+    }
+    let recipient = crate::auth::get_user_by_email(auth, &recipient_email)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or(ApiError::NotFound)?;
+    let _recipient_pk = recipient
+        .pubkey_x25519_b64
+        .as_deref()
+        .ok_or(ApiError::BadRequest(
+            "recipient has not yet minted an X25519 identity — they must log in once to establish one".into(),
+        ))?;
+
+    let created_at = now_secs();
+
+    let recipient_record = RecipientShareRecord {
+        asset_id: asset_id.clone(),
+        sender_user_id: user.user_id.clone(),
+        sender_email: user.email.clone(),
+        sender_pubkey_x25519_b64: req.sender_pubkey_x25519_b64.clone(),
+        wrapped_key_for_recipient_b64: req.wrapped_key_for_recipient_b64.clone(),
+        encrypted_meta_for_recipient_b64: req.encrypted_meta_for_recipient_b64.clone(),
+        created_at,
+    };
+    let owner_record = OwnerShareRecord {
+        asset_id: asset_id.clone(),
+        recipient_user_id: recipient.user_id.clone(),
+        recipient_email: recipient.email.clone(),
+        created_at,
+    };
+
+    use resqd_storage::ObjectStore;
+    let recipient_bytes = serde_json::to_vec(&recipient_record)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
+    let owner_bytes = serde_json::to_vec(&owner_record)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
+
+    // Write the recipient-facing sidecar FIRST so a partial failure
+    // leaves the recipient able to read the asset even if the owner's
+    // listing side is incomplete — erring toward availability over
+    // a clean index. A reconciliation job can rebuild `_shares/` from
+    // `_shared_with/` later if they diverge.
+    state
+        .s3
+        .put(
+            &share_sidecar_recipient_key(&recipient.user_id, &asset_id),
+            Bytes::from(recipient_bytes),
+        )
+        .await?;
+    state
+        .s3
+        .put(
+            &share_sidecar_owner_key(&asset_id, &recipient.user_id),
+            Bytes::from(owner_bytes),
+        )
+        .await?;
+
+    info!(
+        asset_id = %asset_id,
+        owner = %user.user_id,
+        recipient = %recipient.user_id,
+        "share created"
+    );
+
+    Ok(Json(CreateShareResponse {
+        asset_id,
+        recipient_user_id: recipient.user_id,
+        recipient_email: recipient.email,
+        created_at,
+    }))
+}
+
+/// `GET /vault/{id}/shares` — list current recipients of an asset.
+/// Owner-only. Collapses to 404 for non-owners so we don't leak asset
+/// existence.
+pub async fn list_shares(
+    State(state): State<Arc<AppState>>,
+    user: crate::auth::AuthUser,
+    Path(asset_id): Path<String>,
+) -> ApiResult<Json<ListSharesResponse>> {
+    let _auth = state
+        .auth
+        .as_ref()
+        .ok_or(ApiError::Auth(crate::auth::AuthError::Unauthorized))?;
+
+    let manifest_bytes = match state.vault.get(&manifest_key(&asset_id)).await {
+        Ok(b) => b,
+        Err(resqd_storage::StorageError::NotFound(_)) => return Err(ApiError::NotFound),
+        Err(e) => return Err(ApiError::Storage(e)),
+    };
+    let manifest: AssetManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("decode manifest: {e}")))?;
+    match manifest.owner_id.as_deref() {
+        Some(owner) if owner == user.user_id => {}
+        _ => return Err(ApiError::NotFound),
+    }
+
+    let prefix = format!("_shares/{asset_id}/");
+    let keys = state.s3.list_prefix(&prefix).await?;
+
+    use futures::future::join_all;
+    use resqd_storage::ObjectStore;
+    let fetches = keys.into_iter().map(|(key, _modified)| {
+        let s3 = state.s3.clone();
+        async move {
+            let body = s3.get(&key).await.ok()?;
+            let rec: OwnerShareRecord = serde_json::from_slice(&body).ok()?;
+            Some(ShareSummary {
+                recipient_user_id: rec.recipient_user_id,
+                recipient_email: rec.recipient_email,
+                created_at: rec.created_at,
+            })
+        }
+    });
+    let mut shares: Vec<ShareSummary> =
+        join_all(fetches).await.into_iter().flatten().collect();
+    shares.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    Ok(Json(ListSharesResponse {
+        asset_id,
+        count: shares.len(),
+        shares,
+    }))
+}
+
+/// `DELETE /vault/{id}/shares/{recipient_email}` — revoke a share.
+/// Owner-only.
+///
+/// Deletes both sidecars. Note the well-known limitation: a recipient
+/// who has already fetched and cached the asset's per-asset key
+/// (either in session or via a Recovery Kit export) still retains the
+/// ability to read the data they already have — this is inherent to
+/// symmetric-key encryption. Forward secrecy would require rotating
+/// the per-asset key and re-wrapping for every remaining sharee, which
+/// is a deliberate non-goal for the alpha and called out explicitly in
+/// the security model copy.
+pub async fn delete_share(
+    State(state): State<Arc<AppState>>,
+    user: crate::auth::AuthUser,
+    Path((asset_id, recipient_email)): Path<(String, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let auth = state
+        .auth
+        .as_ref()
+        .ok_or(ApiError::Auth(crate::auth::AuthError::Unauthorized))?;
+
+    // Ownership check.
+    let manifest_bytes = match state.vault.get(&manifest_key(&asset_id)).await {
+        Ok(b) => b,
+        Err(resqd_storage::StorageError::NotFound(_)) => return Err(ApiError::NotFound),
+        Err(e) => return Err(ApiError::Storage(e)),
+    };
+    let manifest: AssetManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("decode manifest: {e}")))?;
+    match manifest.owner_id.as_deref() {
+        Some(owner) if owner == user.user_id => {}
+        _ => return Err(ApiError::NotFound),
+    }
+
+    let recipient_email = recipient_email.trim().to_ascii_lowercase();
+    let recipient = crate::auth::get_user_by_email(auth, &recipient_email)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or(ApiError::NotFound)?;
+
+    use resqd_storage::ObjectStore;
+    let _ = state
+        .s3
+        .delete(&share_sidecar_recipient_key(&recipient.user_id, &asset_id))
+        .await;
+    let _ = state
+        .s3
+        .delete(&share_sidecar_owner_key(&asset_id, &recipient.user_id))
+        .await;
+
+    info!(
+        asset_id = %asset_id,
+        owner = %user.user_id,
+        recipient = %recipient.user_id,
+        "share revoked"
+    );
+
+    Ok(Json(serde_json::json!({
+        "asset_id": asset_id,
+        "recipient_email": recipient_email,
+        "revoked": true,
+    })))
 }
 
 /// The sidecar key where each asset's canary chain JSON lives in the vault.
