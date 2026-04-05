@@ -13,10 +13,46 @@ type FetchState =
   | {
       phase: "done";
       bytes: Uint8Array;
+      name: string | null;
+      mime: string | null;
       sequence: string | null;
       canaryHash: string | null;
     }
   | { phase: "error"; message: string };
+
+// Unwrap the {v:1, name, mime} frame written by the upload page.
+// Legacy assets uploaded before the framing change fall through to the
+// raw-bytes branch (name/mime = null).
+function unwrapFrame(plaintext: Uint8Array): {
+  body: Uint8Array;
+  name: string | null;
+  mime: string | null;
+} {
+  const legacy = { body: plaintext, name: null, mime: null };
+  if (plaintext.length < 4) return legacy;
+  const headerLen = new DataView(
+    plaintext.buffer,
+    plaintext.byteOffset,
+    4,
+  ).getUint32(0, true);
+  if (headerLen === 0 || headerLen > 1024 || 4 + headerLen > plaintext.length) {
+    return legacy;
+  }
+  try {
+    const headerJson = new TextDecoder("utf-8", { fatal: true }).decode(
+      plaintext.subarray(4, 4 + headerLen),
+    );
+    const header = JSON.parse(headerJson);
+    if (!header || typeof header !== "object" || header.v !== 1) return legacy;
+    return {
+      body: plaintext.subarray(4 + headerLen),
+      name: typeof header.name === "string" ? header.name : null,
+      mime: typeof header.mime === "string" ? header.mime : null,
+    };
+  } catch {
+    return legacy;
+  }
+}
 
 interface ShardedFetchResponse {
   mode: "sharded";
@@ -121,9 +157,12 @@ function FetchInner() {
         plaintextBytes = crypto.decrypt_data(key, ciphertextJson);
       }
 
+      const { body, name, mime } = unwrapFrame(plaintextBytes);
       setState({
         phase: "done",
-        bytes: plaintextBytes,
+        bytes: body,
+        name,
+        mime,
         sequence,
         canaryHash,
       });
@@ -163,12 +202,12 @@ function FetchInner() {
   const download = useCallback(() => {
     if (state.phase !== "done") return;
     const blob = new Blob([new Uint8Array(state.bytes)], {
-      type: "application/octet-stream",
+      type: state.mime || "application/octet-stream",
     });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `resqd-${assetId.slice(0, 8)}.bin`;
+    a.download = state.name || `resqd-${assetId.slice(0, 8)}.bin`;
     a.click();
     URL.revokeObjectURL(url);
   }, [state, assetId]);
@@ -249,6 +288,15 @@ function FetchInner() {
             <p className="text-green-400">
               ✓ decrypted {state.bytes.length.toLocaleString()} bytes
             </p>
+            {state.name && (
+              <p className="text-xs text-slate-400">
+                filename:{" "}
+                <span className="font-mono text-amber-300">{state.name}</span>
+                {state.mime && (
+                  <span className="text-slate-500"> ({state.mime})</span>
+                )}
+              </p>
+            )}
             <p className="text-xs text-slate-400">
               canary sequence after rotation:{" "}
               <span className="font-mono text-amber-300">{state.sequence}</span>

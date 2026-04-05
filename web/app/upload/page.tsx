@@ -82,7 +82,24 @@ export default function UploadPage() {
         // ───────── ENCRYPT (in browser, WASM) ─────────
         setState({ phase: "encrypting" });
         const crypto = await getCrypto();
-        const plaintext = new Uint8Array(await file.arrayBuffer());
+        // Wrap plaintext in a framing struct that carries filename + MIME so
+        // they're cryptographically bound to the ciphertext and travel with it
+        // across devices. Server only ever sees the encrypted frame, so
+        // filenames (which can leak sensitive info) stay zero-knowledge.
+        // Frame: [header_len u32 LE | header_utf8 | body_bytes], header is
+        // JSON {v:1, name, mime}.
+        const bodyBytes = new Uint8Array(await file.arrayBuffer());
+        const headerBytes = new TextEncoder().encode(
+          JSON.stringify({
+            v: 1,
+            name: file.name,
+            mime: file.type || "application/octet-stream",
+          }),
+        );
+        const plaintext = new Uint8Array(4 + headerBytes.length + bodyBytes.length);
+        new DataView(plaintext.buffer).setUint32(0, headerBytes.length, true);
+        plaintext.set(headerBytes, 4);
+        plaintext.set(bodyBytes, 4 + headerBytes.length);
         const keyBytes = new Uint8Array(
           keyHex.match(/.{2}/g)!.map((b) => parseInt(b, 16)),
         );
