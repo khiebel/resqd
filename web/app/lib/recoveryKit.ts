@@ -47,7 +47,7 @@ export const RECOVERY_KIT_SPEC_URL =
 
 export interface RecoveryKitAsset {
   asset_id: string;
-  role: "owner" | "sharee";
+  role: "owner" | "sharee" | "ring_member";
   /** Filename recovered from the asset frame header. May be null for
    *  legacy/no-name uploads. */
   filename: string | null;
@@ -114,9 +114,11 @@ interface VaultListItem {
   asset_id: string;
   created_at: number;
   encrypted_meta_b64?: string | null;
-  role?: "owner" | "sharee";
+  role?: "owner" | "sharee" | "ring_member";
   shared_by_email?: string | null;
   sender_pubkey_x25519_b64?: string | null;
+  ring_id?: string | null;
+  uploader_pubkey_x25519_b64?: string | null;
 }
 
 interface VaultListResponse {
@@ -135,10 +137,12 @@ interface ShardedFetchResponse {
   canary_sequence: number;
   canary_hash_hex: string;
   ttl_seconds: number;
-  role?: "owner" | "sharee";
+  role?: "owner" | "sharee" | "ring_member";
   wrapped_key_b64?: string;
   encrypted_meta_b64?: string;
   sender_pubkey_x25519_b64?: string;
+  ring_id?: string;
+  uploader_pubkey_x25519_b64?: string;
 }
 
 export interface ExportProgress {
@@ -319,8 +323,22 @@ async function exportOneAsset(args: {
   // with its own key.
   let perAssetKey: Uint8Array;
   if (!manifest.wrapped_key_b64) {
-    // Legacy anonymous asset — the master key IS the direct key.
     perAssetKey = masterKey;
+  } else if (manifest.role === "ring_member") {
+    if (!manifest.ring_id || !manifest.uploader_pubkey_x25519_b64) {
+      throw new Error("ring asset missing ring_id or uploader_pubkey");
+    }
+    const { ensureRingPrivkey } = await import("./passkey");
+    const ringPrivB64 = await ensureRingPrivkey(manifest.ring_id);
+    if (!ringPrivB64) throw new Error("could not unwrap ring privkey");
+    const wrapB64 = crypto.x25519_recipient_wrap_key(
+      ringPrivB64,
+      manifest.uploader_pubkey_x25519_b64,
+      manifest.asset_id,
+    );
+    const wrapKey = base64ToBytes(wrapB64);
+    const wrappedJson = atob(manifest.wrapped_key_b64);
+    perAssetKey = crypto.decrypt_data(wrapKey, wrappedJson);
   } else if (manifest.role === "sharee") {
     if (!manifest.sender_pubkey_x25519_b64) {
       throw new Error("sharee manifest missing sender pubkey");
@@ -349,7 +367,20 @@ async function exportOneAsset(args: {
       // The encrypted_meta is sealed under the SAME KEK as the
       // per-asset key — master for owners, share wrap key for sharees.
       let metaKey: Uint8Array;
-      if (manifest.role === "sharee" && manifest.sender_pubkey_x25519_b64) {
+      if (manifest.role === "ring_member" && manifest.ring_id && manifest.uploader_pubkey_x25519_b64) {
+        const { ensureRingPrivkey } = await import("./passkey");
+        const ringPrivB64 = await ensureRingPrivkey(manifest.ring_id);
+        if (ringPrivB64) {
+          const wrapB64 = crypto.x25519_recipient_wrap_key(
+            ringPrivB64,
+            manifest.uploader_pubkey_x25519_b64,
+            manifest.asset_id,
+          );
+          metaKey = base64ToBytes(wrapB64);
+        } else {
+          metaKey = masterKey; // fallback — likely fails, caught below
+        }
+      } else if (manifest.role === "sharee" && manifest.sender_pubkey_x25519_b64) {
         const wrapB64 = crypto.x25519_recipient_wrap_key(
           identPrivB64,
           manifest.sender_pubkey_x25519_b64,
@@ -400,7 +431,11 @@ async function exportOneAsset(args: {
 
   return {
     asset_id: manifest.asset_id,
-    role: manifest.role === "sharee" ? "sharee" : "owner",
+    role: manifest.role === "ring_member"
+      ? "ring_member"
+      : manifest.role === "sharee"
+        ? "sharee"
+        : "owner",
     filename,
     mime,
     shared_by_email: item.shared_by_email ?? undefined,

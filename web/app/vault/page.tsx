@@ -495,13 +495,19 @@ export default function VaultPage() {
             try {
               let keyForMeta: Uint8Array;
               if (a.role === "ring_member") {
-                // Ring-asset meta is currently sealed under the
-                // uploader's master key — other ring members can't
-                // decrypt it in the listing. They'll see the asset_id
-                // and get the real filename after fetching + decrypting
-                // the full file (the frame header has the name).
-                // Proper ring-meta-key sealing deferred to a follow-up.
-                continue;
+                // Ring-asset meta is sealed under the same ECDH-derived
+                // wrap key as the per-asset key: sender_wrap_key(
+                // uploader_priv, ring_pub, asset_id). We can re-derive
+                // that key using the ring privkey + uploader pubkey.
+                if (!a.ring_id || !a.uploader_pubkey_x25519_b64) continue;
+                const ringPrivB64 = await ensureRingPrivkey(a.ring_id);
+                if (!ringPrivB64) continue;
+                const wrapB64 = crypto.x25519_recipient_wrap_key(
+                  ringPrivB64,
+                  a.uploader_pubkey_x25519_b64,
+                  a.asset_id,
+                );
+                keyForMeta = base64ToBytes(wrapB64);
               } else if (a.role === "sharee") {
                 if (!ident || !a.sender_pubkey_x25519_b64) {
                   continue;

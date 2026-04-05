@@ -8,7 +8,23 @@ import {
   API_URL,
   type ErasureEncoded,
 } from "../lib/resqdCrypto";
-import { loadMasterKey, fetchMe, type SessionUser } from "../lib/passkey";
+import {
+  loadMasterKey,
+  fetchMe,
+  loadX25519Identity,
+  ensureRingPrivkey,
+  type SessionUser,
+} from "../lib/passkey";
+
+interface RingSummary {
+  ring_id: string;
+  name: string;
+  role: string;
+}
+
+interface RingMeResponse {
+  ring_pubkey_x25519_b64?: string;
+}
 
 type UploadState =
   | { phase: "idle" }
@@ -47,10 +63,9 @@ interface CommitResponse {
 export default function UploadPage() {
   const [state, setState] = useState<UploadState>({ phase: "idle" });
   const [user, setUser] = useState<SessionUser | null>(null);
+  const [rings, setRings] = useState<RingSummary[]>([]);
+  const [selectedRingId, setSelectedRingId] = useState<string>("");
 
-  // Guard: must be signed in AND have a PRF master key cached in this tab.
-  // Missing either → bounce to /login so the user gets a Touch ID prompt
-  // before being allowed to upload.
   useEffect(() => {
     (async () => {
       const me = await fetchMe();
@@ -63,6 +78,25 @@ export default function UploadPage() {
         return;
       }
       setUser(me);
+
+      // Load rings so we can show a ring selector. Only show rings
+      // where the user has a write role (Owner or Adult).
+      try {
+        const resp = await fetch(`${API_URL}/rings`, {
+          credentials: "include",
+        });
+        if (resp.ok) {
+          const all: RingSummary[] = await resp.json();
+          setRings(
+            all.filter(
+              (r) => r.role === "owner" || r.role === "adult",
+            ),
+          );
+        }
+      } catch {
+        // Rings are optional — if the fetch fails, the user just
+        // doesn't see the ring selector. No error.
+      }
     })();
   }, []);
 
@@ -74,33 +108,38 @@ export default function UploadPage() {
         return;
       }
 
-      // ───────── WRAP FRESH PER-ASSET KEY + METADATA UNDER MASTER ─────────
-      // Each asset gets its own 32-byte XChaCha20 key. We seal that key
-      // under the PRF-derived master key and ship the sealed blob with
-      // the commit. Only holders of the passkey (and therefore the
-      // master key) can ever unwrap it — the server just round-trips it.
+      // ───────── DETERMINE TARGET (personal vs ring) ─────────
+      const isRingUpload = !!selectedRingId;
+      let ringPubB64: string | undefined;
+      let uploaderPubB64: string | undefined;
+
+      if (isRingUpload) {
+        const ident = loadX25519Identity();
+        if (!ident) {
+          throw new Error("X25519 identity not loaded — re-login");
+        }
+        uploaderPubB64 = ident.pubB64;
+
+        // Fetch ring pubkey.
+        const meResp = await fetch(
+          `${API_URL}/rings/${encodeURIComponent(selectedRingId)}/me`,
+          { credentials: "include" },
+        );
+        if (!meResp.ok) throw new Error("ring membership check failed");
+        const meData = (await meResp.json()) as RingMeResponse;
+        ringPubB64 = meData.ring_pubkey_x25519_b64;
+        if (!ringPubB64) throw new Error("ring pubkey not found");
+      }
+
+      // ───────── WRAP FRESH PER-ASSET KEY ─────────
       //
-      // The filename + MIME type are also sealed under the master key
-      // (separate encryption, distinct nonce) so the /vault listing can
-      // show real filenames instead of UUIDs without ever exposing them
-      // to the server. Using master here instead of per-asset means the
-      // client can decrypt the list view with just one key.
+      // Personal upload: seal under master key.
+      // Ring upload: seal under sender_wrap_key(uploader_priv,
+      //   ring_pub, asset_id). We need the asset_id first, so we
+      //   call /vault/init to get it, THEN wrap. Restructured below.
       setState({ phase: "wrapping-key" });
       const crypto = await getCrypto();
       const perAssetKey = crypto.generate_random_key();
-      const wrappedJson = crypto.encrypt_data(masterKey, perAssetKey);
-      const wrappedB64 = btoa(wrappedJson);
-
-      const metaJson = crypto.encrypt_data(
-        masterKey,
-        new TextEncoder().encode(
-          JSON.stringify({
-            name: file.name,
-            mime: file.type || "application/octet-stream",
-          }),
-        ),
-      );
-      const encryptedMetaB64 = btoa(metaJson);
 
       // ───────── FRAME + ENCRYPT ─────────
       setState({ phase: "encrypting" });
@@ -127,6 +166,8 @@ export default function UploadPage() {
       const encoded: ErasureEncoded = JSON.parse(encodedJson);
 
       // ───────── INIT (presigned slots) ─────────
+      // We need the server-generated asset_id BEFORE wrapping the
+      // per-asset key for ring uploads (the HKDF info binds asset_id).
       setState({ phase: "init" });
       const initResp = await fetch(`${API_URL}/vault/init`, {
         method: "POST",
@@ -142,6 +183,31 @@ export default function UploadPage() {
         throw new Error(
           `server wanted ${init.shards.length} shards, WASM produced ${encoded.shards.length}`,
         );
+      }
+
+      // ───────── WRAP PER-ASSET KEY + META (now that we have asset_id) ─────
+      let wrappedB64: string;
+      let encryptedMetaB64: string;
+      const metaPlaintext = new TextEncoder().encode(
+        JSON.stringify({
+          name: file.name,
+          mime: file.type || "application/octet-stream",
+        }),
+      );
+
+      if (isRingUpload && ringPubB64 && uploaderPubB64) {
+        const ident = loadX25519Identity()!;
+        const wrapKeyB64 = crypto.x25519_sender_wrap_key(
+          ident.privB64,
+          ringPubB64,
+          init.asset_id,
+        );
+        const wrapKey = base64ToBytes(wrapKeyB64);
+        wrappedB64 = btoa(crypto.encrypt_data(wrapKey, perAssetKey));
+        encryptedMetaB64 = btoa(crypto.encrypt_data(wrapKey, metaPlaintext));
+      } else {
+        wrappedB64 = btoa(crypto.encrypt_data(masterKey, perAssetKey));
+        encryptedMetaB64 = btoa(crypto.encrypt_data(masterKey, metaPlaintext));
       }
 
       // ───────── UPLOAD SHARDS IN PARALLEL ─────────
@@ -163,19 +229,24 @@ export default function UploadPage() {
         }),
       );
 
-      // ───────── COMMIT (persists wrapped key + owner + anchors) ─────────
+      // ───────── COMMIT ─────────
       setState({ phase: "committing" });
+      const commitBody: Record<string, unknown> = {
+        original_len: originalLen,
+        wrapped_key_b64: wrappedB64,
+        encrypted_meta_b64: encryptedMetaB64,
+      };
+      if (isRingUpload) {
+        commitBody.ring_id = selectedRingId;
+        commitBody.uploader_pubkey_x25519_b64 = uploaderPubB64;
+      }
       const commitResp = await fetch(
         `${API_URL}/vault/${encodeURIComponent(init.asset_id)}/commit`,
         {
           method: "POST",
           credentials: "include",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            original_len: originalLen,
-            wrapped_key_b64: wrappedB64,
-            encrypted_meta_b64: encryptedMetaB64,
-          }),
+          body: JSON.stringify(commitBody),
         },
       );
       if (!commitResp.ok) {
@@ -210,7 +281,7 @@ export default function UploadPage() {
         message: e instanceof Error ? e.message : String(e),
       });
     }
-  }, []);
+  }, [selectedRingId]);
 
   return (
     <main className="mx-auto max-w-2xl px-6 py-12 text-slate-100">
@@ -232,6 +303,33 @@ export default function UploadPage() {
         RESQD never sees plaintext or any key material. The canary
         commitment is anchored on Base Sepolia before this page returns.
       </p>
+
+      {rings.length > 0 && (
+        <section className="mb-6 bg-slate-900 border border-slate-800 rounded-lg p-4">
+          <label className="block text-xs font-medium text-slate-400 uppercase tracking-wide mb-2">
+            Upload to
+          </label>
+          <select
+            value={selectedRingId}
+            onChange={(e) => setSelectedRingId(e.target.value)}
+            disabled={state.phase !== "idle"}
+            className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm"
+          >
+            <option value="">My personal vault</option>
+            {rings.map((r) => (
+              <option key={r.ring_id} value={r.ring_id}>
+                {r.name} (ring)
+              </option>
+            ))}
+          </select>
+          {selectedRingId && (
+            <p className="mt-2 text-xs text-violet-300">
+              This file will be owned by the ring. All ring members can
+              read it. Only Owner and Adult roles can upload.
+            </p>
+          )}
+        </section>
+      )}
 
       <section
         className="border-2 border-dashed border-slate-700 rounded-xl p-10 text-center hover:border-slate-500 transition-colors cursor-pointer"
