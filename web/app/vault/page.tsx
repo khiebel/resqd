@@ -143,6 +143,12 @@ export default function VaultPage() {
           >
             + Upload
           </Link>
+          <Link
+            href="/settings/"
+            className="text-xs text-slate-400 hover:text-slate-200"
+          >
+            Settings
+          </Link>
           <button
             onClick={onLogout}
             className="text-xs text-slate-400 hover:text-slate-200"

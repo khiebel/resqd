@@ -79,6 +79,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/auth/login/finish", post(auth::login_finish))
         .route("/auth/me", get(auth::me))
         .route("/auth/logout", post(auth::logout))
+        .route(
+            "/auth/tokens",
+            get(auth::list_tokens).post(auth::create_token),
+        )
+        .route("/auth/tokens/{hash}", axum::routing::delete(auth::revoke_token))
         // Vault
         .route("/vault", get(handlers::list_vault).post(handlers::upload))
         .route("/vault/init", post(handlers::init))

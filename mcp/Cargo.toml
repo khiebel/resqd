@@ -1,0 +1,37 @@
+[package]
+name = "resqd-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "MCP server for RESQD — expose the vault as tools to Claude and other LLM agents"
+license = "AGPL-3.0"
+
+[[bin]]
+name = "resqd-mcp"
+path = "src/main.rs"
+
+[dependencies]
+resqd-core = { path = "../core" }
+
+# Async runtime + I/O
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "fs"] }
+
+# HTTP client for the API
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors
+anyhow = "1"
+thiserror = "2"
+
+# Base64
+base64 = "0.22"
+
+# Random per-asset keys
+rand = "0.8"
+
+# Logging to stderr (stdout is reserved for MCP protocol)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

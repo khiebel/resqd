@@ -71,6 +71,7 @@ pub struct AuthConfig {
     pub jwt_secret: Vec<u8>,
     pub users_table: String,
     pub challenges_table: String,
+    pub tokens_table: String,
     pub session_ttl_secs: u64,
     pub cookie_domain: Option<String>,
     pub cookie_secure: bool,
@@ -108,6 +109,8 @@ impl AuthConfig {
             std::env::var("RESQD_USERS_TABLE").unwrap_or_else(|_| "resqd-users".into());
         let challenges_table = std::env::var("RESQD_CHALLENGES_TABLE")
             .unwrap_or_else(|_| "resqd-auth-challenges".into());
+        let tokens_table =
+            std::env::var("RESQD_TOKENS_TABLE").unwrap_or_else(|_| "resqd-api-tokens".into());
 
         let cookie_domain = std::env::var("RESQD_COOKIE_DOMAIN").ok();
         let cookie_secure = std::env::var("RESQD_COOKIE_SECURE")
@@ -130,6 +133,7 @@ impl AuthConfig {
             jwt_secret,
             users_table,
             challenges_table,
+            tokens_table,
             session_ttl_secs: 7 * 24 * 3600,
             cookie_domain,
             cookie_secure,
@@ -428,7 +432,16 @@ impl FromRequestParts<Arc<AppState>> for AuthUser {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        extract_auth_user(parts, state)?.ok_or(AuthError::Unauthorized)
+        // Cookie path — synchronous, no DB hit.
+        if let Some(user) = extract_auth_user(parts, state)? {
+            return Ok(user);
+        }
+        // Bearer-token path — async DynamoDB lookup.
+        if let Some(token) = extract_bearer(parts) {
+            let auth = state.auth.as_ref().ok_or(AuthError::Unauthorized)?;
+            return verify_bearer_token(auth, &token).await;
+        }
+        Err(AuthError::Unauthorized)
     }
 }
 
@@ -445,27 +458,90 @@ impl OptionalFromRequestParts<Arc<AppState>> for AuthUser {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Option<Self>, Self::Rejection> {
-        extract_auth_user(parts, state)
+        if let Some(user) = extract_auth_user(parts, state)? {
+            return Ok(Some(user));
+        }
+        if let Some(token) = extract_bearer(parts) {
+            let Some(auth) = state.auth.as_ref() else {
+                return Ok(None);
+            };
+            return match verify_bearer_token(auth, &token).await {
+                Ok(u) => Ok(Some(u)),
+                Err(AuthError::Unauthorized) => Ok(None),
+                Err(e) => Err(e),
+            };
+        }
+        Ok(None)
     }
 }
 
 fn extract_auth_user(parts: &Parts, state: &Arc<AppState>) -> AuthResult<Option<AuthUser>> {
+    // Session cookie (human users via the browser SPA) takes precedence.
+    // If there's no cookie, fall through to the `Authorization: Bearer`
+    // path used by MCP clients / API consumers. We don't attempt DB
+    // verification here — that's async and we can't await inside the
+    // extractor's sync fast-path — so bearer verification happens in
+    // the full `from_request_parts` path below.
     let Some(auth) = state.auth.as_ref() else {
         return Ok(None);
     };
-    let Some(cookie_header) = parts.headers.get(header::COOKIE).and_then(|v| v.to_str().ok())
-    else {
-        return Ok(None);
-    };
-    let Some(token) = extract_cookie(cookie_header, SESSION_COOKIE) else {
-        return Ok(None);
-    };
-    let claims = verify_session(&auth.config, token)?;
-    Ok(Some(AuthUser {
-        user_id: claims.sub,
-        email: claims.email,
-        display_name: claims.name,
-    }))
+    let cookie_header = parts
+        .headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok());
+    if let Some(ch) = cookie_header {
+        if let Some(token) = extract_cookie(ch, SESSION_COOKIE) {
+            let claims = verify_session(&auth.config, token)?;
+            return Ok(Some(AuthUser {
+                user_id: claims.sub,
+                email: claims.email,
+                display_name: claims.name,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// Extract a bearer token from the `Authorization` header, if present.
+fn extract_bearer(parts: &Parts) -> Option<String> {
+    let raw = parts
+        .headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())?;
+    let rest = raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer "))?;
+    Some(rest.trim().to_string())
+}
+
+/// Hash a raw API token for storage + lookup. We never store raw tokens —
+/// only `sha256(token)` — so a dump of the `resqd-api-tokens` table can't
+/// be replayed against the API. The hash is also the table partition key.
+fn hash_token(raw: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(raw.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+async fn verify_bearer_token(auth: &AuthState, raw: &str) -> AuthResult<AuthUser> {
+    // Token format sanity check — this isn't security, it's a tiny
+    // efficiency so we don't hit DynamoDB for obviously garbage input.
+    if !raw.starts_with("rsqd_") || raw.len() < 16 {
+        return Err(AuthError::Unauthorized);
+    }
+    let token_hash = hash_token(raw);
+    let out = auth
+        .dynamo
+        .get_item()
+        .table_name(&auth.config.tokens_table)
+        .key("token_hash", AttributeValue::S(token_hash))
+        .send()
+        .await?;
+    let item = out.item.ok_or(AuthError::Unauthorized)?;
+    Ok(AuthUser {
+        user_id: take_s(&item, "user_id")?,
+        email: take_s(&item, "email").unwrap_or_default(),
+        display_name: take_s(&item, "display_name").unwrap_or_default(),
+    })
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -808,6 +884,174 @@ pub async fn me(user: AuthUser) -> Json<SessionResponse> {
         email: user.email,
         display_name: user.display_name,
     })
+}
+
+// ────────────────────────────────────────────────────────────────────
+//                       API token management
+// ────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct CreateTokenRequest {
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct CreateTokenResponse {
+    /// The full raw token — `rsqd_...`. Only returned here, ONCE. The
+    /// server stores only the SHA-256 hash, so if the user loses this
+    /// value they must mint a new one.
+    pub token: String,
+    pub token_hash: String,
+    pub label: String,
+    pub created_at: u64,
+}
+
+#[derive(Serialize)]
+pub struct TokenSummary {
+    pub token_hash: String,
+    pub label: String,
+    pub created_at: u64,
+    pub last_used_at: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub struct ListTokensResponse {
+    pub count: usize,
+    pub tokens: Vec<TokenSummary>,
+}
+
+fn generate_raw_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    format!("rsqd_{}", BASE64_URL_SAFE_NO_PAD.encode(bytes))
+}
+
+pub async fn create_token(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(req): Json<CreateTokenRequest>,
+) -> AuthResult<Json<CreateTokenResponse>> {
+    let auth = state.auth.as_ref().ok_or(AuthError::BadRequest(
+        "auth not configured on this deployment".into(),
+    ))?;
+
+    let raw = generate_raw_token();
+    let token_hash = hash_token(&raw);
+    let label = req
+        .label
+        .unwrap_or_else(|| "unnamed".to_string())
+        .chars()
+        .take(64)
+        .collect::<String>();
+    let created_at = now_secs();
+
+    let mut item: HashMap<String, AttributeValue> = HashMap::new();
+    item.insert("token_hash".into(), AttributeValue::S(token_hash.clone()));
+    item.insert("user_id".into(), AttributeValue::S(user.user_id.clone()));
+    item.insert("email".into(), AttributeValue::S(user.email.clone()));
+    item.insert(
+        "display_name".into(),
+        AttributeValue::S(user.display_name.clone()),
+    );
+    item.insert("label".into(), AttributeValue::S(label.clone()));
+    item.insert(
+        "created_at".into(),
+        AttributeValue::N(created_at.to_string()),
+    );
+
+    auth.dynamo
+        .put_item()
+        .table_name(&auth.config.tokens_table)
+        .set_item(Some(item))
+        .send()
+        .await?;
+
+    info!(user_id = %user.user_id, label = %label, "minted api token");
+
+    Ok(Json(CreateTokenResponse {
+        token: raw,
+        token_hash,
+        label,
+        created_at,
+    }))
+}
+
+pub async fn list_tokens(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> AuthResult<Json<ListTokensResponse>> {
+    let auth = state.auth.as_ref().ok_or(AuthError::BadRequest(
+        "auth not configured on this deployment".into(),
+    ))?;
+
+    let out = auth
+        .dynamo
+        .query()
+        .table_name(&auth.config.tokens_table)
+        .index_name("user_id-index")
+        .key_condition_expression("user_id = :uid")
+        .expression_attribute_values(":uid", AttributeValue::S(user.user_id.clone()))
+        .send()
+        .await?;
+
+    let tokens: Vec<TokenSummary> = out
+        .items()
+        .iter()
+        .map(|item| TokenSummary {
+            token_hash: take_s(item, "token_hash").unwrap_or_default(),
+            label: take_s(item, "label").unwrap_or_default(),
+            created_at: take_s(item, "created_at")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            last_used_at: take_s(item, "last_used_at")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+        })
+        .collect();
+
+    Ok(Json(ListTokensResponse {
+        count: tokens.len(),
+        tokens,
+    }))
+}
+
+pub async fn revoke_token(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    axum::extract::Path(token_hash): axum::extract::Path<String>,
+) -> AuthResult<Json<serde_json::Value>> {
+    let auth = state.auth.as_ref().ok_or(AuthError::BadRequest(
+        "auth not configured on this deployment".into(),
+    ))?;
+
+    // Verify the token belongs to the authed user before deleting it.
+    // Otherwise any authed user could DELETE /auth/tokens/<hash> to
+    // revoke someone else's token.
+    let out = auth
+        .dynamo
+        .get_item()
+        .table_name(&auth.config.tokens_table)
+        .key("token_hash", AttributeValue::S(token_hash.clone()))
+        .send()
+        .await?;
+    let item = out.item.ok_or(AuthError::NotFound)?;
+    let owner = take_s(&item, "user_id")?;
+    if owner != user.user_id {
+        return Err(AuthError::NotFound);
+    }
+
+    auth.dynamo
+        .delete_item()
+        .table_name(&auth.config.tokens_table)
+        .key("token_hash", AttributeValue::S(token_hash.clone()))
+        .send()
+        .await?;
+
+    info!(user_id = %user.user_id, token_hash = %token_hash, "revoked api token");
+
+    Ok(Json(serde_json::json!({ "revoked": true })))
 }
 
 pub async fn logout(State(state): State<Arc<AppState>>) -> AuthResult<Response> {

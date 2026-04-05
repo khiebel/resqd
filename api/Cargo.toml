@@ -57,6 +57,7 @@ tower-cookies = "0.11"
 base64 = "0.22"
 rand = "0.8"
 url = "2"
+sha2 = "0.10"
 # `webauthn-rs` pulls openssl via openssl-sys. When cross-compiling for
 # `aarch64-unknown-linux-gnu` on macOS there's no system openssl available,
 # so we vendor and build it from source. Compile time hit is small vs.
