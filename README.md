@@ -65,7 +65,7 @@ infra/       infra             — deploy scripts (Lambda, API Gateway, IAM)
 If you have a Recovery Kit file exported from the RESQD Settings page:
 
 ```bash
-cargo install --git https://github.com/khiebel/resqd resqd-recover
+cargo install --git https://github.com/khiebel/resqd resqd-recover  # builds from source
 resqd-recover decrypt -k resqd-recovery-kit-*.json -o ./recovered
 ```
 
