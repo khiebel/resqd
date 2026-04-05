@@ -129,6 +129,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::delete(rings::remove_member),
         )
         .route("/rings/{id}/me", get(rings::my_membership))
+        .route("/rings/{id}/trigger", axum::routing::put(rings::set_trigger))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(

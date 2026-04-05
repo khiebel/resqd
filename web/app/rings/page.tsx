@@ -27,6 +27,12 @@ interface MemberSummary {
   invited_at: number;
 }
 
+interface EstateTrigger {
+  type: "inactivity" | "scheduled";
+  days?: number;
+  unlock_at?: number;
+}
+
 interface RingDetail {
   ring_id: string;
   name: string;
@@ -34,6 +40,8 @@ interface RingDetail {
   owner_user_id: string;
   created_at: number;
   members: MemberSummary[];
+  estate_trigger?: EstateTrigger | null;
+  last_owner_activity_at?: number | null;
 }
 
 type ViewState =
@@ -56,6 +64,10 @@ export default function RingsPage() {
   const [inviteRole, setInviteRole] = useState("adult");
   const [inviting, setInviting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [triggerType, setTriggerType] = useState<"none" | "inactivity" | "scheduled">("none");
+  const [triggerDays, setTriggerDays] = useState("90");
+  const [triggerDate, setTriggerDate] = useState("");
+  const [savingTrigger, setSavingTrigger] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -174,6 +186,22 @@ export default function RingsPage() {
       setInviteEmail("");
       setInviteRole("adult");
       setActionError(null);
+      // Initialize trigger form from ring config.
+      if (ring.estate_trigger?.type === "inactivity") {
+        setTriggerType("inactivity");
+        setTriggerDays(String(ring.estate_trigger.days ?? 90));
+      } else if (ring.estate_trigger?.type === "scheduled") {
+        setTriggerType("scheduled");
+        if (ring.estate_trigger.unlock_at) {
+          setTriggerDate(
+            new Date(ring.estate_trigger.unlock_at * 1000)
+              .toISOString()
+              .slice(0, 10),
+          );
+        }
+      } else {
+        setTriggerType("none");
+      }
     } catch (e) {
       setActionError(e instanceof Error ? e.message : String(e));
     }
@@ -245,6 +273,44 @@ export default function RingsPage() {
       setInviting(false);
     }
   }, [view, inviteEmail, inviteRole, openDetail]);
+
+  const saveTrigger = useCallback(async () => {
+    if (view.phase !== "detail") return;
+    setSavingTrigger(true);
+    setActionError(null);
+    try {
+      let body: { estate_trigger: unknown };
+      if (triggerType === "inactivity") {
+        const days = parseInt(triggerDays, 10);
+        if (!days || days < 1 || days > 3650) throw new Error("days must be 1–3650");
+        body = { estate_trigger: { type: "inactivity", days } };
+      } else if (triggerType === "scheduled") {
+        const d = new Date(triggerDate);
+        if (isNaN(d.getTime())) throw new Error("enter a valid date");
+        const unlock_at = Math.floor(d.getTime() / 1000);
+        if (unlock_at <= Math.floor(Date.now() / 1000))
+          throw new Error("date must be in the future");
+        body = { estate_trigger: { type: "scheduled", unlock_at } };
+      } else {
+        body = { estate_trigger: null };
+      }
+      const resp = await fetch(
+        `${API_URL}/rings/${encodeURIComponent(view.ring.ring_id)}/trigger`,
+        {
+          method: "PUT",
+          credentials: "include",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        },
+      );
+      if (!resp.ok) throw new Error(await resp.text());
+      await openDetail(view.ring.ring_id);
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingTrigger(false);
+    }
+  }, [view, triggerType, triggerDays, triggerDate, openDetail]);
 
   const onRemoveMember = useCallback(
     async (email: string) => {
@@ -472,6 +538,90 @@ export default function RingsPage() {
                 also upload and delete. Child is read-only. Executor
                 unlocks only after an estate trigger (coming soon).
               </p>
+            </section>
+          )}
+
+          {/* Estate trigger config */}
+          {view.myRole === "owner" && (
+            <section className="mb-6 bg-slate-900 border border-slate-800 rounded-lg p-4">
+              <h3 className="text-sm font-semibold text-slate-400 uppercase tracking-wide mb-3">
+                Estate trigger
+              </h3>
+              <p className="text-xs text-slate-500 mb-3 leading-relaxed">
+                When the trigger fires, Executor-role members are
+                unlocked and can read the ring&apos;s assets. This is
+                the inheritance mechanism — set it so your heirs gain
+                access when you can no longer check in.
+              </p>
+              {view.ring.estate_trigger && (
+                <div className="mb-3 p-2 bg-violet-500/10 border border-violet-500/20 rounded text-xs text-violet-300">
+                  Active:{" "}
+                  {view.ring.estate_trigger.type === "inactivity"
+                    ? `Unlocks after ${view.ring.estate_trigger.days} days of owner inactivity`
+                    : `Unlocks at ${new Date((view.ring.estate_trigger.unlock_at ?? 0) * 1000).toLocaleDateString()}`}
+                  {view.ring.last_owner_activity_at ? (
+                    <span className="ml-2 text-slate-500">
+                      · last owner activity:{" "}
+                      {new Date(view.ring.last_owner_activity_at * 1000).toLocaleString()}
+                    </span>
+                  ) : null}
+                </div>
+              )}
+              <div className="flex gap-2 items-end">
+                <div>
+                  <label className="block text-xs text-slate-500 mb-1">
+                    Type
+                  </label>
+                  <select
+                    value={triggerType}
+                    onChange={(e) =>
+                      setTriggerType(
+                        e.target.value as "none" | "inactivity" | "scheduled",
+                      )
+                    }
+                    className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm"
+                  >
+                    <option value="none">None (no trigger)</option>
+                    <option value="inactivity">Inactivity</option>
+                    <option value="scheduled">Scheduled date</option>
+                  </select>
+                </div>
+                {triggerType === "inactivity" && (
+                  <div>
+                    <label className="block text-xs text-slate-500 mb-1">
+                      Days
+                    </label>
+                    <input
+                      type="number"
+                      min="1"
+                      max="3650"
+                      value={triggerDays}
+                      onChange={(e) => setTriggerDays(e.target.value)}
+                      className="w-20 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm"
+                    />
+                  </div>
+                )}
+                {triggerType === "scheduled" && (
+                  <div>
+                    <label className="block text-xs text-slate-500 mb-1">
+                      Date
+                    </label>
+                    <input
+                      type="date"
+                      value={triggerDate}
+                      onChange={(e) => setTriggerDate(e.target.value)}
+                      className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm"
+                    />
+                  </div>
+                )}
+                <button
+                  onClick={saveTrigger}
+                  disabled={savingTrigger}
+                  className="rounded-lg bg-violet-500 text-slate-50 font-semibold px-4 py-2 text-sm disabled:opacity-30"
+                >
+                  {savingTrigger ? "Saving…" : "Save trigger"}
+                </button>
+              </div>
             </section>
           )}
 

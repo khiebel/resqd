@@ -154,6 +154,24 @@ pub struct CreateRingRequest {
     /// time because the ECDH wrap key derivation binds the ring_id
     /// into the HKDF info field. The server validates it's a UUID.
     pub ring_id: String,
+    /// Optional estate trigger config. When set, Executor-role members
+    /// are locked out until the trigger fires.
+    #[serde(default)]
+    pub estate_trigger: Option<EstateTriggerConfig>,
+}
+
+/// Configuration for an estate trigger on a ring.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum EstateTriggerConfig {
+    /// Unlock after no Owner-role member has been active for `days` days.
+    /// "Active" means calling `/rings/{id}/me` (which the web UI does on
+    /// every page load that shows ring data).
+    #[serde(rename = "inactivity")]
+    Inactivity { days: u64 },
+    /// Unlock at a specific unix timestamp.
+    #[serde(rename = "scheduled")]
+    Scheduled { unlock_at: u64 },
 }
 
 #[derive(Serialize)]
@@ -180,6 +198,13 @@ pub struct RingDetail {
     pub owner_user_id: String,
     pub created_at: u64,
     pub members: Vec<MemberSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estate_trigger: Option<EstateTriggerConfig>,
+    /// Unix seconds of the last time an Owner-role member was active.
+    /// Used by the inactivity trigger. Updated on every `/rings/{id}/me`
+    /// call by an Owner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_owner_activity_at: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -318,7 +343,7 @@ pub async fn create_ring(
     let created_at = now_secs();
 
     // Write META row (conditional on not existing).
-    let meta_result = auth
+    let mut put = auth
         .dynamo
         .put_item()
         .table_name(&auth.config.rings_table)
@@ -338,9 +363,20 @@ pub async fn create_ring(
             "created_at",
             AttributeValue::N(created_at.to_string()),
         )
-        .condition_expression("attribute_not_exists(pk)")
-        .send()
-        .await;
+        .item(
+            "last_owner_activity_at",
+            AttributeValue::N(created_at.to_string()),
+        )
+        .condition_expression("attribute_not_exists(pk)");
+
+    // Store estate trigger config as a JSON string attribute if provided.
+    if let Some(trigger) = &req.estate_trigger {
+        let trigger_json = serde_json::to_string(trigger)
+            .map_err(|e| RingError::Internal(anyhow::anyhow!("serialize trigger: {e}")))?;
+        put = put.item("estate_trigger", AttributeValue::S(trigger_json));
+    }
+
+    let meta_result = put.send().await;
 
     if let Err(e) = &meta_result {
         let msg = format!("{e:?}");
@@ -479,6 +515,8 @@ pub async fn get_ring(
     let mut ring_pubkey = String::new();
     let mut owner_user_id = String::new();
     let mut created_at = 0u64;
+    let mut estate_trigger: Option<EstateTriggerConfig> = None;
+    let mut last_owner_activity_at: Option<u64> = None;
     let mut members = Vec::new();
 
     for item in out.items() {
@@ -491,6 +529,10 @@ pub async fn get_ring(
             created_at = take_s_opt(item, "created_at")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
+            estate_trigger = take_s_opt(item, "estate_trigger")
+                .and_then(|s| serde_json::from_str(&s).ok());
+            last_owner_activity_at = take_s_opt(item, "last_owner_activity_at")
+                .and_then(|s| s.parse().ok());
         } else if let Some(uid) = sk.strip_prefix("MEMBER#") {
             members.push(MemberSummary {
                 user_id: uid.to_string(),
@@ -510,6 +552,8 @@ pub async fn get_ring(
         owner_user_id,
         created_at,
         members,
+        estate_trigger,
+        last_owner_activity_at,
     }))
 }
 
@@ -716,6 +760,76 @@ pub async fn remove_member(
     })))
 }
 
+/// `PUT /rings/{id}/trigger` — set or update the estate trigger config.
+/// Owner only.
+pub async fn set_trigger(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(ring_id): Path<String>,
+    Json(req): Json<SetTriggerRequest>,
+) -> RingResult<Json<serde_json::Value>> {
+    let auth = get_auth(&state)?;
+
+    let (caller_role, _) = get_caller_membership(auth, &ring_id, &user.user_id)
+        .await?
+        .ok_or(RingError::NotFound)?;
+    if caller_role != Role::Owner {
+        return Err(RingError::Forbidden(
+            "only owners can configure estate triggers".into(),
+        ));
+    }
+
+    // Validate the trigger config.
+    match &req.estate_trigger {
+        Some(EstateTriggerConfig::Inactivity { days }) => {
+            if *days == 0 || *days > 3650 {
+                return Err(RingError::BadRequest(
+                    "inactivity days must be 1–3650".into(),
+                ));
+            }
+        }
+        Some(EstateTriggerConfig::Scheduled { unlock_at }) => {
+            if *unlock_at <= now_secs() {
+                return Err(RingError::BadRequest(
+                    "scheduled unlock_at must be in the future".into(),
+                ));
+            }
+        }
+        None => {} // clearing the trigger
+    }
+
+    if let Some(trigger) = &req.estate_trigger {
+        let trigger_json = serde_json::to_string(trigger)
+            .map_err(|e| RingError::Internal(anyhow::anyhow!("serialize: {e}")))?;
+        auth.dynamo
+            .update_item()
+            .table_name(&auth.config.rings_table)
+            .key("pk", AttributeValue::S(ring_pk(&ring_id)))
+            .key("sk", AttributeValue::S(META_SK.into()))
+            .update_expression("SET estate_trigger = :t")
+            .expression_attribute_values(":t", AttributeValue::S(trigger_json))
+            .send()
+            .await?;
+    } else {
+        auth.dynamo
+            .update_item()
+            .table_name(&auth.config.rings_table)
+            .key("pk", AttributeValue::S(ring_pk(&ring_id)))
+            .key("sk", AttributeValue::S(META_SK.into()))
+            .update_expression("REMOVE estate_trigger")
+            .send()
+            .await?;
+    }
+
+    info!(ring_id = %ring_id, "estate trigger updated");
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+pub struct SetTriggerRequest {
+    pub estate_trigger: Option<EstateTriggerConfig>,
+}
+
 /// `GET /rings/{id}/me` — return the caller's own membership record
 /// including their `wrapped_ring_privkey_b64` so the browser can
 /// unwrap the ring privkey and use it for ring-asset crypto. This
@@ -730,7 +844,7 @@ pub async fn my_membership(
         .await?
         .ok_or(RingError::NotFound)?;
 
-    // Fetch ring META for the pubkey.
+    // Fetch ring META for the pubkey + estate trigger config.
     let meta_out = auth
         .dynamo
         .get_item()
@@ -740,6 +854,100 @@ pub async fn my_membership(
         .send()
         .await?;
     let meta = meta_out.item.ok_or(RingError::NotFound)?;
+
+    // ── Owner heartbeat ──
+    // Every time an Owner visits this endpoint (which the web UI hits
+    // on page load), bump `last_owner_activity_at` on the ring META
+    // row. This is the inactivity trigger's clock source.
+    if role == Role::Owner {
+        let _ = auth
+            .dynamo
+            .update_item()
+            .table_name(&auth.config.rings_table)
+            .key("pk", AttributeValue::S(ring_pk(&ring_id)))
+            .key("sk", AttributeValue::S(META_SK.into()))
+            .update_expression("SET last_owner_activity_at = :t")
+            .expression_attribute_values(
+                ":t",
+                AttributeValue::N(now_secs().to_string()),
+            )
+            .send()
+            .await;
+    }
+
+    // ── Executor estate gate ──
+    // Executors only receive their wrapped ring privkey after the
+    // estate trigger has fired. We check the condition lazily here
+    // and set `estate_unlocked_at` if it's met. If not, we return
+    // the response WITHOUT the wrapped key and with a clear message.
+    if role == Role::Executor {
+        let already_unlocked = take_s_opt(&item, "estate_unlocked_at")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+            > 0;
+
+        if !already_unlocked {
+            let trigger: Option<EstateTriggerConfig> = take_s_opt(&meta, "estate_trigger")
+                .and_then(|s| serde_json::from_str(&s).ok());
+
+            let should_unlock = match &trigger {
+                Some(EstateTriggerConfig::Inactivity { days }) => {
+                    let last_activity = take_s_opt(&meta, "last_owner_activity_at")
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    let threshold = *days * 86400;
+                    last_activity > 0 && now_secs().saturating_sub(last_activity) >= threshold
+                }
+                Some(EstateTriggerConfig::Scheduled { unlock_at }) => {
+                    now_secs() >= *unlock_at
+                }
+                None => false,
+            };
+
+            if should_unlock {
+                // Fire the trigger: set estate_unlocked_at on the
+                // Executor's membership row.
+                let _ = auth
+                    .dynamo
+                    .update_item()
+                    .table_name(&auth.config.rings_table)
+                    .key("pk", AttributeValue::S(ring_pk(&ring_id)))
+                    .key(
+                        "sk",
+                        AttributeValue::S(member_sk(&user.user_id)),
+                    )
+                    .update_expression("SET estate_unlocked_at = :t")
+                    .expression_attribute_values(
+                        ":t",
+                        AttributeValue::N(now_secs().to_string()),
+                    )
+                    .send()
+                    .await;
+                info!(ring_id = %ring_id, executor = %user.user_id, "estate trigger fired — executor unlocked");
+            } else {
+                // Not yet unlocked — return a response without the
+                // wrapped key so the Executor knows they're locked
+                // out and why.
+                let trigger_desc = match &trigger {
+                    Some(EstateTriggerConfig::Inactivity { days }) => {
+                        format!("inactivity trigger ({days} days)")
+                    }
+                    Some(EstateTriggerConfig::Scheduled { unlock_at }) => {
+                        format!("scheduled trigger (unix {unlock_at})")
+                    }
+                    None => "no trigger configured".into(),
+                };
+                return Ok(Json(serde_json::json!({
+                    "ring_id": ring_id,
+                    "role": "executor",
+                    "estate_locked": true,
+                    "estate_trigger": trigger_desc,
+                    "ring_pubkey_x25519_b64": take_s_opt(&meta, "ring_pubkey_x25519_b64"),
+                    // No wrapped_ring_privkey_b64 — locked.
+                })));
+            }
+        }
+    }
 
     Ok(Json(serde_json::json!({
         "ring_id": ring_id,
