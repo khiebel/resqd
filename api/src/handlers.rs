@@ -64,6 +64,13 @@ fn asset_id_from_sidecar_key(key: &str) -> Option<&str> {
 // modify, delete, or re-share the underlying asset — those paths
 // check `asset.owner_id == caller.user_id` and reject sharees.
 
+/// Sidecar key for ring-owned assets. Mirrors the _owner/{uid}/...
+/// pattern but scoped to a ring_id so list_vault can enumerate all
+/// assets belonging to a ring with one `list_prefix` call.
+fn ring_asset_sidecar_key(ring_id: &str, asset_id: &str) -> String {
+    format!("_ring_assets/{ring_id}/{asset_id}.json")
+}
+
 fn share_sidecar_owner_key(asset_id: &str, recipient_user_id: &str) -> String {
     format!("_shares/{asset_id}/{recipient_user_id}.json")
 }
@@ -206,6 +213,19 @@ pub struct CommitRequest {
     pub wrapped_key_b64: Option<String>,
     #[serde(default)]
     pub encrypted_meta_b64: Option<String>,
+    /// When present, the asset is owned by a family ring instead of
+    /// an individual user. The per-asset key in `wrapped_key_b64` is
+    /// wrapped to the ring's X25519 pubkey via `sender_wrap_key(
+    /// uploader_priv, ring_pub, asset_id)`. Any ring member who holds
+    /// the ring privkey can read. Quota is charged to the uploader.
+    #[serde(default)]
+    pub ring_id: Option<String>,
+    /// Uploader's X25519 pubkey, required when `ring_id` is present.
+    /// Stored in the manifest so ring members can ECDH-derive the
+    /// wrap key on the read side: `recipient_wrap_key(ring_priv,
+    /// uploader_pub, asset_id)`.
+    #[serde(default)]
+    pub uploader_pubkey_x25519_b64: Option<String>,
 }
 
 /// Response from `POST /vault/{id}/commit` — same shape as the legacy
@@ -262,6 +282,14 @@ pub struct ShardedFetchResponse {
     /// unwrap under their own master key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sender_pubkey_x25519_b64: Option<String>,
+    /// Ring id, when the asset belongs to a family ring.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ring_id: Option<String>,
+    /// Uploader's X25519 pubkey — present on ring assets so the
+    /// reader can `recipient_wrap_key(ring_priv, uploader_pub,
+    /// asset_id)` to unwrap the per-asset key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uploader_pubkey_x25519_b64: Option<String>,
 }
 
 /// Entry in the `GET /vault` listing response. `encrypted_meta_b64`
@@ -292,6 +320,12 @@ pub struct VaultListItem {
     /// trip to `/users/lookup`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sender_pubkey_x25519_b64: Option<String>,
+    /// Ring id when role == "ring_member".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ring_id: Option<String>,
+    /// Uploader pubkey for ring assets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uploader_pubkey_x25519_b64: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -333,6 +367,16 @@ struct AssetManifest {
     /// "recently added" sorting.
     #[serde(default)]
     created_at: Option<u64>,
+    /// When present, this asset belongs to a family ring (Phase 3).
+    /// The `wrapped_key_b64` is wrapped to the ring's X25519 pubkey,
+    /// not the individual user's master key.
+    #[serde(default)]
+    ring_id: Option<String>,
+    /// X25519 pubkey of the user who uploaded this ring asset. Required
+    /// when `ring_id` is present — ring members need it for the read-
+    /// side ECDH: `recipient_wrap_key(ring_priv, uploader_pub, asset_id)`.
+    #[serde(default)]
+    uploader_pubkey_x25519_b64: Option<String>,
 }
 
 // -------------------------------------------------------------------
@@ -588,6 +632,48 @@ pub async fn commit(
         }
     }
 
+    // ── Ring-owned asset validation ──
+    //
+    // If the caller specified a ring_id, verify membership + write role.
+    // Ring assets need an uploader pubkey for the read-side ECDH so the
+    // client must supply it, and it must match their stored identity.
+    if let Some(ring_id) = &req.ring_id {
+        let auth_state = state.auth.as_ref().ok_or(ApiError::Auth(
+            crate::auth::AuthError::Unauthorized,
+        ))?;
+        let caller = user.as_ref().ok_or(ApiError::Auth(
+            crate::auth::AuthError::Unauthorized,
+        ))?;
+        let membership = crate::rings::get_caller_membership_pub(
+            auth_state, ring_id, &caller.user_id,
+        )
+        .await
+        .map_err(|_| ApiError::NotFound)?
+        .ok_or(ApiError::NotFound)?;
+        if !membership.0.can_write() {
+            return Err(ApiError::BadRequest(format!(
+                "your ring role '{}' cannot upload — Owner or Adult required",
+                membership.0.as_str()
+            )));
+        }
+        // Uploader pubkey is required and must match.
+        let up_pub = req.uploader_pubkey_x25519_b64.as_deref().ok_or(
+            ApiError::BadRequest(
+                "uploader_pubkey_x25519_b64 required when ring_id is present".into(),
+            ),
+        )?;
+        let caller_row = crate::auth::get_user_by_email(auth_state, &caller.email)
+            .await
+            .map_err(ApiError::from)?
+            .ok_or(ApiError::Internal(anyhow::anyhow!("caller missing")))?;
+        let stored_pk = caller_row.pubkey_x25519_b64.as_deref().unwrap_or("");
+        if stored_pk != up_pub {
+            return Err(ApiError::BadRequest(
+                "uploader_pubkey does not match your stored identity".into(),
+            ));
+        }
+    }
+
     // Build the manifest + canary chain sidecar.
     let owner_id = user.as_ref().map(|u| u.user_id.clone());
     let created_at = now_secs();
@@ -600,6 +686,8 @@ pub async fn commit(
         wrapped_key_b64: req.wrapped_key_b64.clone(),
         encrypted_meta_b64: req.encrypted_meta_b64.clone(),
         created_at: Some(created_at),
+        ring_id: req.ring_id.clone(),
+        uploader_pubkey_x25519_b64: req.uploader_pubkey_x25519_b64.clone(),
     };
     let manifest_json = serde_json::to_vec(&manifest)
         .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
@@ -608,15 +696,27 @@ pub async fn commit(
         .put(&manifest_key(&asset_id), Bytes::from(manifest_json))
         .await?;
 
-    // Owner sidecar — a tiny raw-S3 record under `_owner/{uid}/{asset_id}.json`
-    // that the listing endpoint enumerates via ListObjectsV2. We write it
-    // via the concrete S3 client (not the erasure-coded vault) because the
-    // vault doesn't expose list.
-    if let Some(uid) = &owner_id {
-        // Inline the encrypted meta in the owner sidecar so the listing
-        // handler can return it without having to read each asset's
-        // manifest. Still opaque to the server — the client encrypts it
-        // under the master key before we ever see it.
+    // Sidecar: ring-owned assets go to `_ring_assets/{ring_id}/...`;
+    // individually owned assets go to `_owner/{uid}/...`. Both carry
+    // the same encrypted_meta_b64 blob for the listing endpoint.
+    use resqd_storage::ObjectStore;
+    if let Some(ring_id) = &req.ring_id {
+        let sidecar = serde_json::json!({
+            "asset_id": asset_id,
+            "created_at": created_at,
+            "encrypted_meta_b64": req.encrypted_meta_b64,
+            "uploader_pubkey_x25519_b64": req.uploader_pubkey_x25519_b64,
+        });
+        let bytes = serde_json::to_vec(&sidecar)
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
+        state
+            .s3
+            .put(
+                &ring_asset_sidecar_key(ring_id, &asset_id),
+                Bytes::from(bytes),
+            )
+            .await?;
+    } else if let Some(uid) = &owner_id {
         let sidecar = serde_json::json!({
             "asset_id": asset_id,
             "created_at": created_at,
@@ -624,7 +724,6 @@ pub async fn commit(
         });
         let bytes = serde_json::to_vec(&sidecar)
             .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
-        use resqd_storage::ObjectStore;
         state
             .s3
             .put(&owner_sidecar_key(uid, &asset_id), Bytes::from(bytes))
@@ -722,64 +821,103 @@ pub async fn fetch(
             let manifest: AssetManifest = serde_json::from_slice(&m)
                 .map_err(|e| ApiError::Internal(anyhow::anyhow!("decode manifest: {e}")))?;
 
-            // Access check:
+            // Access check — four cases:
             //
-            // - Owner: reads the manifest's master-key-wrapped per-asset
-            //   key directly. `role = "owner"`.
-            // - Sharee: must have a `_shared_with/{user_id}/{asset_id}`
-            //   sidecar. The sidecar's `wrapped_key_for_recipient_b64`
-            //   is returned IN PLACE OF the owner's wrapped key, along
-            //   with the sender's pubkey so the client can ECDH-derive
-            //   the share wrap key before unwrapping. `role = "sharee"`.
-            // - Anyone else: 404, same as "not found".
+            // 1. Ring-owned asset (manifest.ring_id present): caller
+            //    must be a member of the ring. Returns wrapped_key
+            //    and uploader_pubkey so the client can ECDH with the
+            //    ring privkey. `role = "ring_member"`.
             //
-            // Pre-auth assets (owner_id = None) remain publicly
-            // accessible for legacy compatibility.
+            // 2. Individual owner: `role = "owner"`, wrapped_key
+            //    sealed under the caller's master key.
+            //
+            // 3. Sharee: `_shared_with/{user_id}/{asset_id}` sidecar
+            //    → `role = "sharee"`, wrapped_key sealed under the
+            //    ECDH-derived share wrap key.
+            //
+            // 4. Pre-auth / legacy: `owner_id = None` → public by id.
             use resqd_storage::ObjectStore;
-            let (role, wrapped_key_b64, encrypted_meta_b64, sender_pubkey): (
+
+            // Ring asset — check ring membership.
+            let ring_access: Option<(
                 &'static str,
                 Option<String>,
                 Option<String>,
                 Option<String>,
-            ) = match (&manifest.owner_id, &user) {
-                (Some(owner), Some(u)) if u.user_id == *owner => (
-                    "owner",
+                Option<String>,
+                Option<String>,
+            )> = if let Some(ring_id) = &manifest.ring_id {
+                let u = user.as_ref().ok_or(ApiError::NotFound)?;
+                let auth_state = state.auth.as_ref().ok_or(ApiError::Auth(
+                    crate::auth::AuthError::Unauthorized,
+                ))?;
+                let _membership = crate::rings::get_caller_membership_pub(
+                    auth_state, ring_id, &u.user_id,
+                )
+                .await
+                .map_err(|_| ApiError::NotFound)?
+                .ok_or(ApiError::NotFound)?;
+                Some((
+                    "ring_member",
                     manifest.wrapped_key_b64.clone(),
                     manifest.encrypted_meta_b64.clone(),
-                    None,
-                ),
-                (Some(_), Some(u)) => {
-                    // Non-owner — look for a share sidecar.
-                    let key = share_sidecar_recipient_key(&u.user_id, &asset_id);
-                    match state.s3.get(&key).await {
-                        Ok(bytes) => {
-                            let rec: RecipientShareRecord =
-                                serde_json::from_slice(&bytes).map_err(|e| {
-                                    ApiError::Internal(anyhow::anyhow!(
-                                        "decode share sidecar: {e}"
-                                    ))
-                                })?;
-                            (
-                                "sharee",
-                                Some(rec.wrapped_key_for_recipient_b64),
-                                rec.encrypted_meta_for_recipient_b64,
-                                Some(rec.sender_pubkey_x25519_b64),
-                            )
-                        }
-                        Err(resqd_storage::StorageError::NotFound(_)) => {
-                            return Err(ApiError::NotFound);
-                        }
-                        Err(e) => return Err(ApiError::Storage(e)),
-                    }
-                }
-                (Some(_), None) => return Err(ApiError::NotFound),
-                (None, _) => (
-                    "owner",
-                    manifest.wrapped_key_b64.clone(),
-                    manifest.encrypted_meta_b64.clone(),
-                    None,
-                ),
+                    None, // no sender_pubkey for rings
+                    Some(ring_id.clone()),
+                    manifest.uploader_pubkey_x25519_b64.clone(),
+                ))
+            } else {
+                None
             };
+
+            let (role, wrapped_key_b64, encrypted_meta_b64, sender_pubkey, resp_ring_id, resp_uploader_pub) =
+                if let Some(ra) = ring_access {
+                    ra
+                } else {
+                    match (&manifest.owner_id, &user) {
+                        (Some(owner), Some(u)) if u.user_id == *owner => (
+                            "owner",
+                            manifest.wrapped_key_b64.clone(),
+                            manifest.encrypted_meta_b64.clone(),
+                            None,
+                            None,
+                            None,
+                        ),
+                        (Some(_), Some(u)) => {
+                            let key = share_sidecar_recipient_key(&u.user_id, &asset_id);
+                            match state.s3.get(&key).await {
+                                Ok(bytes) => {
+                                    let rec: RecipientShareRecord =
+                                        serde_json::from_slice(&bytes).map_err(|e| {
+                                            ApiError::Internal(anyhow::anyhow!(
+                                                "decode share sidecar: {e}"
+                                            ))
+                                        })?;
+                                    (
+                                        "sharee",
+                                        Some(rec.wrapped_key_for_recipient_b64),
+                                        rec.encrypted_meta_for_recipient_b64,
+                                        Some(rec.sender_pubkey_x25519_b64),
+                                        None,
+                                        None,
+                                    )
+                                }
+                                Err(resqd_storage::StorageError::NotFound(_)) => {
+                                    return Err(ApiError::NotFound);
+                                }
+                                Err(e) => return Err(ApiError::Storage(e)),
+                            }
+                        }
+                        (Some(_), None) => return Err(ApiError::NotFound),
+                        (None, _) => (
+                            "owner",
+                            manifest.wrapped_key_b64.clone(),
+                            manifest.encrypted_meta_b64.clone(),
+                            None,
+                            None,
+                            None,
+                        ),
+                    }
+                };
 
             let mut slots = Vec::with_capacity(TOTAL_SHARDS);
             for i in 0..TOTAL_SHARDS {
@@ -811,6 +949,8 @@ pub async fn fetch(
                 wrapped_key_b64,
                 encrypted_meta_b64,
                 sender_pubkey_x25519_b64: sender_pubkey,
+                ring_id: resp_ring_id,
+                uploader_pubkey_x25519_b64: resp_uploader_pub,
             };
             Ok((
                 [
@@ -1019,6 +1159,8 @@ pub async fn list_vault(
                 role: "owner",
                 shared_by_email: None,
                 sender_pubkey_x25519_b64: None,
+                ring_id: None,
+                uploader_pubkey_x25519_b64: None,
             })
         }
     });
@@ -1044,17 +1186,104 @@ pub async fn list_vault(
                 role: "sharee",
                 shared_by_email: Some(rec.sender_email),
                 sender_pubkey_x25519_b64: Some(rec.sender_pubkey_x25519_b64),
+                ring_id: None,
+                uploader_pubkey_x25519_b64: None,
             })
         }
     });
 
-    let (owned_items, shared_items) =
-        tokio::join!(join_all(owned_fetches), join_all(shared_fetches));
+    // Ring assets — enumerate every ring the caller belongs to, then
+    // fan out list_prefix for each ring's _ring_assets/ prefix. For
+    // the alpha population (1-3 rings per user, 0-10 assets per ring)
+    // this is a handful of S3 calls in parallel.
+    let ring_keys_fut = async {
+        let auth = match state.auth.as_ref() {
+            Some(a) => a,
+            None => return vec![],
+        };
+        let ring_out = auth
+            .dynamo
+            .query()
+            .table_name(&auth.config.rings_table)
+            .index_name("user_id-index")
+            .key_condition_expression("user_id = :uid")
+            .expression_attribute_values(
+                ":uid",
+                aws_sdk_dynamodb::types::AttributeValue::S(user.user_id.clone()),
+            )
+            .send()
+            .await;
+        let ring_out = match ring_out {
+            Ok(o) => o,
+            Err(_) => return vec![],
+        };
+        let ring_ids: Vec<String> = ring_out
+            .items()
+            .iter()
+            .filter_map(|i| i.get("ring_id").and_then(|v| v.as_s().ok().cloned()))
+            .collect();
+        let futs = ring_ids.into_iter().map(|rid| {
+            let s3 = state.s3.clone();
+            async move {
+                let prefix = format!("_ring_assets/{rid}/");
+                let keys = s3.list_prefix(&prefix).await.unwrap_or_default();
+                keys.into_iter()
+                    .filter_map(|(key, modified)| {
+                        let asset_id = asset_id_from_sidecar_key(&key)?.to_string();
+                        Some((rid.clone(), asset_id, modified))
+                    })
+                    .collect::<Vec<_>>()
+            }
+        });
+        join_all(futs).await.into_iter().flatten().collect::<Vec<_>>()
+    };
+
+    let (owned_items, shared_items, ring_asset_keys) = tokio::join!(
+        join_all(owned_fetches),
+        join_all(shared_fetches),
+        ring_keys_fut
+    );
+
+    // Fetch ring asset sidecars in parallel.
+    let ring_fetches = ring_asset_keys.into_iter().map(|(ring_id, asset_id, modified)| {
+        let s3 = state.s3.clone();
+        async move {
+            let key = ring_asset_sidecar_key(&ring_id, &asset_id);
+            let body = s3.get(&key).await.ok()?;
+            #[derive(Deserialize)]
+            struct RingAssetSidecar {
+                #[serde(default)]
+                created_at: u64,
+                #[serde(default)]
+                encrypted_meta_b64: Option<String>,
+                #[serde(default)]
+                uploader_pubkey_x25519_b64: Option<String>,
+            }
+            let sc: RingAssetSidecar = serde_json::from_slice(&body).ok()?;
+            let created_at = if sc.created_at > 0 {
+                sc.created_at
+            } else {
+                modified.map(|s| s as u64).unwrap_or(0)
+            };
+            Some(VaultListItem {
+                asset_id,
+                created_at,
+                encrypted_meta_b64: sc.encrypted_meta_b64,
+                role: "ring_member",
+                shared_by_email: None,
+                sender_pubkey_x25519_b64: None,
+                ring_id: Some(ring_id),
+                uploader_pubkey_x25519_b64: sc.uploader_pubkey_x25519_b64,
+            })
+        }
+    });
+    let ring_items = join_all(ring_fetches).await;
 
     let mut assets: Vec<VaultListItem> = owned_items
         .into_iter()
         .flatten()
         .chain(shared_items.into_iter().flatten())
+        .chain(ring_items.into_iter().flatten())
         .collect();
     // Newest first, independent of role.
     assets.sort_by(|a, b| b.created_at.cmp(&a.created_at));

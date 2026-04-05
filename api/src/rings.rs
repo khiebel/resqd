@@ -106,7 +106,7 @@ pub enum Role {
 }
 
 impl Role {
-    fn from_str(s: &str) -> Option<Self> {
+    pub fn from_str(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "owner" => Some(Self::Owner),
             "adult" => Some(Self::Adult),
@@ -115,7 +115,7 @@ impl Role {
             _ => None,
         }
     }
-    fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Owner => "owner",
             Self::Adult => "adult",
@@ -123,18 +123,16 @@ impl Role {
             Self::Executor => "executor",
         }
     }
-    fn can_invite(&self) -> bool {
+    pub fn can_invite(&self) -> bool {
         matches!(self, Self::Owner | Self::Adult)
     }
-    fn can_remove(&self) -> bool {
+    pub fn can_remove(&self) -> bool {
         matches!(self, Self::Owner)
     }
-    #[allow(dead_code)] // Used by ring-asset upload (task #10, follow-up commit)
-    fn can_write(&self) -> bool {
+    pub fn can_write(&self) -> bool {
         matches!(self, Self::Owner | Self::Adult)
     }
-    #[allow(dead_code)] // Used by ring-asset fetch (task #10, follow-up commit)
-    fn can_read(&self) -> bool {
+    pub fn can_read(&self) -> bool {
         // Executor reads are gated by estate_unlocked_at, not here.
         // For now, all roles can read. Estate trigger enforcement will
         // layer on top in Phase 4.
@@ -236,6 +234,15 @@ fn take_s_opt(item: &HashMap<String, AttributeValue>, key: &str) -> Option<Strin
 
 fn get_auth(state: &AppState) -> RingResult<&AuthState> {
     state.auth.as_ref().ok_or(RingError::Unauthorized)
+}
+
+/// Public re-export for use by `handlers.rs` ring-asset commit/fetch paths.
+pub async fn get_caller_membership_pub(
+    auth: &AuthState,
+    ring_id: &str,
+    user_id: &str,
+) -> RingResult<Option<(Role, HashMap<String, AttributeValue>)>> {
+    get_caller_membership(auth, ring_id, user_id).await
 }
 
 async fn get_caller_membership(
