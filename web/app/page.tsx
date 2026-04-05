@@ -55,14 +55,14 @@ function TopNav() {
           </span>
         </Link>
         <div className="flex items-center gap-6 text-sm text-slate-400">
+          <Link href="/why/" className="hover:text-slate-100 hidden md:inline">
+            Why RESQD
+          </Link>
           <Link
             href="/how-it-works/"
             className="hover:text-slate-100 hidden md:inline"
           >
             How it works
-          </Link>
-          <Link href="/why/" className="hover:text-slate-100 hidden md:inline">
-            Why RESQD
           </Link>
           <a href="#pricing" className="hover:text-slate-100 hidden md:inline">
             Pricing
@@ -414,11 +414,11 @@ function Footer() {
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div>© 2026 RESQD · Quantum-secured digital vault</div>
           <div className="flex gap-5 flex-wrap">
-            <Link href="/how-it-works/" className="hover:text-slate-300">
-              How it works
-            </Link>
             <Link href="/why/" className="hover:text-slate-300">
               Why RESQD
+            </Link>
+            <Link href="/how-it-works/" className="hover:text-slate-300">
+              How it works
             </Link>
             <a href="#pricing" className="hover:text-slate-300">Pricing</a>
             <Link href="/security-model/" className="hover:text-slate-300">

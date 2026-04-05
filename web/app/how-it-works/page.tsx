@@ -37,11 +37,11 @@ export default function HowItWorksPage() {
             RESQD
           </Link>
           <div className="flex items-center gap-6 text-sm text-slate-400">
-            <Link href="/how-it-works/" className="text-slate-100">
-              How it works
-            </Link>
             <Link href="/why/" className="hover:text-slate-100">
               Why RESQD
+            </Link>
+            <Link href="/how-it-works/" className="text-slate-100">
+              How it works
             </Link>
             <Link href="/signup/" className="rounded-lg bg-amber-500 text-slate-900 font-semibold px-4 py-2">
               Sign up

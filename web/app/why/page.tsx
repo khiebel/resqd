@@ -14,11 +14,11 @@ export default function WhyPage() {
             RESQD
           </Link>
           <div className="flex items-center gap-6 text-sm text-slate-400">
-            <Link href="/how-it-works/" className="hover:text-slate-100">
-              How it works
-            </Link>
             <Link href="/why/" className="text-slate-100">
               Why RESQD
+            </Link>
+            <Link href="/how-it-works/" className="hover:text-slate-100">
+              How it works
             </Link>
             <Link
               href="/signup/"
