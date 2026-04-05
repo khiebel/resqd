@@ -7,6 +7,7 @@ import {
   fetchMe,
   loadMasterKey,
   loadX25519Identity,
+  ensureRingPrivkey,
   logout,
   type SessionUser,
 } from "../lib/passkey";
@@ -15,12 +16,16 @@ interface VaultAsset {
   asset_id: string;
   created_at: number;
   encrypted_meta_b64?: string | null;
-  /** "owner" or "sharee". Defaults to "owner" on legacy rows. */
-  role?: "owner" | "sharee";
+  /** "owner", "sharee", or "ring_member". Defaults to "owner" on legacy rows. */
+  role?: "owner" | "sharee" | "ring_member";
   /** For sharees: who shared it with us. */
   shared_by_email?: string | null;
   /** For sharees: sender's X25519 public identity. */
   sender_pubkey_x25519_b64?: string | null;
+  /** For ring_member items: ring id. */
+  ring_id?: string | null;
+  /** For ring_member items: uploader's pubkey for ECDH unwrap. */
+  uploader_pubkey_x25519_b64?: string | null;
   /** Populated client-side after decrypting `encrypted_meta_b64`. */
   name?: string | null;
   mime?: string | null;
@@ -489,9 +494,16 @@ export default function VaultPage() {
             if (!a.encrypted_meta_b64) continue;
             try {
               let keyForMeta: Uint8Array;
-              if (a.role === "sharee") {
+              if (a.role === "ring_member") {
+                // Ring-asset meta is currently sealed under the
+                // uploader's master key — other ring members can't
+                // decrypt it in the listing. They'll see the asset_id
+                // and get the real filename after fetching + decrypting
+                // the full file (the frame header has the name).
+                // Proper ring-meta-key sealing deferred to a follow-up.
+                continue;
+              } else if (a.role === "sharee") {
                 if (!ident || !a.sender_pubkey_x25519_b64) {
-                  // Can't derive the wrap key without both halves.
                   continue;
                 }
                 const wrapB64 = crypto.x25519_recipient_wrap_key(
@@ -578,6 +590,12 @@ export default function VaultPage() {
             className="text-xs text-slate-400 hover:text-slate-200"
           >
             Connect Claude
+          </Link>
+          <Link
+            href="/rings/"
+            className="text-xs text-slate-400 hover:text-slate-200"
+          >
+            Rings
           </Link>
           <Link
             href="/settings/"
@@ -681,6 +699,8 @@ export default function VaultPage() {
             <tbody>
               {view.assets.map((a) => {
                 const isSharee = a.role === "sharee";
+                const isRing = a.role === "ring_member";
+                const isReadOnly = isSharee || (isRing && false); // ring Owner/Adult can delete; defer role check
                 return (
                   <tr
                     key={`${a.role ?? "owner"}:${a.asset_id}`}
@@ -716,6 +736,11 @@ export default function VaultPage() {
                         {isSharee && (
                           <span className="shrink-0 text-[10px] uppercase tracking-wider bg-violet-500/20 text-violet-300 px-1.5 py-0.5 rounded">
                             Shared
+                          </span>
+                        )}
+                        {isRing && (
+                          <span className="shrink-0 text-[10px] uppercase tracking-wider bg-amber-500/20 text-amber-300 px-1.5 py-0.5 rounded">
+                            Ring
                           </span>
                         )}
                       </div>

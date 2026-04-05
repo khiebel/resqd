@@ -173,8 +173,77 @@ export function saveX25519Privkey(privB64: string, pubB64: string): void {
 
 export function loadX25519Identity(): { privB64: string; pubB64: string } | null {
   const priv = sessionStorage.getItem(X25519_PRIVKEY_STORAGE);
-  const pub = sessionStorage.getItem(X25519_PUBKEY_STORAGE);
-  return priv && pub ? { privB64: priv, pubB64: pub } : null;
+  const pub_ = sessionStorage.getItem(X25519_PUBKEY_STORAGE);
+  return priv && pub_ ? { privB64: priv, pubB64: pub_ } : null;
+}
+
+// ── Ring privkey session cache ─────────────────────────────────────
+//
+// Ring privkeys are fetched lazily from GET /rings/{id}/me and
+// unwrapped client-side. We cache them in sessionStorage so
+// subsequent ring-asset reads don't need another round trip +
+// ECDH unwrap.
+
+const RING_PRIVKEY_PREFIX = "resqd_ring_privkey_";
+
+export function saveRingPrivkey(ringId: string, privB64: string): void {
+  sessionStorage.setItem(`${RING_PRIVKEY_PREFIX}${ringId}`, privB64);
+}
+
+export function loadRingPrivkey(ringId: string): string | null {
+  return sessionStorage.getItem(`${RING_PRIVKEY_PREFIX}${ringId}`);
+}
+
+/**
+ * Ensure the ring privkey for `ringId` is cached in session. Fetches
+ * the membership record from the API if not already cached, unwraps
+ * the sealed ring privkey via the caller's X25519 identity, and
+ * stashes it.
+ *
+ * Returns the ring privkey (base64) or null if the caller is not a
+ * member or the unwrap fails.
+ */
+export async function ensureRingPrivkey(
+  ringId: string,
+): Promise<string | null> {
+  const cached = loadRingPrivkey(ringId);
+  if (cached) return cached;
+
+  const ident = loadX25519Identity();
+  if (!ident) return null;
+
+  try {
+    const resp = await fetch(`${API_URL}/rings/${encodeURIComponent(ringId)}/me`, {
+      credentials: "include",
+    });
+    if (!resp.ok) return null;
+    const data = (await resp.json()) as {
+      wrapped_ring_privkey_b64?: string;
+      inviter_pubkey_x25519_b64?: string;
+      ring_pubkey_x25519_b64?: string;
+    };
+    if (!data.wrapped_ring_privkey_b64 || !data.inviter_pubkey_x25519_b64) {
+      return null;
+    }
+
+    const crypto = await getCrypto();
+    // Derive the wrap key the inviter used to seal this ring privkey
+    // for us: recipient_wrap_key(my_priv, inviter_pub, ring_id).
+    const wrapKeyB64 = crypto.x25519_recipient_wrap_key(
+      ident.privB64,
+      data.inviter_pubkey_x25519_b64,
+      ringId,
+    );
+    const wrapKey = base64ToBytes(wrapKeyB64);
+    const wrappedJson = atob(data.wrapped_ring_privkey_b64);
+    const ringPrivBytes = crypto.decrypt_data(wrapKey, wrappedJson);
+    const ringPrivB64 = bytesToBase64(ringPrivBytes);
+    saveRingPrivkey(ringId, ringPrivB64);
+    return ringPrivB64;
+  } catch (e) {
+    console.warn(`ensureRingPrivkey(${ringId}) failed:`, e);
+    return null;
+  }
 }
 
 /**

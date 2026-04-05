@@ -9,7 +9,12 @@ import {
   base64ToBytes,
   API_URL,
 } from "../lib/resqdCrypto";
-import { loadMasterKey, fetchMe, loadX25519Identity } from "../lib/passkey";
+import {
+  loadMasterKey,
+  fetchMe,
+  loadX25519Identity,
+  ensureRingPrivkey,
+} from "../lib/passkey";
 
 type FetchState =
   | { phase: "idle" }
@@ -43,11 +48,14 @@ interface ShardedFetchResponse {
    * means it's sealed under the ECDH-derived share wrap key and
    * `sender_pubkey_x25519_b64` will be present.
    */
-  role?: "owner" | "sharee";
+  role?: "owner" | "sharee" | "ring_member";
   /** Per-asset key — wrapping depends on `role`. */
   wrapped_key_b64?: string;
   /** For sharee fetches only. */
   sender_pubkey_x25519_b64?: string;
+  /** Ring asset fields. */
+  ring_id?: string;
+  uploader_pubkey_x25519_b64?: string;
 }
 
 /** Unwrap the {v:1, name, mime} plaintext frame the upload page writes. */
@@ -153,6 +161,26 @@ function FetchInner() {
         let assetKey: Uint8Array;
         if (!manifest.wrapped_key_b64) {
           assetKey = masterKey;
+        } else if (manifest.role === "ring_member") {
+          // Ring asset: unwrap per-asset key using ring privkey +
+          // uploader's pubkey via ECDH.
+          if (!manifest.ring_id || !manifest.uploader_pubkey_x25519_b64) {
+            throw new Error("ring asset missing ring_id or uploader_pubkey");
+          }
+          const ringPrivB64 = await ensureRingPrivkey(manifest.ring_id);
+          if (!ringPrivB64) {
+            throw new Error(
+              "could not unwrap ring privkey — log out and back in, or check ring membership",
+            );
+          }
+          const wrapKeyB64 = crypto.x25519_recipient_wrap_key(
+            ringPrivB64,
+            manifest.uploader_pubkey_x25519_b64,
+            manifest.asset_id,
+          );
+          const wrapKey = base64ToBytes(wrapKeyB64);
+          const wrappedJson = atob(manifest.wrapped_key_b64);
+          assetKey = crypto.decrypt_data(wrapKey, wrappedJson);
         } else if (manifest.role === "sharee") {
           if (!manifest.sender_pubkey_x25519_b64) {
             throw new Error("sharee fetch missing sender_pubkey_x25519_b64");
