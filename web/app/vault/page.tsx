@@ -149,6 +149,12 @@ export default function VaultPage() {
           >
             Settings
           </Link>
+          <Link
+            href="/billing/"
+            className="text-xs text-slate-400 hover:text-slate-200"
+          >
+            Billing
+          </Link>
           <button
             onClick={onLogout}
             className="text-xs text-slate-400 hover:text-slate-200"
