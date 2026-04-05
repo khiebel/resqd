@@ -326,11 +326,12 @@
             verifies integrity on the blockchain, and uses post-quantum cryptography
             to <strong>prove</strong> no one has ever seen your secrets.
         </p>
-        <div class="waitlist">
-            <input type="email" placeholder="Enter your email for early access" id="email-input">
-            <button onclick="joinWaitlist()">Join Waitlist</button>
-        </div>
-        <p class="waitlist-note">Be first to rescue your digital life. No spam, ever.</p>
+        <form class="waitlist" id="waitlist-form-1" data-source="hero" autocomplete="off">
+            <input type="email" placeholder="Enter your email for early access" name="email" id="email-input" required>
+            <input type="text" name="website" tabindex="-1" autocomplete="off" style="position:absolute;left:-9999px;" aria-hidden="true">
+            <button type="submit">Join Waitlist</button>
+        </form>
+        <p class="waitlist-note" id="waitlist-note-1">Be first to rescue your digital life. No spam, ever.</p>
         <img src="/assets/hero.png" alt="RESQD Quantum Shield" class="hero-image">
     </section>
 
@@ -438,10 +439,12 @@
     <section class="section" style="text-align: center; padding-bottom: 80px;">
         <h2 class="section-title">Ready to Rescue Your Digital Life?</h2>
         <p class="section-sub">Join the waitlist for early access. Alpha launching soon.</p>
-        <div class="waitlist" style="margin-top: 30px;">
-            <input type="email" placeholder="your@email.com" id="email-input-2">
-            <button onclick="joinWaitlist2()">Get Early Access</button>
-        </div>
+        <form class="waitlist" id="waitlist-form-2" data-source="cta" autocomplete="off" style="margin-top: 30px;">
+            <input type="email" placeholder="your@email.com" name="email" id="email-input-2" required>
+            <input type="text" name="website" tabindex="-1" autocomplete="off" style="position:absolute;left:-9999px;" aria-hidden="true">
+            <button type="submit">Get Early Access</button>
+        </form>
+        <p class="waitlist-note" id="waitlist-note-2" style="margin-top: 16px;"></p>
     </section>
 </div>
 
@@ -453,20 +456,54 @@
 </footer>
 
 <script>
-function joinWaitlist() {
-    const email = document.getElementById('email-input').value;
-    if (email && email.includes('@')) {
-        alert('Thanks! You\'re on the RESQD waitlist. We\'ll be in touch soon.');
-        document.getElementById('email-input').value = '';
+(function () {
+  async function submitWaitlist(form, noteEl) {
+    const email = form.querySelector('input[name="email"]').value.trim();
+    const website = form.querySelector('input[name="website"]').value;
+    const source = form.dataset.source || 'landing';
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      noteEl.textContent = 'Please enter a valid email.';
+      noteEl.style.color = '#ff6b6b';
+      return;
     }
-}
-function joinWaitlist2() {
-    const email = document.getElementById('email-input-2').value;
-    if (email && email.includes('@')) {
-        alert('Thanks! You\'re on the RESQD waitlist. We\'ll be in touch soon.');
-        document.getElementById('email-input-2').value = '';
+    const btn = form.querySelector('button');
+    const origLabel = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Joining…';
+    try {
+      const res = await fetch('/api/waitlist', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, source, website })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.ok) {
+        noteEl.textContent = data.dedup
+          ? "You're already on the list — we'll be in touch."
+          : "You're on the list. We'll be in touch when alpha opens.";
+        noteEl.style.color = '#4ade80';
+        form.querySelector('input[name="email"]').value = '';
+      } else {
+        noteEl.textContent = 'Something went wrong. Please try again.';
+        noteEl.style.color = '#ff6b6b';
+      }
+    } catch (e) {
+      noteEl.textContent = 'Network error. Please try again.';
+      noteEl.style.color = '#ff6b6b';
+    } finally {
+      btn.disabled = false;
+      btn.textContent = origLabel;
     }
-}
+  }
+  document.getElementById('waitlist-form-1').addEventListener('submit', function (e) {
+    e.preventDefault();
+    submitWaitlist(this, document.getElementById('waitlist-note-1'));
+  });
+  document.getElementById('waitlist-form-2').addEventListener('submit', function (e) {
+    e.preventDefault();
+    submitWaitlist(this, document.getElementById('waitlist-note-2'));
+  });
+})();
 </script>
 
 </body>

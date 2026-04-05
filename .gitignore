@@ -1,3 +1,15 @@
 core/pkg/
 core/target/
+target/
 .wrangler/
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Foundry build artifacts (in contracts/)
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+contracts/lib/

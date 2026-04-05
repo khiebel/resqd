@@ -1,0 +1,100 @@
+/**
+ * Client-side crypto bridge to the resqd-core WASM module.
+ *
+ * Loads the WASM glue lazily from /public/resqd-wasm/ so it never runs
+ * during SSR and never ends up in the initial bundle. The user's plaintext
+ * and encryption key never leave the browser.
+ */
+
+let wasmReady: Promise<WasmApi> | null = null;
+
+interface WasmApi {
+  generate_random_key: () => Uint8Array;
+  generate_salt: () => Uint8Array;
+  derive_key: (passphrase: string, salt: Uint8Array) => Uint8Array;
+  encrypt_data: (key: Uint8Array, plaintext: Uint8Array) => string;
+  decrypt_data: (key: Uint8Array, blobJson: string) => Uint8Array;
+  hash_bytes: (data: Uint8Array) => string;
+  /** Erasure-code data into 4+2 Reed-Solomon shards. Returns JSON string. */
+  erasure_encode: (data: Uint8Array) => string;
+  /** Reconstruct original bytes from shards (JSON array of base64|null). */
+  erasure_reconstruct: (shards_json: string, original_len: number) => Uint8Array;
+}
+
+/** Shape of the JSON string returned by `erasure_encode`. */
+export interface ErasureEncoded {
+  shards: string[]; // base64
+  original_len: number;
+  data_shards: number;
+  parity_shards: number;
+}
+
+export async function getCrypto(): Promise<WasmApi> {
+  if (typeof window === "undefined") {
+    throw new Error("resqd crypto only runs in the browser");
+  }
+  if (!wasmReady) {
+    wasmReady = (async () => {
+      // The wasm-bindgen glue is in public/ so it's served as a static file.
+      // Dynamic import via a runtime-built URL keeps Next's bundler from
+      // trying to resolve it at build time.
+      const glueUrl = "/resqd-wasm/resqd_core.js";
+      const mod = await import(/* webpackIgnore: true */ glueUrl);
+      // wasm-bindgen default export initializes the module. Pass an explicit
+      // URL to the .wasm file so it resolves relative to the page origin.
+      await mod.default({ module_or_path: "/resqd-wasm/resqd_core_bg.wasm" });
+      return mod as WasmApi;
+    })();
+  }
+  return wasmReady;
+}
+
+/**
+ * Convert a Uint8Array to a lowercase hex string (for displaying keys to
+ * the user so they can copy/save them).
+ */
+export function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Parse a hex string back into a Uint8Array. Tolerant of whitespace and
+ * optional `0x` prefix. Throws on invalid input.
+ */
+export function hexToBytes(hex: string): Uint8Array {
+  const clean = hex.trim().replace(/^0x/i, "").replace(/\s+/g, "");
+  if (clean.length % 2 !== 0) throw new Error("odd-length hex");
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    const byte = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+    if (Number.isNaN(byte)) throw new Error(`invalid hex at offset ${i * 2}`);
+    out[i] = byte;
+  }
+  return out;
+}
+
+/**
+ * Convert a base64 string to a Uint8Array (for shard uploads).
+ */
+export function base64ToBytes(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+/**
+ * Convert a Uint8Array to base64.
+ */
+export function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+/**
+ * The API endpoint to talk to. Configured via NEXT_PUBLIC_RESQD_API at
+ * build time; falls back to localhost for dev.
+ */
+export const API_URL =
+  process.env.NEXT_PUBLIC_RESQD_API || "http://127.0.0.1:8787";

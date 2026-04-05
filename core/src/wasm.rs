@@ -10,6 +10,7 @@
 use wasm_bindgen::prelude::*;
 
 use crate::crypto::{hash, encrypt, kem, keys};
+use crate::erasure;
 use crate::canary::CanaryChain;
 
 // ── Hashing ──────────────────────────────────────────────────────────
@@ -154,6 +155,69 @@ pub fn kem_decapsulate(secret_key_b64: &str, ciphertext_b64: &str) -> Result<Str
     let ss = kem::decapsulate(&sk, &ct)
         .map_err(|e| JsError::new(&e.to_string()))?;
     Ok(base64_encode(&ss))
+}
+
+// ── Erasure Coding ───────────────────────────────────────────────────
+
+/// Erasure-code data into 4+2 Reed-Solomon shards. Any 4 of 6 shards
+/// reconstruct the original.
+///
+/// Returns JSON `{shards: [base64, base64, ...], original_len: u32}`.
+/// The caller uploads each shard to a separate storage backend and saves
+/// `original_len` so decode knows how many bytes of padding to strip.
+#[wasm_bindgen]
+pub fn erasure_encode(data: &[u8]) -> Result<String, JsError> {
+    let shards = erasure::encode(data)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+
+    #[derive(serde::Serialize)]
+    struct EncodedShards {
+        shards: Vec<String>,
+        original_len: u32,
+        data_shards: u8,
+        parity_shards: u8,
+    }
+    let result = EncodedShards {
+        shards: shards.iter().map(|s| base64_encode(s)).collect(),
+        original_len: data.len() as u32,
+        data_shards: erasure::DATA_SHARDS as u8,
+        parity_shards: erasure::PARITY_SHARDS as u8,
+    };
+    serde_json::to_string(&result)
+        .map_err(|e| JsError::new(&e.to_string()))
+}
+
+/// Reconstruct original bytes from a (possibly incomplete) set of shards.
+///
+/// `shards_json` must be a JSON array of length TOTAL_SHARDS (6) where each
+/// slot is either a base64-encoded shard or `null`. At least DATA_SHARDS (4)
+/// slots must be non-null.
+///
+/// `original_len` must be the value returned by `erasure_encode` (tells the
+/// decoder how many trailing pad bytes to strip).
+#[wasm_bindgen]
+pub fn erasure_reconstruct(shards_json: &str, original_len: u32) -> Result<Vec<u8>, JsError> {
+    let raw: Vec<Option<String>> = serde_json::from_str(shards_json)
+        .map_err(|e| JsError::new(&format!("parse shards: {e}")))?;
+
+    if raw.len() != erasure::TOTAL_SHARDS {
+        return Err(JsError::new(&format!(
+            "expected {} shards, got {}",
+            erasure::TOTAL_SHARDS,
+            raw.len()
+        )));
+    }
+
+    let mut shards: Vec<Option<Vec<u8>>> = raw
+        .into_iter()
+        .map(|opt| match opt {
+            Some(b64) => base64_decode(&b64).map(Some),
+            None => Ok(None),
+        })
+        .collect::<Result<_, _>>()?;
+
+    erasure::reconstruct(&mut shards, original_len as usize)
+        .map_err(|e| JsError::new(&e.to_string()))
 }
 
 // ── Canary System ────────────────────────────────────────────────────

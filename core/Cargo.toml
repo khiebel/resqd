@@ -36,8 +36,10 @@ rand = "0.9"
 # Hex encoding for display
 hex = "0.4"
 
-# Timestamps
-chrono = { version = "0.4", features = ["serde"] }
+# Timestamps — `wasmbind` bridges `Utc::now()` to `Date.now()` on wasm32
+# targets. Without it chrono emits an unresolved `env.now` import that
+# breaks the WASM module in browsers.
+chrono = { version = "0.4", features = ["serde", "wasmbind"] }
 
 # Error handling
 thiserror = "2"

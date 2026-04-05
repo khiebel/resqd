@@ -1,0 +1,6 @@
+User-agent: *
+Allow: /
+Disallow: /alpha/
+Disallow: /api/
+
+Sitemap: https://resqd.ai/sitemap.xml

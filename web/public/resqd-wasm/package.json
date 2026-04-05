@@ -1,0 +1,17 @@
+{
+  "name": "resqd-core",
+  "type": "module",
+  "description": "Quantum-hardened cryptographic core for RESQD digital vault",
+  "version": "0.1.0",
+  "license": "AGPL-3.0",
+  "files": [
+    "resqd_core_bg.wasm",
+    "resqd_core.js",
+    "resqd_core.d.ts"
+  ],
+  "main": "resqd_core.js",
+  "types": "resqd_core.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

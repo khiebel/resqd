@@ -1,0 +1,12 @@
+name = "resqd-api-proxy"
+main = "src/index.ts"
+compatibility_date = "2025-12-01"
+workers_dev = false
+
+# Route api.resqd.ai/* through this Worker (DNS record added separately).
+[[routes]]
+pattern = "api.resqd.ai/*"
+zone_id = "20fc4a4faa1c0b70b0b5ff5893abd24b"
+
+[vars]
+UPSTREAM_HOST = "pjoq4jjjtb.execute-api.us-east-1.amazonaws.com"
