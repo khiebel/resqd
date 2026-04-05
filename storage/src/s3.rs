@@ -71,6 +71,34 @@ impl S3Store {
     pub async fn head(&self, key: &str) -> StorageResult<bool> {
         <Self as ObjectStore>::exists(self, key).await
     }
+
+    /// List keys beneath `prefix` along with their `LastModified` times.
+    /// Used by the vault listing endpoint to enumerate a user's assets.
+    /// Returns at most 1000 entries (S3 default page size) — fine for MVP;
+    /// pagination is a future extension.
+    pub async fn list_prefix(
+        &self,
+        prefix: &str,
+    ) -> StorageResult<Vec<(String, Option<i64>)>> {
+        let resp = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .send()
+            .await
+            .map_err(|e| StorageError::S3(format!("list {prefix}: {e}")))?;
+
+        Ok(resp
+            .contents()
+            .iter()
+            .filter_map(|o| {
+                let key = o.key()?.to_string();
+                let modified = o.last_modified().map(|t| t.secs());
+                Some((key, modified))
+            })
+            .collect())
+    }
 }
 
 #[async_trait]

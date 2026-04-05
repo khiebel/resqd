@@ -1,5 +1,6 @@
 //! HTTP route handlers.
 
+use crate::auth::AuthUser;
 use crate::state::{AppState, LARGE_BLOB_PREFIX};
 use axum::{
     Json,
@@ -12,9 +13,28 @@ use resqd_core::canary::CanaryChain;
 use resqd_core::crypto::hash::AssetHash;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Owner sidecar key. Written on commit so the listing endpoint can
+/// enumerate a user's assets via `ListObjectsV2` with this prefix.
+fn owner_sidecar_key(user_id: &str, asset_id: &str) -> String {
+    format!("_owner/{user_id}/{asset_id}.json")
+}
+
+/// Parse an asset_id out of an owner sidecar key like `_owner/{uid}/{id}.json`.
+fn asset_id_from_sidecar_key(key: &str) -> Option<&str> {
+    let name = key.rsplit('/').next()?;
+    name.strip_suffix(".json")
+}
 
 /// Number of shards the client erasure-codes into. Mirrors
 /// `resqd_core::erasure::TOTAL_SHARDS` but declared here so the handler
@@ -79,9 +99,17 @@ pub struct ShardUploadSlot {
 /// returned in WASM); required to strip padding on read. The client
 /// already knows this locally so we take it as input rather than trying
 /// to re-derive it from shard sizes.
+///
+/// `wrapped_key_b64` is the per-asset encryption key sealed under the
+/// user's PRF-derived master key, base64-encoded. Optional so that the
+/// legacy unauthenticated flow still works. When present, it's round-
+/// tripped verbatim via the asset manifest and returned on fetch; the
+/// server never unwraps it.
 #[derive(Deserialize)]
 pub struct CommitRequest {
     pub original_len: u64,
+    #[serde(default)]
+    pub wrapped_key_b64: Option<String>,
 }
 
 /// Response from `POST /vault/{id}/commit` — same shape as the legacy
@@ -112,6 +140,26 @@ pub struct ShardedFetchResponse {
     pub canary_sequence: u64,
     pub canary_hash_hex: String,
     pub ttl_seconds: u64,
+    /// Base64-encoded per-asset key wrapped under the user's master key.
+    /// Present when the asset was committed with a wrapped key. The
+    /// client unwraps this locally with its PRF-derived master key to
+    /// recover the per-asset XChaCha20 key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrapped_key_b64: Option<String>,
+}
+
+/// Entry in the `GET /vault` listing response.
+#[derive(Serialize)]
+pub struct VaultListItem {
+    pub asset_id: String,
+    pub created_at: u64,
+}
+
+#[derive(Serialize)]
+pub struct VaultListResponse {
+    pub user_id: String,
+    pub count: usize,
+    pub assets: Vec<VaultListItem>,
 }
 
 #[derive(Serialize)]
@@ -129,6 +177,20 @@ struct AssetManifest {
     original_len: u64,
     data_shards: u8,
     parity_shards: u8,
+    /// Owner of this asset (JWT `sub` of the user who committed it).
+    /// `None` means the asset was uploaded in legacy anonymous mode,
+    /// pre-auth. Those assets stay accessible to anyone with the id
+    /// (matching v0 behavior) so we don't retroactively lock people
+    /// out of their test data.
+    #[serde(default)]
+    owner_id: Option<String>,
+    /// Per-asset key wrapped under the owner's master key, base64.
+    #[serde(default)]
+    wrapped_key_b64: Option<String>,
+    /// Unix seconds at commit time. Used by the listing endpoint for
+    /// "recently added" sorting.
+    #[serde(default)]
+    created_at: Option<u64>,
 }
 
 // -------------------------------------------------------------------
@@ -285,18 +347,30 @@ pub async fn init(State(state): State<Arc<AppState>>) -> ApiResult<Json<InitResp
 /// shards exist in S3, persists the manifest + initial canary chain, and
 /// anchors the first commitment on-chain. Idempotent: if the manifest
 /// already exists for this asset_id, returns the existing state.
+///
+/// When auth is enabled and the caller is authenticated, the user id is
+/// recorded as the asset owner and a sidecar is written so the listing
+/// endpoint can enumerate the user's assets. Anonymous commits remain
+/// allowed for legacy/test flows.
 pub async fn commit(
     State(state): State<Arc<AppState>>,
+    user: Option<AuthUser>,
     Path(asset_id): Path<String>,
     Json(req): Json<CommitRequest>,
 ) -> ApiResult<Json<CommitResponse>> {
-    info!(asset_id = %asset_id, original_len = req.original_len, "commit sharded upload");
+    info!(asset_id = %asset_id, original_len = req.original_len, owner = ?user.as_ref().map(|u| &u.user_id), "commit sharded upload");
 
     // Idempotency: if the manifest already exists, return the existing state
     // rather than re-creating the chain. Prevents double-anchoring on retries.
     if let Ok(existing) = state.vault.get(&manifest_key(&asset_id)).await {
         let manifest: AssetManifest = serde_json::from_slice(&existing)
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("decode manifest: {e}")))?;
+        // If the existing manifest has an owner, only the owner can re-commit.
+        if let (Some(existing_owner), Some(authed)) = (&manifest.owner_id, &user) {
+            if existing_owner != &authed.user_id {
+                return Err(ApiError::NotFound);
+            }
+        }
         let chain_bytes = state.vault.get(&chain_key(&asset_id)).await?;
         let chain: CanaryChain = serde_json::from_slice(&chain_bytes)
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("decode chain: {e}")))?;
@@ -326,11 +400,16 @@ pub async fn commit(
     }
 
     // Build the manifest + canary chain sidecar.
+    let owner_id = user.as_ref().map(|u| u.user_id.clone());
+    let created_at = now_secs();
     let manifest = AssetManifest {
         mode: "sharded".into(),
         original_len: req.original_len,
         data_shards: 4,
         parity_shards: 2,
+        owner_id: owner_id.clone(),
+        wrapped_key_b64: req.wrapped_key_b64.clone(),
+        created_at: Some(created_at),
     };
     let manifest_json = serde_json::to_vec(&manifest)
         .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
@@ -338,6 +417,24 @@ pub async fn commit(
         .vault
         .put(&manifest_key(&asset_id), Bytes::from(manifest_json))
         .await?;
+
+    // Owner sidecar — a tiny raw-S3 record under `_owner/{uid}/{asset_id}.json`
+    // that the listing endpoint enumerates via ListObjectsV2. We write it
+    // via the concrete S3 client (not the erasure-coded vault) because the
+    // vault doesn't expose list.
+    if let Some(uid) = &owner_id {
+        let sidecar = serde_json::json!({
+            "asset_id": asset_id,
+            "created_at": created_at,
+        });
+        let bytes = serde_json::to_vec(&sidecar)
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
+        use resqd_storage::ObjectStore;
+        state
+            .s3
+            .put(&owner_sidecar_key(uid, &asset_id), Bytes::from(bytes))
+            .await?;
+    }
 
     let chain = CanaryChain::new(&asset_id);
     let initial = chain.commitments[0].clone();
@@ -390,6 +487,7 @@ pub async fn commit(
 ///   erasure-coded vault. Fallback when no manifest exists.
 pub async fn fetch(
     State(state): State<Arc<AppState>>,
+    user: Option<AuthUser>,
     Path(asset_id): Path<String>,
 ) -> ApiResult<Response> {
     info!(asset_id = %asset_id, "fetch");
@@ -429,6 +527,17 @@ pub async fn fetch(
             let manifest: AssetManifest = serde_json::from_slice(&m)
                 .map_err(|e| ApiError::Internal(anyhow::anyhow!("decode manifest: {e}")))?;
 
+            // Ownership check: if the asset has an owner, the caller
+            // must be authenticated as that owner. Pre-auth assets
+            // (owner_id = None) remain publicly accessible by id so
+            // the alpha's test uploads don't break.
+            if let Some(owner) = &manifest.owner_id {
+                match &user {
+                    Some(u) if &u.user_id == owner => {}
+                    _ => return Err(ApiError::NotFound),
+                }
+            }
+
             let mut slots = Vec::with_capacity(TOTAL_SHARDS);
             for i in 0..TOTAL_SHARDS {
                 let key = shard_key(&asset_id, i);
@@ -455,6 +564,7 @@ pub async fn fetch(
                 canary_sequence: new_commitment.sequence,
                 canary_hash_hex: new_commitment.hash.to_hex(),
                 ttl_seconds: PRESIGN_TTL.as_secs(),
+                wrapped_key_b64: manifest.wrapped_key_b64.clone(),
             };
             Ok((
                 [
@@ -528,6 +638,38 @@ pub async fn verify(
         expected_count: q.count,
         on_chain_access_count: onchain_count,
         matches: onchain_count == q.count,
+    }))
+}
+
+/// `GET /vault` — list assets owned by the authenticated user. Driven
+/// by the `_owner/{user_id}/...` sidecar files written at commit time.
+/// Returns up to 1000 entries (S3 ListObjectsV2 default page); adding
+/// pagination is a future extension.
+pub async fn list_vault(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> ApiResult<Json<VaultListResponse>> {
+    let prefix = format!("_owner/{}/", user.user_id);
+    let raw = state.s3.list_prefix(&prefix).await?;
+
+    let mut assets: Vec<VaultListItem> = raw
+        .into_iter()
+        .filter_map(|(key, modified)| {
+            let asset_id = asset_id_from_sidecar_key(&key)?.to_string();
+            let created_at = modified.map(|s| s as u64).unwrap_or(0);
+            Some(VaultListItem {
+                asset_id,
+                created_at,
+            })
+        })
+        .collect();
+    // Newest first.
+    assets.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    Ok(Json(VaultListResponse {
+        user_id: user.user_id,
+        count: assets.len(),
+        assets,
     }))
 }
 

@@ -14,6 +14,7 @@
 //! anchors the new commitment on-chain before returning the bytes. This is
 //! non-negotiable — it's the core tamper-evidence guarantee.
 
+pub mod auth;
 pub mod handlers;
 pub mod state;
 
@@ -21,9 +22,10 @@ pub use state::{AppConfig, AppState};
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
+use axum::http::{HeaderValue, Method};
 use axum::routing::{get, post};
 use std::sync::Arc;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 /// Max request body size. API Gateway HTTP API allows 10 MB and Lambda
@@ -34,22 +36,48 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 
 /// Build the axum router. Shared by both the Lambda and local binaries.
 ///
-/// CORS is permissive (any origin, any method) for the alpha. When we front
-/// the endpoint with Cloudflare Access and move past MVP, lock this down to
-/// the specific allowed origins (e.g. `https://resqd.ai`).
+/// CORS is explicit-origin + credentials-enabled (required for the session
+/// cookie to cross origin from the frontend Pages deployment to the API
+/// Gateway). The allow list comes from `RESQD_CORS_ORIGINS` (comma-
+/// separated). If the env var is unset we fall back to a set of known
+/// dev/prod origins.
 pub fn router(state: Arc<AppState>) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any)
+    let origins = cors_origins();
+    let mut cors = CorsLayer::new()
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::COOKIE,
+        ])
+        .allow_credentials(true)
         .expose_headers([
             "x-resqd-canary-sequence".parse().unwrap(),
             "x-resqd-canary-hash".parse().unwrap(),
         ]);
+    for origin in &origins {
+        if let Ok(val) = HeaderValue::from_str(origin) {
+            cors = cors.allow_origin(val);
+        }
+    }
 
     Router::new()
         .route("/health", get(handlers::health))
-        .route("/vault", post(handlers::upload))
+        // Auth
+        .route("/auth/register/begin", post(auth::register_begin))
+        .route("/auth/register/finish", post(auth::register_finish))
+        .route("/auth/login/begin", post(auth::login_begin))
+        .route("/auth/login/finish", post(auth::login_finish))
+        .route("/auth/me", get(auth::me))
+        .route("/auth/logout", post(auth::logout))
+        // Vault
+        .route("/vault", get(handlers::list_vault).post(handlers::upload))
         .route("/vault/init", post(handlers::init))
         .route("/vault/{id}/commit", post(handlers::commit))
         .route("/vault/{id}", get(handlers::fetch))
@@ -58,4 +86,24 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)
+}
+
+/// Parse the allow-list of CORS origins. Env var takes precedence; the
+/// fallback covers local dev + the current Pages deployment + the future
+/// custom domain so deploys don't break if the env var is forgotten.
+fn cors_origins() -> Vec<String> {
+    if let Ok(s) = std::env::var("RESQD_CORS_ORIGINS") {
+        return s
+            .split(',')
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .collect();
+    }
+    vec![
+        "http://localhost:3000".into(),
+        "http://127.0.0.1:3000".into(),
+        "https://resqd-app.pages.dev".into(),
+        "https://app.resqd.ai".into(),
+        "https://resqd.ai".into(),
+    ]
 }

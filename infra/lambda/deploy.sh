@@ -42,6 +42,7 @@ if [[ ! -f "$BINARY" ]]; then
 fi
 
 : "${RESQD_CHAIN_SIGNER_KEY:?RESQD_CHAIN_SIGNER_KEY must be set (hex private key of the on-chain signer)}"
+: "${RESQD_JWT_SECRET:?RESQD_JWT_SECRET must be set (base64-encoded 32+ bytes for session JWT HMAC). Generate with: openssl rand -base64 32}"
 
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 echo "==> Deploying as account $ACCOUNT in $REGION"
@@ -74,7 +75,15 @@ ZIP=$(mktemp -d)/lambda.zip
 echo "==> Packaged $(du -h "$ZIP" | awk '{print $1}')"
 
 # ---------- 3. Lambda function ----------
-ENV_VARS="Variables={RESQD_S3_BUCKET=resqd-vault-64553a1a,RESQD_CHAIN_ENABLED=true,RESQD_CHAIN_RPC_URL=https://sepolia.base.org,RESQD_CHAIN_CONTRACT=0xd45453477aa729C157E4840e81F81D4437Ec99f3,RESQD_CHAIN_SIGNER_KEY=$RESQD_CHAIN_SIGNER_KEY,RUST_LOG=info}"
+# Auth config. RESQD_WEBAUTHN_RP_ID must match the public hostname the
+# frontend is served from — passkeys are bound to a specific RP id and
+# won't work if the app is reached through a different domain. Change
+# this + re-register when moving to the custom domain.
+WEBAUTHN_RP_ID=${RESQD_WEBAUTHN_RP_ID:-resqd-app.pages.dev}
+WEBAUTHN_ORIGIN=${RESQD_WEBAUTHN_ORIGIN:-https://resqd-app.pages.dev}
+CORS_ORIGINS=${RESQD_CORS_ORIGINS:-https://resqd-app.pages.dev\\,https://resqd.ai\\,https://app.resqd.ai}
+
+ENV_VARS="Variables={RESQD_S3_BUCKET=resqd-vault-64553a1a,RESQD_CHAIN_ENABLED=true,RESQD_CHAIN_RPC_URL=https://sepolia.base.org,RESQD_CHAIN_CONTRACT=0xd45453477aa729C157E4840e81F81D4437Ec99f3,RESQD_CHAIN_SIGNER_KEY=$RESQD_CHAIN_SIGNER_KEY,RUST_LOG=info,RESQD_AUTH_ENABLED=true,RESQD_WEBAUTHN_RP_ID=$WEBAUTHN_RP_ID,RESQD_WEBAUTHN_RP_NAME=RESQD,RESQD_WEBAUTHN_ORIGIN=$WEBAUTHN_ORIGIN,RESQD_JWT_SECRET=$RESQD_JWT_SECRET,RESQD_USERS_TABLE=resqd-users,RESQD_CHALLENGES_TABLE=resqd-auth-challenges,RESQD_COOKIE_SECURE=true,RESQD_COOKIE_SAMESITE=None,RESQD_CORS_ORIGINS=$CORS_ORIGINS}"
 
 if aws lambda get-function --function-name "$FUNCTION_NAME" --region "$REGION" >/dev/null 2>&1; then
   echo "==> Updating existing function $FUNCTION_NAME"

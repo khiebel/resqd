@@ -1,5 +1,6 @@
 //! Shared application state and config.
 
+use crate::auth::{AuthConfig, AuthState};
 use anyhow::Context;
 use resqd_chain::{CanaryAnchorClient, ChainConfig};
 use resqd_storage::{MultiCloudVault, ObjectStore, PrefixedStore, S3Store};
@@ -25,6 +26,12 @@ pub struct AppConfig {
     pub chain_enabled: bool,
     /// Chain config (only required when `chain_enabled`).
     pub chain: Option<ChainConfig>,
+    /// Whether passkey authentication is enabled. When false, the auth
+    /// routes return 400 and vault endpoints remain public (legacy alpha
+    /// mode — used for tests and for the smoke-test deploy path).
+    pub auth_enabled: bool,
+    /// Auth config (only required when `auth_enabled`).
+    pub auth: Option<AuthConfig>,
 }
 
 impl AppConfig {
@@ -50,11 +57,22 @@ impl AppConfig {
             None
         };
 
+        let auth_enabled = std::env::var("RESQD_AUTH_ENABLED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let auth = if auth_enabled {
+            Some(AuthConfig::from_env().context("auth config")?)
+        } else {
+            None
+        };
+
         Ok(Self {
             s3_bucket,
             gcs_bucket,
             chain_enabled,
             chain,
+            auth_enabled,
+            auth,
         })
     }
 }
@@ -69,6 +87,10 @@ pub struct AppState {
     /// `vault` can't do that since it fans each object out to 6 shards.
     pub s3: Arc<S3Store>,
     pub chain: Option<CanaryAnchorClient>,
+    /// Passkey auth state (webauthn builder + DynamoDB client). `None`
+    /// when `auth_enabled = false`. Handlers that need auth must check
+    /// this and return 400/401.
+    pub auth: Option<AuthState>,
 }
 
 impl AppState {
@@ -121,11 +143,22 @@ impl AppState {
             None
         };
 
+        let auth = if let Some(auth_config) = config.auth.clone() {
+            Some(
+                AuthState::from_config(auth_config)
+                    .await
+                    .context("init auth state")?,
+            )
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             vault,
             s3: s3_concrete,
             chain,
+            auth,
         })
     }
 }

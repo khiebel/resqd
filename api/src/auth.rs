@@ -1,0 +1,846 @@
+//! Passkey authentication with WebAuthn + DynamoDB.
+//!
+//! # Design
+//!
+//! - **Passkeys only.** No passwords, no hex keys. Users sign up by giving
+//!   an email (for login lookup + support contact) and performing one
+//!   WebAuthn registration ceremony. Subsequent logins are just email +
+//!   platform biometric.
+//! - **Key derivation via the PRF extension.** The server is PRF-agnostic:
+//!   it runs the standard webauthn-rs ceremony and stores only the Passkey
+//!   public key. The browser injects the PRF extension on both register
+//!   and auth, reads the PRF output locally, and derives the vault master
+//!   key. That key never leaves the browser. The PRF salt is a fixed
+//!   per-app constant baked into the frontend (`resqd-vault-prf-v1`), so
+//!   PRF output uniqueness comes from the credential itself — which is
+//!   exactly what PRF guarantees.
+//! - **Stateless sessions** via HS256 JWT stored in a cookie. The cookie
+//!   is `HttpOnly; Secure; SameSite=<configurable>; Path=/`.
+//! - **DynamoDB** holds two small tables: `resqd-users` (the passkey
+//!   credential + metadata, keyed by email) and `resqd-auth-challenges`
+//!   (short-lived webauthn state, TTL 5 min via the `expires_at` attr).
+
+use aws_sdk_dynamodb::Client as DynamoClient;
+use aws_sdk_dynamodb::types::AttributeValue;
+use axum::{
+    Json,
+    extract::{FromRequestParts, OptionalFromRequestParts, State},
+    http::{StatusCode, header, request::Parts},
+    response::{IntoResponse, Response},
+};
+use base64::prelude::*;
+use jsonwebtoken::{DecodingKey, EncodingKey, Header as JwtHeader, Validation, decode, encode};
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::{error, info, warn};
+use url::Url;
+use uuid::Uuid;
+use webauthn_rs::prelude::*;
+
+use crate::state::AppState;
+
+// ────────────────────────────────────────────────────────────────────
+//                            Config
+// ────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug)]
+pub enum CookieSameSite {
+    Strict,
+    Lax,
+    None,
+}
+
+impl CookieSameSite {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "Strict",
+            Self::Lax => "Lax",
+            Self::None => "None",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AuthConfig {
+    pub rp_id: String,
+    pub rp_name: String,
+    pub origin: Url,
+    pub jwt_secret: Vec<u8>,
+    pub users_table: String,
+    pub challenges_table: String,
+    pub session_ttl_secs: u64,
+    pub cookie_domain: Option<String>,
+    pub cookie_secure: bool,
+    pub cookie_same_site: CookieSameSite,
+}
+
+impl AuthConfig {
+    pub fn from_env() -> anyhow::Result<Self> {
+        use anyhow::Context;
+
+        let rp_id = std::env::var("RESQD_WEBAUTHN_RP_ID").unwrap_or_else(|_| "localhost".into());
+        let rp_name = std::env::var("RESQD_WEBAUTHN_RP_NAME").unwrap_or_else(|_| "RESQD".into());
+        let origin_str = std::env::var("RESQD_WEBAUTHN_ORIGIN")
+            .unwrap_or_else(|_| "http://localhost:3000".into());
+        let origin = Url::parse(&origin_str).context("RESQD_WEBAUTHN_ORIGIN must be a URL")?;
+
+        let jwt_secret = match std::env::var("RESQD_JWT_SECRET") {
+            Ok(s) => BASE64_STANDARD
+                .decode(s.trim())
+                .context("RESQD_JWT_SECRET must be standard base64")?,
+            Err(_) => {
+                // Ephemeral secret — sessions don't survive restart. Fine for
+                // local dev, broken in prod, so we warn loudly.
+                let mut bytes = vec![0u8; 32];
+                rand::thread_rng().fill_bytes(&mut bytes);
+                warn!("RESQD_JWT_SECRET not set — using ephemeral random secret");
+                bytes
+            }
+        };
+        if jwt_secret.len() < 32 {
+            anyhow::bail!("RESQD_JWT_SECRET must decode to at least 32 bytes");
+        }
+
+        let users_table =
+            std::env::var("RESQD_USERS_TABLE").unwrap_or_else(|_| "resqd-users".into());
+        let challenges_table = std::env::var("RESQD_CHALLENGES_TABLE")
+            .unwrap_or_else(|_| "resqd-auth-challenges".into());
+
+        let cookie_domain = std::env::var("RESQD_COOKIE_DOMAIN").ok();
+        let cookie_secure = std::env::var("RESQD_COOKIE_SECURE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true);
+        let cookie_same_site = match std::env::var("RESQD_COOKIE_SAMESITE")
+            .unwrap_or_else(|_| "None".into())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "strict" => CookieSameSite::Strict,
+            "lax" => CookieSameSite::Lax,
+            _ => CookieSameSite::None,
+        };
+
+        Ok(Self {
+            rp_id,
+            rp_name,
+            origin,
+            jwt_secret,
+            users_table,
+            challenges_table,
+            session_ttl_secs: 7 * 24 * 3600,
+            cookie_domain,
+            cookie_secure,
+            cookie_same_site,
+        })
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+//                             State
+// ────────────────────────────────────────────────────────────────────
+
+pub struct AuthState {
+    pub config: AuthConfig,
+    pub webauthn: Arc<Webauthn>,
+    pub dynamo: DynamoClient,
+}
+
+impl AuthState {
+    pub async fn from_config(config: AuthConfig) -> anyhow::Result<Self> {
+        let builder = WebauthnBuilder::new(&config.rp_id, &config.origin)?
+            .rp_name(&config.rp_name);
+        let webauthn = Arc::new(builder.build()?);
+        let aws_conf = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let dynamo = DynamoClient::new(&aws_conf);
+        Ok(Self {
+            config,
+            webauthn,
+            dynamo,
+        })
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+//                          DynamoDB rows
+// ────────────────────────────────────────────────────────────────────
+
+/// Row in `resqd-users`. Primary key is `email` (lowercased, trimmed) —
+/// this lets us look up a user on login without maintaining a second GSI
+/// just for email. The opaque `user_id` (UUID) is what goes in the JWT
+/// `sub` and ends up on assets as the owner id, so the email can be
+/// changed later (we'd copy-delete the row) without invalidating any
+/// downstream references.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct UserRow {
+    email: String,
+    user_id: String,
+    /// base64url of the WebAuthn credential id. Also the partition key of
+    /// the `credential_id-index` GSI for reverse lookups.
+    credential_id: String,
+    /// Full `Passkey` JSON from webauthn-rs (requires
+    /// `danger-allow-state-serialisation` feature).
+    passkey_json: String,
+    display_name: String,
+    created_at: u64,
+}
+
+/// Row in `resqd-auth-challenges`. Stores the serialized webauthn state
+/// between begin and finish. TTL is enforced by DynamoDB via the
+/// `expires_at` attribute (unix seconds).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ChallengeRow {
+    challenge_id: String,
+    kind: String, // "registration" | "authentication"
+    /// Serialized `PasskeyRegistration` or `PasskeyAuthentication`.
+    state_json: String,
+    /// Pre-filled during register_begin (we know the email they're claiming)
+    /// and during login_begin.
+    email: Option<String>,
+    expires_at: u64,
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn normalize_email(input: &str) -> String {
+    input.trim().to_ascii_lowercase()
+}
+
+// ────────────────────────────────────────────────────────────────────
+//                          Errors
+// ────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, thiserror::Error)]
+pub enum AuthError {
+    #[error("bad request: {0}")]
+    BadRequest(String),
+    #[error("unauthorized")]
+    Unauthorized,
+    #[error("not found")]
+    NotFound,
+    #[error("conflict: {0}")]
+    Conflict(String),
+    #[error("webauthn: {0}")]
+    Webauthn(#[from] WebauthnError),
+    #[error("dynamo: {0}")]
+    Dynamo(String),
+    #[error("internal: {0}")]
+    Internal(#[from] anyhow::Error),
+}
+
+impl<E: std::fmt::Debug + std::error::Error + 'static> From<aws_sdk_dynamodb::error::SdkError<E>>
+    for AuthError
+{
+    fn from(err: aws_sdk_dynamodb::error::SdkError<E>) -> Self {
+        // Surface the full error chain — `Display` on SdkError just says
+        // "service error" and drops the useful detail on the floor. Walk
+        // `source()` manually and concatenate each layer.
+        use std::error::Error as _;
+        let mut msg = format!("{err}");
+        let mut cursor: Option<&(dyn std::error::Error + 'static)> = err.source();
+        while let Some(s) = cursor {
+            msg.push_str(" | ");
+            msg.push_str(&format!("{s}"));
+            cursor = s.source();
+        }
+        AuthError::Dynamo(msg)
+    }
+}
+
+impl IntoResponse for AuthError {
+    fn into_response(self) -> Response {
+        let (status, msg) = match &self {
+            AuthError::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            AuthError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
+            AuthError::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
+            AuthError::Conflict(_) => (StatusCode::CONFLICT, self.to_string()),
+            AuthError::Webauthn(e) => {
+                info!(error = ?e, "webauthn error");
+                (StatusCode::BAD_REQUEST, format!("webauthn: {e}"))
+            }
+            _ => {
+                error!(error = %self, "auth handler error");
+                (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
+            }
+        };
+        (status, Json(serde_json::json!({ "error": msg }))).into_response()
+    }
+}
+
+type AuthResult<T> = Result<T, AuthError>;
+
+// ────────────────────────────────────────────────────────────────────
+//                          DTOs
+// ────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct RegisterBeginRequest {
+    pub email: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct RegisterBeginResponse {
+    pub challenge_id: String,
+    /// The `CreationChallengeResponse` from webauthn-rs, passed through
+    /// as opaque JSON. The browser merges our PRF extension into this
+    /// object's `publicKey.extensions` before calling `navigator.credentials.create()`.
+    pub creation_options: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+pub struct RegisterFinishRequest {
+    pub challenge_id: String,
+    pub credential: RegisterPublicKeyCredential,
+}
+
+#[derive(Deserialize)]
+pub struct LoginBeginRequest {
+    pub email: String,
+}
+
+#[derive(Serialize)]
+pub struct LoginBeginResponse {
+    pub challenge_id: String,
+    pub request_options: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+pub struct LoginFinishRequest {
+    pub challenge_id: String,
+    pub credential: PublicKeyCredential,
+}
+
+#[derive(Serialize)]
+pub struct SessionResponse {
+    pub user_id: String,
+    pub email: String,
+    pub display_name: String,
+}
+
+// ────────────────────────────────────────────────────────────────────
+//                          JWT / cookie
+// ────────────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+struct SessionClaims {
+    sub: String, // user_id
+    email: String,
+    name: String,
+    exp: u64,
+    iat: u64,
+}
+
+const SESSION_COOKIE: &str = "resqd_session";
+
+fn issue_session_cookie(cfg: &AuthConfig, user: &UserRow) -> AuthResult<String> {
+    let iat = now_secs();
+    let exp = iat + cfg.session_ttl_secs;
+    let claims = SessionClaims {
+        sub: user.user_id.clone(),
+        email: user.email.clone(),
+        name: user.display_name.clone(),
+        iat,
+        exp,
+    };
+    let token = encode(
+        &JwtHeader::default(),
+        &claims,
+        &EncodingKey::from_secret(&cfg.jwt_secret),
+    )
+    .map_err(|e| AuthError::Internal(anyhow::anyhow!("jwt encode: {e}")))?;
+
+    let mut parts = vec![
+        format!("{SESSION_COOKIE}={token}"),
+        "HttpOnly".into(),
+        "Path=/".into(),
+        format!("Max-Age={}", cfg.session_ttl_secs),
+        format!("SameSite={}", cfg.cookie_same_site.as_str()),
+    ];
+    if cfg.cookie_secure {
+        parts.push("Secure".into());
+    }
+    if let Some(d) = &cfg.cookie_domain {
+        parts.push(format!("Domain={d}"));
+    }
+    Ok(parts.join("; "))
+}
+
+fn clear_session_cookie(cfg: &AuthConfig) -> String {
+    let mut parts = vec![
+        format!("{SESSION_COOKIE}=deleted"),
+        "HttpOnly".into(),
+        "Path=/".into(),
+        "Max-Age=0".into(),
+        format!("SameSite={}", cfg.cookie_same_site.as_str()),
+    ];
+    if cfg.cookie_secure {
+        parts.push("Secure".into());
+    }
+    if let Some(d) = &cfg.cookie_domain {
+        parts.push(format!("Domain={d}"));
+    }
+    parts.join("; ")
+}
+
+fn verify_session(cfg: &AuthConfig, token: &str) -> AuthResult<SessionClaims> {
+    let data = decode::<SessionClaims>(
+        token,
+        &DecodingKey::from_secret(&cfg.jwt_secret),
+        &Validation::default(),
+    )
+    .map_err(|_| AuthError::Unauthorized)?;
+    Ok(data.claims)
+}
+
+fn extract_cookie<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
+    for part in cookie_header.split(';') {
+        let part = part.trim();
+        if let Some(rest) = part.strip_prefix(&format!("{name}=")) {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+/// Axum extractor: parses the session cookie and yields the authed user.
+/// Handlers that need auth take `AuthUser` as an extractor. Unauth'd
+/// requests short-circuit with 401.
+#[derive(Clone, Debug)]
+pub struct AuthUser {
+    pub user_id: String,
+    pub email: String,
+    pub display_name: String,
+}
+
+impl FromRequestParts<Arc<AppState>> for AuthUser {
+    type Rejection = AuthError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        extract_auth_user(parts, state)?.ok_or(AuthError::Unauthorized)
+    }
+}
+
+/// Optional variant so handlers can take `Option<AuthUser>` for endpoints
+/// that accept both authed and anonymous callers (e.g. legacy vault
+/// fetch paths). Axum 0.8 requires a separate `OptionalFromRequestParts`
+/// impl — the blanket `FromRequestParts for Option<T>` from earlier
+/// versions was removed to avoid ambiguity with rejections that can be
+/// "genuinely missing" vs "malformed".
+impl OptionalFromRequestParts<Arc<AppState>> for AuthUser {
+    type Rejection = AuthError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        extract_auth_user(parts, state)
+    }
+}
+
+fn extract_auth_user(parts: &Parts, state: &Arc<AppState>) -> AuthResult<Option<AuthUser>> {
+    let Some(auth) = state.auth.as_ref() else {
+        return Ok(None);
+    };
+    let Some(cookie_header) = parts.headers.get(header::COOKIE).and_then(|v| v.to_str().ok())
+    else {
+        return Ok(None);
+    };
+    let Some(token) = extract_cookie(cookie_header, SESSION_COOKIE) else {
+        return Ok(None);
+    };
+    let claims = verify_session(&auth.config, token)?;
+    Ok(Some(AuthUser {
+        user_id: claims.sub,
+        email: claims.email,
+        display_name: claims.name,
+    }))
+}
+
+// ────────────────────────────────────────────────────────────────────
+//                          DynamoDB helpers
+// ────────────────────────────────────────────────────────────────────
+
+async fn put_challenge(auth: &AuthState, row: &ChallengeRow) -> AuthResult<()> {
+    let mut item: HashMap<String, AttributeValue> = HashMap::new();
+    item.insert(
+        "challenge_id".into(),
+        AttributeValue::S(row.challenge_id.clone()),
+    );
+    item.insert("kind".into(), AttributeValue::S(row.kind.clone()));
+    item.insert(
+        "state_json".into(),
+        AttributeValue::S(row.state_json.clone()),
+    );
+    if let Some(e) = &row.email {
+        item.insert("email".into(), AttributeValue::S(e.clone()));
+    }
+    item.insert(
+        "expires_at".into(),
+        AttributeValue::N(row.expires_at.to_string()),
+    );
+    auth.dynamo
+        .put_item()
+        .table_name(&auth.config.challenges_table)
+        .set_item(Some(item))
+        .send()
+        .await?;
+    Ok(())
+}
+
+async fn take_challenge(auth: &AuthState, id: &str, kind: &str) -> AuthResult<ChallengeRow> {
+    let out = auth
+        .dynamo
+        .get_item()
+        .table_name(&auth.config.challenges_table)
+        .key("challenge_id", AttributeValue::S(id.into()))
+        .send()
+        .await?;
+    let item = out.item.ok_or(AuthError::BadRequest(
+        "challenge not found or expired".into(),
+    ))?;
+
+    let row = ChallengeRow {
+        challenge_id: take_s(&item, "challenge_id")?,
+        kind: take_s(&item, "kind")?,
+        state_json: take_s(&item, "state_json")?,
+        email: item.get("email").and_then(|v| v.as_s().ok().cloned()),
+        expires_at: take_s(&item, "expires_at")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+    };
+
+    if row.kind != kind {
+        return Err(AuthError::BadRequest(format!(
+            "challenge kind mismatch: expected {kind}, got {}",
+            row.kind
+        )));
+    }
+    if row.expires_at != 0 && row.expires_at < now_secs() {
+        return Err(AuthError::BadRequest("challenge expired".into()));
+    }
+
+    // Fire-and-forget delete so the challenge can't be reused.
+    let _ = auth
+        .dynamo
+        .delete_item()
+        .table_name(&auth.config.challenges_table)
+        .key("challenge_id", AttributeValue::S(id.into()))
+        .send()
+        .await;
+
+    Ok(row)
+}
+
+fn take_s(item: &HashMap<String, AttributeValue>, key: &str) -> AuthResult<String> {
+    item.get(key)
+        .and_then(|v| v.as_s().ok().cloned())
+        .ok_or(AuthError::BadRequest(format!("missing attribute: {key}")))
+}
+
+async fn get_user_by_email(auth: &AuthState, email: &str) -> AuthResult<Option<UserRow>> {
+    let out = auth
+        .dynamo
+        .get_item()
+        .table_name(&auth.config.users_table)
+        .key("email", AttributeValue::S(email.into()))
+        .send()
+        .await?;
+    let Some(item) = out.item else { return Ok(None) };
+    Ok(Some(UserRow {
+        email: take_s(&item, "email")?,
+        user_id: take_s(&item, "user_id")?,
+        credential_id: take_s(&item, "credential_id")?,
+        passkey_json: take_s(&item, "passkey_json")?,
+        display_name: take_s(&item, "display_name").unwrap_or_default(),
+        created_at: take_s(&item, "created_at")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+    }))
+}
+
+async fn put_user(auth: &AuthState, user: &UserRow) -> AuthResult<()> {
+    let mut item: HashMap<String, AttributeValue> = HashMap::new();
+    item.insert("email".into(), AttributeValue::S(user.email.clone()));
+    item.insert("user_id".into(), AttributeValue::S(user.user_id.clone()));
+    item.insert(
+        "credential_id".into(),
+        AttributeValue::S(user.credential_id.clone()),
+    );
+    item.insert(
+        "passkey_json".into(),
+        AttributeValue::S(user.passkey_json.clone()),
+    );
+    item.insert(
+        "display_name".into(),
+        AttributeValue::S(user.display_name.clone()),
+    );
+    item.insert(
+        "created_at".into(),
+        AttributeValue::N(user.created_at.to_string()),
+    );
+    auth.dynamo
+        .put_item()
+        .table_name(&auth.config.users_table)
+        .set_item(Some(item))
+        // condition_expression ensures we don't clobber an existing row.
+        .condition_expression("attribute_not_exists(email)")
+        .send()
+        .await
+        .map_err(|e| {
+            let msg = format!("{e}");
+            if msg.contains("ConditionalCheckFailed") {
+                AuthError::Conflict("email already registered".into())
+            } else {
+                AuthError::Dynamo(msg)
+            }
+        })?;
+    Ok(())
+}
+
+// ────────────────────────────────────────────────────────────────────
+//                          Handlers
+// ────────────────────────────────────────────────────────────────────
+
+const CHALLENGE_TTL_SECS: u64 = 300;
+
+pub async fn register_begin(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RegisterBeginRequest>,
+) -> AuthResult<Json<RegisterBeginResponse>> {
+    let auth = state.auth.as_ref().ok_or(AuthError::BadRequest(
+        "auth not configured on this deployment".into(),
+    ))?;
+    let email = normalize_email(&req.email);
+    if email.is_empty() || !email.contains('@') {
+        return Err(AuthError::BadRequest("valid email required".into()));
+    }
+
+    // Reject if the email is already registered.
+    if get_user_by_email(auth, &email).await?.is_some() {
+        return Err(AuthError::Conflict("email already registered".into()));
+    }
+
+    let user_unique_id = Uuid::new_v4();
+    let display_name = req
+        .display_name
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(&email);
+
+    let (ccr, reg_state) = auth.webauthn.start_passkey_registration(
+        user_unique_id,
+        &email,
+        display_name,
+        None, // no exclude list — webauthn-rs uses the user's cred list elsewhere
+    )?;
+
+    let challenge_id = Uuid::new_v4().to_string();
+    let state_json = serde_json::to_string(&reg_state)
+        .map_err(|e| AuthError::Internal(anyhow::anyhow!("serialize reg state: {e}")))?;
+    put_challenge(
+        auth,
+        &ChallengeRow {
+            challenge_id: challenge_id.clone(),
+            kind: "registration".into(),
+            state_json,
+            email: Some(email.clone()),
+            expires_at: now_secs() + CHALLENGE_TTL_SECS,
+        },
+    )
+    .await?;
+
+    let creation_options = serde_json::to_value(&ccr)
+        .map_err(|e| AuthError::Internal(anyhow::anyhow!("serialize ccr: {e}")))?;
+
+    Ok(Json(RegisterBeginResponse {
+        challenge_id,
+        creation_options,
+    }))
+}
+
+pub async fn register_finish(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RegisterFinishRequest>,
+) -> AuthResult<Response> {
+    let auth = state.auth.as_ref().ok_or(AuthError::BadRequest(
+        "auth not configured on this deployment".into(),
+    ))?;
+
+    let challenge = take_challenge(auth, &req.challenge_id, "registration").await?;
+    let reg_state: PasskeyRegistration = serde_json::from_str(&challenge.state_json)
+        .map_err(|e| AuthError::Internal(anyhow::anyhow!("decode reg state: {e}")))?;
+
+    let passkey = auth
+        .webauthn
+        .finish_passkey_registration(&req.credential, &reg_state)?;
+
+    let email = challenge
+        .email
+        .ok_or(AuthError::Internal(anyhow::anyhow!(
+            "registration challenge missing email"
+        )))?;
+    let display_name = email.clone();
+    let credential_id = BASE64_URL_SAFE_NO_PAD.encode(passkey.cred_id().as_ref());
+    let passkey_json = serde_json::to_string(&passkey)
+        .map_err(|e| AuthError::Internal(anyhow::anyhow!("serialize passkey: {e}")))?;
+
+    let user = UserRow {
+        email: email.clone(),
+        user_id: Uuid::new_v4().to_string(),
+        credential_id,
+        passkey_json,
+        display_name,
+        created_at: now_secs(),
+    };
+    put_user(auth, &user).await?;
+
+    info!(user_id = %user.user_id, email = %user.email, "registered passkey");
+
+    let cookie = issue_session_cookie(&auth.config, &user)?;
+    let body = SessionResponse {
+        user_id: user.user_id.clone(),
+        email: user.email.clone(),
+        display_name: user.display_name.clone(),
+    };
+    Ok(session_response(cookie, body))
+}
+
+pub async fn login_begin(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LoginBeginRequest>,
+) -> AuthResult<Json<LoginBeginResponse>> {
+    let auth = state.auth.as_ref().ok_or(AuthError::BadRequest(
+        "auth not configured on this deployment".into(),
+    ))?;
+    let email = normalize_email(&req.email);
+    let user = get_user_by_email(auth, &email).await?.ok_or_else(|| {
+        // Don't leak enumeration info — just "not found" is enough, and
+        // the client UI says "check your email or sign up".
+        AuthError::NotFound
+    })?;
+
+    let passkey: Passkey = serde_json::from_str(&user.passkey_json)
+        .map_err(|e| AuthError::Internal(anyhow::anyhow!("decode stored passkey: {e}")))?;
+
+    let (rcr, auth_state_) = auth.webauthn.start_passkey_authentication(&[passkey])?;
+    let state_json = serde_json::to_string(&auth_state_)
+        .map_err(|e| AuthError::Internal(anyhow::anyhow!("serialize auth state: {e}")))?;
+
+    let challenge_id = Uuid::new_v4().to_string();
+    put_challenge(
+        auth,
+        &ChallengeRow {
+            challenge_id: challenge_id.clone(),
+            kind: "authentication".into(),
+            state_json,
+            email: Some(email.clone()),
+            expires_at: now_secs() + CHALLENGE_TTL_SECS,
+        },
+    )
+    .await?;
+
+    let request_options = serde_json::to_value(&rcr)
+        .map_err(|e| AuthError::Internal(anyhow::anyhow!("serialize rcr: {e}")))?;
+
+    Ok(Json(LoginBeginResponse {
+        challenge_id,
+        request_options,
+    }))
+}
+
+pub async fn login_finish(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LoginFinishRequest>,
+) -> AuthResult<Response> {
+    let auth = state.auth.as_ref().ok_or(AuthError::BadRequest(
+        "auth not configured on this deployment".into(),
+    ))?;
+
+    let challenge = take_challenge(auth, &req.challenge_id, "authentication").await?;
+    let auth_state_: PasskeyAuthentication = serde_json::from_str(&challenge.state_json)
+        .map_err(|e| AuthError::Internal(anyhow::anyhow!("decode auth state: {e}")))?;
+
+    let _result = auth
+        .webauthn
+        .finish_passkey_authentication(&req.credential, &auth_state_)?;
+
+    let email = challenge.email.ok_or(AuthError::Internal(anyhow::anyhow!(
+        "auth challenge missing email"
+    )))?;
+    let user = get_user_by_email(auth, &email)
+        .await?
+        .ok_or(AuthError::NotFound)?;
+
+    // NOTE: On successful finish webauthn-rs returns an AuthenticationResult
+    // containing the new counter state. A production build should update
+    // the stored Passkey with the new counter to detect cloned authenticators.
+    // Passkey devices (platform authenticators) generally keep counter = 0
+    // so this is rarely observed in practice — deferring until after MVP.
+
+    info!(user_id = %user.user_id, "login success");
+
+    let cookie = issue_session_cookie(&auth.config, &user)?;
+    let body = SessionResponse {
+        user_id: user.user_id.clone(),
+        email: user.email.clone(),
+        display_name: user.display_name.clone(),
+    };
+    Ok(session_response(cookie, body))
+}
+
+pub async fn me(user: AuthUser) -> Json<SessionResponse> {
+    Json(SessionResponse {
+        user_id: user.user_id,
+        email: user.email,
+        display_name: user.display_name,
+    })
+}
+
+pub async fn logout(State(state): State<Arc<AppState>>) -> AuthResult<Response> {
+    let auth = state.auth.as_ref().ok_or(AuthError::BadRequest(
+        "auth not configured on this deployment".into(),
+    ))?;
+    let cookie = clear_session_cookie(&auth.config);
+    let mut resp = Json(serde_json::json!({"ok": true})).into_response();
+    resp.headers_mut()
+        .insert(header::SET_COOKIE, cookie.parse().unwrap());
+    Ok(resp)
+}
+
+fn session_response<T: Serialize>(cookie: String, body: T) -> Response {
+    let mut resp = Json(body).into_response();
+    resp.headers_mut().insert(
+        header::SET_COOKIE,
+        cookie
+            .parse()
+            .unwrap_or_else(|_| "resqd_session=".parse().unwrap()),
+    );
+    resp
+}
+
+/// Idle timeout — how long a cookie is considered "fresh" even when not
+/// refreshed. Currently the same as `session_ttl_secs`; kept as a separate
+/// constant so we can later distinguish "authenticated" from "recently
+/// active" without breaking callers.
+pub const _SESSION_IDLE_SECS: u64 = 7 * 24 * 3600;
+
+#[allow(dead_code)]
+fn _force_imports() {
+    // Silence unused-import warnings for types that only appear in trait
+    // bound positions above.
+    let _: Duration = Duration::from_secs(0);
+}

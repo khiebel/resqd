@@ -2,7 +2,9 @@
 
 import { Suspense, useCallback, useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { getCrypto, hexToBytes, bytesToBase64, API_URL } from "../lib/resqdCrypto";
+import Link from "next/link";
+import { getCrypto, bytesToBase64, API_URL } from "../lib/resqdCrypto";
+import { loadMasterKey, fetchMe } from "../lib/passkey";
 
 type FetchState =
   | { phase: "idle" }
@@ -20,9 +22,21 @@ type FetchState =
     }
   | { phase: "error"; message: string };
 
-// Unwrap the {v:1, name, mime} frame written by the upload page.
-// Legacy assets uploaded before the framing change fall through to the
-// raw-bytes branch (name/mime = null).
+interface ShardedFetchResponse {
+  mode: "sharded";
+  asset_id: string;
+  original_len: number;
+  data_shards: number;
+  parity_shards: number;
+  shards: { index: number; download_url: string | null }[];
+  canary_sequence: number;
+  canary_hash_hex: string;
+  ttl_seconds: number;
+  /** Present for authed assets — per-asset key sealed under user master. */
+  wrapped_key_b64?: string;
+}
+
+/** Unwrap the {v:1, name, mime} plaintext frame the upload page writes. */
 function unwrapFrame(plaintext: Uint8Array): {
   body: Uint8Array;
   name: string | null;
@@ -54,44 +68,42 @@ function unwrapFrame(plaintext: Uint8Array): {
   }
 }
 
-interface ShardedFetchResponse {
-  mode: "sharded";
-  asset_id: string;
-  original_len: number;
-  data_shards: number;
-  parity_shards: number;
-  shards: { index: number; download_url: string | null }[];
-  canary_sequence: number;
-  canary_hash_hex: string;
-  ttl_seconds: number;
-}
-
 function FetchInner() {
   const params = useSearchParams();
   const [assetId, setAssetId] = useState(params.get("id") || "");
-  const [keyHex, setKeyHex] = useState(params.get("key") || "");
   const [state, setState] = useState<FetchState>({ phase: "idle" });
-  const [expectedCount, setExpectedCount] = useState<string>("");
-  const [verifyResult, setVerifyResult] = useState<string>("");
 
-  // Auto-run once if URL params are present.
   useEffect(() => {
-    if (params.get("id") && params.get("key")) {
-      fetchAndDecrypt();
-    }
+    (async () => {
+      const me = await fetchMe();
+      if (!me || !loadMasterKey()) {
+        window.location.href = "/login/";
+        return;
+      }
+      if (params.get("id")) {
+        fetchAndDecrypt();
+      }
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const fetchAndDecrypt = useCallback(async () => {
     try {
-      if (!assetId || !keyHex) {
-        setState({ phase: "error", message: "asset id and key required" });
+      if (!assetId) {
+        setState({ phase: "error", message: "asset id required" });
+        return;
+      }
+      const masterKey = loadMasterKey();
+      if (!masterKey) {
+        window.location.href = "/login/";
         return;
       }
 
-      // ───────── REQUEST METADATA + 6 SHARD URLS ─────────
       setState({ phase: "requesting" });
-      const metaResp = await fetch(`${API_URL}/vault/${encodeURIComponent(assetId)}`);
+      const metaResp = await fetch(
+        `${API_URL}/vault/${encodeURIComponent(assetId)}`,
+        { credentials: "include" },
+      );
       if (!metaResp.ok) {
         throw new Error(`api ${metaResp.status}: ${await metaResp.text()}`);
       }
@@ -102,13 +114,24 @@ function FetchInner() {
       let plaintextBytes: Uint8Array;
 
       if (contentType.includes("application/json")) {
-        // SHARDED MODE — new path
         const manifest: ShardedFetchResponse = await metaResp.json();
         if (manifest.mode !== "sharded") {
           throw new Error(`unexpected mode: ${manifest.mode}`);
         }
 
-        // ───────── DOWNLOAD ALL AVAILABLE SHARDS IN PARALLEL ─────────
+        // ───────── UNWRAP PER-ASSET KEY ─────────
+        // Legacy assets (pre-auth) have no wrapped key; fall back to the
+        // master key as the direct decryption key for those. New assets
+        // always have a wrapped key that we unseal here.
+        const crypto = await getCrypto();
+        let assetKey: Uint8Array;
+        if (manifest.wrapped_key_b64) {
+          const wrappedJson = atob(manifest.wrapped_key_b64);
+          assetKey = crypto.decrypt_data(masterKey, wrappedJson);
+        } else {
+          assetKey = masterKey;
+        }
+
         const total = manifest.shards.length;
         let done = 0;
         setState({ phase: "downloading-shards", done, total });
@@ -132,13 +155,11 @@ function FetchInner() {
         const present = shardResults.filter((s) => s !== null).length;
         if (present < manifest.data_shards) {
           throw new Error(
-            `only ${present}/${manifest.data_shards} required shards available — vault is degraded`,
+            `only ${present}/${manifest.data_shards} required shards available`,
           );
         }
 
-        // ───────── RECONSTRUCT + DECRYPT (WASM) ─────────
         setState({ phase: "reconstructing" });
-        const crypto = await getCrypto();
         const encryptedBytes = crypto.erasure_reconstruct(
           JSON.stringify(shardResults),
           manifest.original_len,
@@ -146,15 +167,13 @@ function FetchInner() {
         const blobJson = new TextDecoder().decode(encryptedBytes);
 
         setState({ phase: "decrypting" });
-        const key = hexToBytes(keyHex);
-        plaintextBytes = crypto.decrypt_data(key, blobJson);
+        plaintextBytes = crypto.decrypt_data(assetKey, blobJson);
       } else {
-        // LEGACY INLINE MODE — small-file bytes come back directly
+        // Legacy inline small-file path.
         const ciphertextJson = await metaResp.text();
         setState({ phase: "decrypting" });
         const crypto = await getCrypto();
-        const key = hexToBytes(keyHex);
-        plaintextBytes = crypto.decrypt_data(key, ciphertextJson);
+        plaintextBytes = crypto.decrypt_data(masterKey, ciphertextJson);
       }
 
       const { body, name, mime } = unwrapFrame(plaintextBytes);
@@ -172,32 +191,7 @@ function FetchInner() {
         message: e instanceof Error ? e.message : String(e),
       });
     }
-  }, [assetId, keyHex]);
-
-  const verify = useCallback(async () => {
-    try {
-      const count = parseInt(expectedCount, 10);
-      if (Number.isNaN(count)) {
-        setVerifyResult("expected count must be a number");
-        return;
-      }
-      const resp = await fetch(
-        `${API_URL}/vault/${encodeURIComponent(assetId)}/verify?count=${count}`,
-      );
-      if (!resp.ok) {
-        setVerifyResult(`api error: ${resp.status}`);
-        return;
-      }
-      const data = await resp.json();
-      setVerifyResult(
-        `on-chain count: ${data.on_chain_access_count} — ${
-          data.matches ? "✓ matches" : "✗ mismatch"
-        }`,
-      );
-    } catch (e) {
-      setVerifyResult(e instanceof Error ? e.message : String(e));
-    }
-  }, [assetId, expectedCount]);
+  }, [assetId]);
 
   const download = useCallback(() => {
     if (state.phase !== "done") return;
@@ -219,11 +213,19 @@ function FetchInner() {
 
   return (
     <main className="mx-auto max-w-2xl px-6 py-12 text-slate-100">
-      <h1 className="text-3xl font-bold mb-2">Fetch from RESQD</h1>
+      <div className="flex items-center justify-between mb-6">
+        <h1 className="text-3xl font-bold">Fetch from RESQD</h1>
+        <Link
+          href="/vault/"
+          className="text-xs text-amber-400 hover:underline"
+        >
+          My vault →
+        </Link>
+      </div>
       <p className="text-sm text-slate-400 mb-8">
         Each fetch rotates the canary and anchors a new commitment on Base
-        Sepolia. Shards are downloaded directly from storage backends and
-        reassembled in your browser. Your key never leaves the browser.
+        Sepolia. Shards are downloaded directly from storage and reassembled
+        in your browser. Your key never leaves the browser.
       </p>
 
       <section className="space-y-4 mb-6">
@@ -238,20 +240,9 @@ function FetchInner() {
             className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-sm font-mono"
           />
         </div>
-        <div>
-          <label className="block text-xs font-medium text-slate-400 uppercase tracking-wide mb-1">
-            Encryption key (hex)
-          </label>
-          <input
-            type="text"
-            value={keyHex}
-            onChange={(e) => setKeyHex(e.target.value)}
-            className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-xs font-mono"
-          />
-        </div>
         <button
           onClick={fetchAndDecrypt}
-          disabled={!assetId || !keyHex}
+          disabled={!assetId}
           className="rounded-lg bg-amber-500 text-slate-900 font-medium px-5 py-2 text-sm disabled:opacity-30"
         >
           Fetch & Decrypt
@@ -261,7 +252,7 @@ function FetchInner() {
       <section className="bg-slate-900 border border-slate-800 rounded-xl p-5 min-h-24">
         {state.phase === "idle" && (
           <p className="text-slate-500 text-sm">
-            Paste an asset id + key, then click Fetch.
+            Paste an asset id and click Fetch, or open one from your vault.
           </p>
         )}
         {state.phase === "requesting" && (
@@ -301,10 +292,6 @@ function FetchInner() {
               canary sequence after rotation:{" "}
               <span className="font-mono text-amber-300">{state.sequence}</span>
             </p>
-            <p className="text-xs text-slate-400 break-all">
-              new commitment hash:{" "}
-              <span className="font-mono">{state.canaryHash}</span>
-            </p>
             {preview && (
               <pre className="bg-slate-950 border border-slate-800 rounded p-3 text-xs whitespace-pre-wrap">
                 {preview}
@@ -314,32 +301,9 @@ function FetchInner() {
               onClick={download}
               className="rounded-lg bg-slate-700 hover:bg-slate-600 px-4 py-2 text-xs"
             >
-              Download bytes
+              Download
             </button>
           </div>
-        )}
-      </section>
-
-      <section className="mt-8 border-t border-slate-800 pt-6">
-        <h2 className="text-sm font-semibold mb-2">Verify on-chain access count</h2>
-        <div className="flex gap-2">
-          <input
-            type="number"
-            value={expectedCount}
-            onChange={(e) => setExpectedCount(e.target.value)}
-            placeholder="expected count"
-            className="flex-1 bg-slate-900 border border-slate-800 rounded-lg p-2 text-sm"
-          />
-          <button
-            onClick={verify}
-            disabled={!assetId || !expectedCount}
-            className="rounded-lg bg-slate-700 hover:bg-slate-600 px-4 py-2 text-sm disabled:opacity-30"
-          >
-            Verify
-          </button>
-        </div>
-        {verifyResult && (
-          <p className="mt-2 text-xs font-mono text-slate-300">{verifyResult}</p>
         )}
       </section>
     </main>

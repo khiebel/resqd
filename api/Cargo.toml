@@ -44,6 +44,20 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # AWS SDK (for bootstrapping S3/KMS)
 aws-config = "1"
+aws-sdk-dynamodb = "1"
+
+# Auth: passkey / WebAuthn, session JWT, cookies
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
+jsonwebtoken = "9"
+tower-cookies = "0.11"
+base64 = "0.22"
+rand = "0.8"
+url = "2"
+# `webauthn-rs` pulls openssl via openssl-sys. When cross-compiling for
+# `aarch64-unknown-linux-gnu` on macOS there's no system openssl available,
+# so we vendor and build it from source. Compile time hit is small vs.
+# the alternative of managing a sysroot.
+openssl = { version = "0.10", features = ["vendored"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
