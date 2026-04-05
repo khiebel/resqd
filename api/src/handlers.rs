@@ -105,11 +105,19 @@ pub struct ShardUploadSlot {
 /// legacy unauthenticated flow still works. When present, it's round-
 /// tripped verbatim via the asset manifest and returned on fetch; the
 /// server never unwraps it.
+///
+/// `encrypted_meta_b64` is a client-encrypted `{name, mime}` JSON blob
+/// sealed under the user's master key. Returned on both fetch and the
+/// `/vault` listing so the client can display a real filename in the
+/// list view without downloading + decrypting the whole asset. Server
+/// is zero-knowledge of the contents — it's just an opaque base64 string.
 #[derive(Deserialize)]
 pub struct CommitRequest {
     pub original_len: u64,
     #[serde(default)]
     pub wrapped_key_b64: Option<String>,
+    #[serde(default)]
+    pub encrypted_meta_b64: Option<String>,
 }
 
 /// Response from `POST /vault/{id}/commit` — same shape as the legacy
@@ -146,13 +154,20 @@ pub struct ShardedFetchResponse {
     /// recover the per-asset XChaCha20 key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wrapped_key_b64: Option<String>,
+    /// Client-encrypted `{name, mime}` JSON sealed under the master key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypted_meta_b64: Option<String>,
 }
 
-/// Entry in the `GET /vault` listing response.
+/// Entry in the `GET /vault` listing response. `encrypted_meta_b64`
+/// is the same opaque blob the client sent at commit time — the server
+/// just passes it back so the browser can decrypt the filename locally.
 #[derive(Serialize)]
 pub struct VaultListItem {
     pub asset_id: String,
     pub created_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypted_meta_b64: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -187,6 +202,9 @@ struct AssetManifest {
     /// Per-asset key wrapped under the owner's master key, base64.
     #[serde(default)]
     wrapped_key_b64: Option<String>,
+    /// Client-encrypted `{name, mime}` JSON sealed under the master key.
+    #[serde(default)]
+    encrypted_meta_b64: Option<String>,
     /// Unix seconds at commit time. Used by the listing endpoint for
     /// "recently added" sorting.
     #[serde(default)]
@@ -409,6 +427,7 @@ pub async fn commit(
         parity_shards: 2,
         owner_id: owner_id.clone(),
         wrapped_key_b64: req.wrapped_key_b64.clone(),
+        encrypted_meta_b64: req.encrypted_meta_b64.clone(),
         created_at: Some(created_at),
     };
     let manifest_json = serde_json::to_vec(&manifest)
@@ -423,9 +442,14 @@ pub async fn commit(
     // via the concrete S3 client (not the erasure-coded vault) because the
     // vault doesn't expose list.
     if let Some(uid) = &owner_id {
+        // Inline the encrypted meta in the owner sidecar so the listing
+        // handler can return it without having to read each asset's
+        // manifest. Still opaque to the server — the client encrypts it
+        // under the master key before we ever see it.
         let sidecar = serde_json::json!({
             "asset_id": asset_id,
             "created_at": created_at,
+            "encrypted_meta_b64": req.encrypted_meta_b64,
         });
         let bytes = serde_json::to_vec(&sidecar)
             .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
@@ -565,6 +589,7 @@ pub async fn fetch(
                 canary_hash_hex: new_commitment.hash.to_hex(),
                 ttl_seconds: PRESIGN_TTL.as_secs(),
                 wrapped_key_b64: manifest.wrapped_key_b64.clone(),
+                encrypted_meta_b64: manifest.encrypted_meta_b64.clone(),
             };
             Ok((
                 [
@@ -641,28 +666,54 @@ pub async fn verify(
     }))
 }
 
-/// `GET /vault` — list assets owned by the authenticated user. Driven
-/// by the `_owner/{user_id}/...` sidecar files written at commit time.
-/// Returns up to 1000 entries (S3 ListObjectsV2 default page); adding
-/// pagination is a future extension.
+/// `GET /vault` — list assets owned by the authenticated user.
+///
+/// Driven by the `_owner/{user_id}/...` sidecars written at commit time.
+/// Each sidecar is a tiny JSON doc containing `created_at` and the
+/// opaque `encrypted_meta_b64` blob (filename + MIME, sealed under the
+/// user's master key). We fan out the GetObject calls in parallel so
+/// that rendering a 100-asset vault is one S3 LIST + one parallel
+/// batch of GETs, not N serial round trips. Returns up to 1000 entries
+/// (ListObjectsV2 default page); pagination is a future extension.
 pub async fn list_vault(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
 ) -> ApiResult<Json<VaultListResponse>> {
     let prefix = format!("_owner/{}/", user.user_id);
-    let raw = state.s3.list_prefix(&prefix).await?;
+    let keys = state.s3.list_prefix(&prefix).await?;
 
-    let mut assets: Vec<VaultListItem> = raw
-        .into_iter()
-        .filter_map(|(key, modified)| {
+    #[derive(Deserialize)]
+    struct OwnerSidecar {
+        #[serde(default)]
+        created_at: u64,
+        #[serde(default)]
+        encrypted_meta_b64: Option<String>,
+    }
+
+    use futures::future::join_all;
+    use resqd_storage::ObjectStore;
+    let fetches = keys.into_iter().map(|(key, modified)| {
+        let s3 = state.s3.clone();
+        async move {
             let asset_id = asset_id_from_sidecar_key(&key)?.to_string();
-            let created_at = modified.map(|s| s as u64).unwrap_or(0);
+            let body = s3.get(&key).await.ok();
+            let sidecar = body
+                .as_ref()
+                .and_then(|b| serde_json::from_slice::<OwnerSidecar>(b).ok());
+            let created_at = sidecar
+                .as_ref()
+                .map(|s| s.created_at)
+                .filter(|n| *n > 0)
+                .unwrap_or_else(|| modified.map(|s| s as u64).unwrap_or(0));
             Some(VaultListItem {
                 asset_id,
                 created_at,
+                encrypted_meta_b64: sidecar.and_then(|s| s.encrypted_meta_b64),
             })
-        })
-        .collect();
+        }
+    });
+    let mut assets: Vec<VaultListItem> =
+        join_all(fetches).await.into_iter().flatten().collect();
     // Newest first.
     assets.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 

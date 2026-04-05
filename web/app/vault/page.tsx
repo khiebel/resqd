@@ -2,12 +2,16 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { API_URL } from "../lib/resqdCrypto";
-import { fetchMe, logout, type SessionUser } from "../lib/passkey";
+import { API_URL, getCrypto } from "../lib/resqdCrypto";
+import { fetchMe, loadMasterKey, logout, type SessionUser } from "../lib/passkey";
 
 interface VaultAsset {
   asset_id: string;
   created_at: number;
+  encrypted_meta_b64?: string | null;
+  /** Populated client-side after decrypting `encrypted_meta_b64`. */
+  name?: string | null;
+  mime?: string | null;
 }
 
 interface VaultListResponse {
@@ -47,6 +51,33 @@ export default function VaultPage() {
           throw new Error(`${resp.status} ${await resp.text()}`);
         }
         const data: VaultListResponse = await resp.json();
+
+        // Decrypt filename hints in-place. Needs the PRF-derived master
+        // key, which lives in sessionStorage. If it's missing (e.g., the
+        // user has a valid session cookie but a fresh tab where the PRF
+        // output was never cached), we still render the list with UUIDs
+        // and let the user re-login to unlock names.
+        const masterKey = loadMasterKey();
+        if (masterKey) {
+          const crypto = await getCrypto();
+          for (const a of data.assets) {
+            if (!a.encrypted_meta_b64) continue;
+            try {
+              const metaJson = atob(a.encrypted_meta_b64);
+              const plaintext = crypto.decrypt_data(masterKey, metaJson);
+              const parsed = JSON.parse(new TextDecoder().decode(plaintext));
+              if (parsed && typeof parsed === "object") {
+                a.name = typeof parsed.name === "string" ? parsed.name : null;
+                a.mime = typeof parsed.mime === "string" ? parsed.mime : null;
+              }
+            } catch (e) {
+              // Best-effort — a decrypt failure just means the row falls
+              // back to showing its UUID. Log it so we notice trends but
+              // don't fail the whole page.
+              console.warn(`meta decrypt failed for ${a.asset_id}:`, e);
+            }
+          }
+        }
         setView({ phase: "ready", assets: data.assets });
       } catch (e) {
         setView({
@@ -117,7 +148,7 @@ export default function VaultPage() {
           <table className="w-full text-sm">
             <thead className="bg-slate-950 text-slate-400 text-xs uppercase">
               <tr>
-                <th className="text-left py-2 px-4 font-medium">Asset</th>
+                <th className="text-left py-2 px-4 font-medium">File</th>
                 <th className="text-left py-2 px-4 font-medium">Added</th>
                 <th className="text-right py-2 px-4 font-medium"></th>
               </tr>
@@ -128,8 +159,22 @@ export default function VaultPage() {
                   key={a.asset_id}
                   className="border-t border-slate-800 hover:bg-slate-800/40"
                 >
-                  <td className="py-3 px-4 font-mono text-xs break-all">
-                    {a.asset_id}
+                  <td className="py-3 px-4">
+                    {a.name ? (
+                      <>
+                        <div className="text-slate-100">{a.name}</div>
+                        <div className="text-xs text-slate-500 font-mono break-all">
+                          {a.asset_id.slice(0, 8)}…
+                          {a.mime && (
+                            <span className="ml-2">· {a.mime}</span>
+                          )}
+                        </div>
+                      </>
+                    ) : (
+                      <div className="font-mono text-xs break-all text-slate-300">
+                        {a.asset_id}
+                      </div>
+                    )}
                   </td>
                   <td className="py-3 px-4 text-xs text-slate-400">
                     {formatTimestamp(a.created_at)}

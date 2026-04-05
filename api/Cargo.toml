@@ -46,6 +46,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 aws-config = "1"
 aws-sdk-dynamodb = "1"
 
+# Futures combinators — used by the vault-listing handler to fan out
+# owner-sidecar GetObject calls in parallel.
+futures = "0.3"
+
 # Auth: passkey / WebAuthn, session JWT, cookies
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
 jsonwebtoken = "9"

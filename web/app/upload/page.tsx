@@ -74,16 +74,33 @@ export default function UploadPage() {
         return;
       }
 
-      // ───────── WRAP FRESH PER-ASSET KEY UNDER MASTER ─────────
+      // ───────── WRAP FRESH PER-ASSET KEY + METADATA UNDER MASTER ─────────
       // Each asset gets its own 32-byte XChaCha20 key. We seal that key
       // under the PRF-derived master key and ship the sealed blob with
       // the commit. Only holders of the passkey (and therefore the
       // master key) can ever unwrap it — the server just round-trips it.
+      //
+      // The filename + MIME type are also sealed under the master key
+      // (separate encryption, distinct nonce) so the /vault listing can
+      // show real filenames instead of UUIDs without ever exposing them
+      // to the server. Using master here instead of per-asset means the
+      // client can decrypt the list view with just one key.
       setState({ phase: "wrapping-key" });
       const crypto = await getCrypto();
       const perAssetKey = crypto.generate_random_key();
       const wrappedJson = crypto.encrypt_data(masterKey, perAssetKey);
       const wrappedB64 = btoa(wrappedJson);
+
+      const metaJson = crypto.encrypt_data(
+        masterKey,
+        new TextEncoder().encode(
+          JSON.stringify({
+            name: file.name,
+            mime: file.type || "application/octet-stream",
+          }),
+        ),
+      );
+      const encryptedMetaB64 = btoa(metaJson);
 
       // ───────── FRAME + ENCRYPT ─────────
       setState({ phase: "encrypting" });
@@ -157,6 +174,7 @@ export default function UploadPage() {
           body: JSON.stringify({
             original_len: originalLen,
             wrapped_key_b64: wrappedB64,
+            encrypted_meta_b64: encryptedMetaB64,
           }),
         },
       );
