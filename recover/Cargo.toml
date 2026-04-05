@@ -1,0 +1,40 @@
+[package]
+name = "resqd-recover"
+version = "0.1.0"
+edition = "2024"
+description = "Offline Recovery Kit reconstruction tool for RESQD — zero-dependency DIY recovery"
+license = "AGPL-3.0"
+
+[[bin]]
+name = "resqd-recover"
+path = "src/main.rs"
+
+[dependencies]
+# The only RESQD crate dependency is the core crypto — keeps the
+# recover tool auditable in one sitting (no network clients, no AWS,
+# no Dynamo, no axum). Everything the tool does is CPU-only JSON
+# parsing and symmetric decryption.
+resqd-core = { path = "../core" }
+
+# Reed-Solomon erasure reconstruction — matches the writer's shard
+# layout exactly (k=4, n=6, GF(256) default field).
+reed-solomon-erasure = "6"
+
+# Symmetric AEAD. Kept as a direct dependency (rather than going
+# through resqd-core's wasm helper) so the decrypt path is legible
+# without hopping through WASM bindings.
+chacha20poly1305 = "0.10"
+
+# Serialization — JSON walking is the tool's hottest path.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Base64 for key / shard decode.
+base64 = "0.22"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Errors
+anyhow = "1"
+thiserror = "2"
