@@ -25,7 +25,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, Method};
 use axum::routing::{get, post};
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 /// Max request body size. API Gateway HTTP API allows 10 MB and Lambda
@@ -42,8 +42,15 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 /// separated). If the env var is unset we fall back to a set of known
 /// dev/prod origins.
 pub fn router(state: Arc<AppState>) -> Router {
-    let origins = cors_origins();
-    let mut cors = CorsLayer::new()
+    // Build the allow list. `CorsLayer::allow_origin` REPLACES its value
+    // each time it's called, so we have to build an `AllowOrigin::list`
+    // up front and pass it in a single call — looping with `.allow_origin()`
+    // silently drops every origin except the last.
+    let origin_values: Vec<HeaderValue> = cors_origins()
+        .iter()
+        .filter_map(|o| HeaderValue::from_str(o).ok())
+        .collect();
+    let cors = CorsLayer::new()
         .allow_methods([
             Method::GET,
             Method::POST,
@@ -57,15 +64,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::http::header::COOKIE,
         ])
         .allow_credentials(true)
+        .allow_origin(AllowOrigin::list(origin_values))
         .expose_headers([
             "x-resqd-canary-sequence".parse().unwrap(),
             "x-resqd-canary-hash".parse().unwrap(),
         ]);
-    for origin in &origins {
-        if let Ok(val) = HeaderValue::from_str(origin) {
-            cors = cors.allow_origin(val);
-        }
-    }
 
     Router::new()
         .route("/health", get(handlers::health))
