@@ -86,12 +86,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(auth::login_finish_discoverable),
         )
         .route("/auth/me", get(auth::me))
+        .route("/auth/me/identity", axum::routing::put(auth::set_identity))
         .route("/auth/logout", post(auth::logout))
         .route(
             "/auth/tokens",
             get(auth::list_tokens).post(auth::create_token),
         )
         .route("/auth/tokens/{hash}", axum::routing::delete(auth::revoke_token))
+        // User identity lookup — share-flow-only, requires an auth'd caller.
+        .route("/users/lookup", get(auth::lookup_user))
         // Vault
         .route("/vault", get(handlers::list_vault).post(handlers::upload))
         .route("/vault/init", post(handlers::init))

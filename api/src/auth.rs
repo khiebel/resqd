@@ -24,7 +24,7 @@ use aws_sdk_dynamodb::Client as DynamoClient;
 use aws_sdk_dynamodb::types::AttributeValue;
 use axum::{
     Json,
-    extract::{FromRequestParts, OptionalFromRequestParts, State},
+    extract::{FromRequestParts, OptionalFromRequestParts, Query, State},
     http::{StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
 };
@@ -210,6 +210,25 @@ pub struct UserRow {
     /// "not yet loaded"; the row itself defaults to 0 at registration.
     #[serde(default)]
     pub storage_used_bytes: Option<u64>,
+    /// Long-term X25519 public identity (base64). Minted client-side on
+    /// first login post-identity-rollout and PUT to
+    /// `/auth/me/identity`. Used as the recipient pubkey when another
+    /// user shares an asset with this user. `None` for rows that
+    /// haven't upgraded yet — they can still read their own vault and
+    /// will be prompted to establish an identity next time they log in
+    /// with PRF support. Immutable once set.
+    #[serde(default)]
+    pub pubkey_x25519_b64: Option<String>,
+    /// X25519 private key sealed under the user's PRF-derived master
+    /// key via the standard XChaCha20-Poly1305 envelope. Stored on the
+    /// server but unreadable without the master key, so the server
+    /// still holds no useful key material. Fetched by the browser on
+    /// each login, unwrapped with the master key, and cached in
+    /// session storage next to `resqd_master_key`. Required on the
+    /// sharing read path so the recipient can ECDH against the
+    /// sender's pubkey without a fresh passkey prompt.
+    #[serde(default)]
+    pub wrapped_privkey_x25519_b64: Option<String>,
 }
 
 /// Row in `resqd-auth-challenges`. Stores the serialized webauthn state
@@ -360,6 +379,43 @@ pub struct MeResponse {
     pub storage_used_bytes: u64,
     /// Hard cap enforced on commit. See `QUOTA_BYTES`.
     pub storage_quota_bytes: u64,
+    /// Long-term X25519 public identity, base64. Empty string if the
+    /// user hasn't established one yet (pre-identity-rollout rows) —
+    /// the browser uses this as a signal to run the one-time identity
+    /// mint flow on next PRF-capable login.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pubkey_x25519_b64: Option<String>,
+    /// Master-key-sealed X25519 private identity, base64. Only this
+    /// user ever receives their own wrapped privkey (it's inside their
+    /// own auth'd `/auth/me` response), and the server cannot unwrap
+    /// it without the PRF-derived master key it has never seen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrapped_privkey_x25519_b64: Option<String>,
+}
+
+/// Request body for `PUT /auth/me/identity`. Browser-generated X25519
+/// keypair: public half in the clear, private half already sealed under
+/// the master key client-side. The server writes both into the user row
+/// with a conditional update so the first successful caller wins and
+/// subsequent calls are rejected — identities are immutable for the
+/// life of the account (rotating them would silently invalidate every
+/// share that pointed at the old pubkey).
+#[derive(Deserialize)]
+pub struct SetIdentityRequest {
+    pub pubkey_x25519_b64: String,
+    pub wrapped_privkey_x25519_b64: String,
+}
+
+/// Response to `GET /users/lookup?email=X`. Exposes ONLY the public
+/// half of another user's long-term identity — enough for the caller
+/// to ECDH-derive a share wrap key, nothing more. Requires a valid
+/// session so random unauthenticated clients can't harvest pubkeys.
+#[derive(Serialize)]
+pub struct UserLookupResponse {
+    pub user_id: String,
+    pub email: String,
+    pub display_name: String,
+    pub pubkey_x25519_b64: String,
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -681,6 +737,12 @@ pub async fn get_user_by_email(auth: &AuthState, email: &str) -> AuthResult<Opti
             .get("storage_used_bytes")
             .and_then(|v| v.as_n().ok())
             .and_then(|s| s.parse().ok()),
+        pubkey_x25519_b64: item
+            .get("pubkey_x25519_b64")
+            .and_then(|v| v.as_s().ok().cloned()),
+        wrapped_privkey_x25519_b64: item
+            .get("wrapped_privkey_x25519_b64")
+            .and_then(|v| v.as_s().ok().cloned()),
     }))
 }
 
@@ -941,6 +1003,13 @@ pub async fn register_finish(
         display_name,
         created_at: now_secs(),
         storage_used_bytes: Some(0),
+        // Identity is minted lazily by the browser on the first
+        // PRF-capable login right after registration finishes, via
+        // PUT /auth/me/identity. Registration itself doesn't have
+        // access to the master key yet (that lives client-side) so
+        // we can't pre-seal a privkey here.
+        pubkey_x25519_b64: None,
+        wrapped_privkey_x25519_b64: None,
     };
     put_user(auth, &user).await?;
 
@@ -1074,6 +1143,12 @@ async fn get_user_by_credential_id(
             .get("storage_used_bytes")
             .and_then(|v| v.as_n().ok())
             .and_then(|s| s.parse().ok()),
+        pubkey_x25519_b64: item
+            .get("pubkey_x25519_b64")
+            .and_then(|v| v.as_s().ok().cloned()),
+        wrapped_privkey_x25519_b64: item
+            .get("wrapped_privkey_x25519_b64")
+            .and_then(|v| v.as_s().ok().cloned()),
     }))
 }
 
@@ -1167,17 +1242,210 @@ pub async fn me(
     let auth = state.auth.as_ref().ok_or(AuthError::Unauthorized)?;
     // Read the row to get a fresh usage count. Cheap (single GetItem),
     // and only called on page load / tab focus — not on every vault op.
-    let storage_used_bytes = get_user_by_email(auth, &user.email)
-        .await?
-        .and_then(|u| u.storage_used_bytes)
-        .unwrap_or(0);
+    let row = get_user_by_email(auth, &user.email).await?;
+    let storage_used_bytes = row.as_ref().and_then(|u| u.storage_used_bytes).unwrap_or(0);
+    let pubkey_x25519_b64 = row.as_ref().and_then(|u| u.pubkey_x25519_b64.clone());
+    let wrapped_privkey_x25519_b64 =
+        row.as_ref().and_then(|u| u.wrapped_privkey_x25519_b64.clone());
     Ok(Json(MeResponse {
         user_id: user.user_id,
         email: user.email,
         display_name: user.display_name,
         storage_used_bytes,
         storage_quota_bytes: QUOTA_BYTES,
+        pubkey_x25519_b64,
+        wrapped_privkey_x25519_b64,
     }))
+}
+
+/// `PUT /auth/me/identity` — one-time mint of the caller's long-term
+/// X25519 identity. Called exactly once by the browser after the first
+/// PRF-capable login on an account that has no identity yet. Both
+/// fields are opaque base64 blobs produced client-side by
+/// `x25519_generate_identity` (pubkey) + `encrypt_data` under the
+/// master key (wrapped privkey).
+///
+/// Conditional on `attribute_not_exists(pubkey_x25519_b64)` so a later
+/// call that tries to overwrite — whether accidentally, via a bug, or
+/// via an attacker who somehow holds a session — is rejected with 409
+/// Conflict. The identity is effectively an extension of the user's
+/// passkey: stable forever, same blast radius on loss.
+pub async fn set_identity(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(req): Json<SetIdentityRequest>,
+) -> AuthResult<Json<serde_json::Value>> {
+    let auth = state.auth.as_ref().ok_or(AuthError::Unauthorized)?;
+
+    // Light format validation. We deliberately don't validate the
+    // *contents* of the wrapped privkey (the server can't decrypt it)
+    // but we do gate the pubkey on a correct 32-byte x25519 key length
+    // post-base64 to catch obvious client bugs before they write a
+    // permanent row.
+    let pk_bytes = BASE64_STANDARD
+        .decode(req.pubkey_x25519_b64.trim())
+        .map_err(|e| AuthError::BadRequest(format!("pubkey_x25519_b64 not base64: {e}")))?;
+    if pk_bytes.len() != 32 {
+        return Err(AuthError::BadRequest(format!(
+            "pubkey_x25519_b64 must decode to 32 bytes, got {}",
+            pk_bytes.len()
+        )));
+    }
+    if req.wrapped_privkey_x25519_b64.trim().is_empty() {
+        return Err(AuthError::BadRequest(
+            "wrapped_privkey_x25519_b64 required".into(),
+        ));
+    }
+
+    let result = auth
+        .dynamo
+        .update_item()
+        .table_name(&auth.config.users_table)
+        .key("email", AttributeValue::S(user.email.clone()))
+        .update_expression(
+            "SET pubkey_x25519_b64 = :pk, wrapped_privkey_x25519_b64 = :wsk",
+        )
+        .condition_expression("attribute_not_exists(pubkey_x25519_b64)")
+        .expression_attribute_values(
+            ":pk",
+            AttributeValue::S(req.pubkey_x25519_b64.clone()),
+        )
+        .expression_attribute_values(
+            ":wsk",
+            AttributeValue::S(req.wrapped_privkey_x25519_b64.clone()),
+        )
+        .send()
+        .await;
+
+    match result {
+        Ok(_) => {
+            info!(user_id = %user.user_id, "x25519 identity minted");
+            Ok(Json(serde_json::json!({
+                "ok": true,
+                "pubkey_x25519_b64": req.pubkey_x25519_b64,
+            })))
+        }
+        Err(e) => {
+            let msg = format!("{e:?}");
+            if msg.contains("ConditionalCheckFailed") {
+                Err(AuthError::Conflict(
+                    "identity already established for this user".into(),
+                ))
+            } else {
+                Err(AuthError::Dynamo(msg))
+            }
+        }
+    }
+}
+
+/// `GET /users/lookup?email=X` — resolve another user's **public**
+/// X25519 identity for the purpose of sharing an asset with them. The
+/// caller must be authenticated; we refuse to expose identities to
+/// unauthenticated scrapers even though the pubkeys themselves are
+/// public crypto material, because the mapping `email -> has an
+/// account` is itself a disclosure.
+///
+/// Returns 404 if the user doesn't exist OR if they haven't minted an
+/// identity yet — we deliberately collapse both cases so an attacker
+/// can't use this endpoint to probe which emails have RESQD accounts
+/// without identities (vs. which don't have accounts at all).
+pub async fn lookup_user(
+    State(state): State<Arc<AppState>>,
+    _caller: AuthUser,
+    Query(q): Query<UserLookupQuery>,
+) -> AuthResult<Json<UserLookupResponse>> {
+    let auth = state.auth.as_ref().ok_or(AuthError::Unauthorized)?;
+    let email = normalize_email(&q.email);
+    if email.is_empty() || !email.contains('@') {
+        return Err(AuthError::BadRequest("valid email required".into()));
+    }
+
+    let row = get_user_by_email(auth, &email).await?.ok_or(AuthError::NotFound)?;
+    let pubkey = row
+        .pubkey_x25519_b64
+        .ok_or(AuthError::NotFound)?;
+
+    Ok(Json(UserLookupResponse {
+        user_id: row.user_id,
+        email: row.email,
+        display_name: row.display_name,
+        pubkey_x25519_b64: pubkey,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct UserLookupQuery {
+    pub email: String,
+}
+
+/// Lookup by user_id (not email). Used by handlers that only know the
+/// opaque owner id — e.g. when a sharee fetches a shared asset and we
+/// want to surface the sender's email/display name in the read path
+/// without a second round trip. Scans by-email via a loose approach
+/// for now; at scale we'd add a user_id GSI, but the alpha population
+/// is small enough that a single targeted GetItem by email is the hot
+/// path and this helper only runs on the sharing read, which is
+/// already a multi-step flow.
+pub async fn get_user_by_user_id(
+    auth: &AuthState,
+    user_id: &str,
+) -> AuthResult<Option<UserRow>> {
+    // For the alpha we take advantage of `user_id` being carried on
+    // every token row and use the tokens GSI as a poor-man's reverse
+    // lookup. This keeps us from having to add another GSI on the
+    // users table just for sharing. If a user has no tokens we fall
+    // back to scanning the users table — acceptable while the
+    // population is tiny. Revisit when users table grows.
+    let out = auth
+        .dynamo
+        .query()
+        .table_name(&auth.config.tokens_table)
+        .index_name("user_id-index")
+        .key_condition_expression("user_id = :uid")
+        .expression_attribute_values(":uid", AttributeValue::S(user_id.to_string()))
+        .limit(1)
+        .send()
+        .await?;
+    if let Some(tok) = out.items().first() {
+        if let Ok(email) = take_s(tok, "email") {
+            return get_user_by_email(auth, &email).await;
+        }
+    }
+    // Fallback: scan the users table for a matching user_id. Linear in
+    // the users table size — fine for alpha.
+    let scan = auth
+        .dynamo
+        .scan()
+        .table_name(&auth.config.users_table)
+        .filter_expression("user_id = :uid")
+        .expression_attribute_values(":uid", AttributeValue::S(user_id.to_string()))
+        .limit(1)
+        .send()
+        .await?;
+    if let Some(item) = scan.items().first() {
+        return Ok(Some(UserRow {
+            email: take_s(item, "email")?,
+            user_id: take_s(item, "user_id")?,
+            credential_id: take_s(item, "credential_id")?,
+            passkey_json: take_s(item, "passkey_json")?,
+            display_name: take_s(item, "display_name").unwrap_or_default(),
+            created_at: take_s(item, "created_at")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            storage_used_bytes: item
+                .get("storage_used_bytes")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|s| s.parse().ok()),
+            pubkey_x25519_b64: item
+                .get("pubkey_x25519_b64")
+                .and_then(|v| v.as_s().ok().cloned()),
+            wrapped_privkey_x25519_b64: item
+                .get("wrapped_privkey_x25519_b64")
+                .and_then(|v| v.as_s().ok().cloned()),
+        }));
+    }
+    Ok(None)
 }
 
 // ────────────────────────────────────────────────────────────────────
