@@ -199,6 +199,12 @@ export async function registerWithPasskey(email: string): Promise<SessionUser> {
     }).authenticatorSelection ?? {}),
     requireResidentKey: true,
     residentKey: "required",
+    // `platform` = Touch ID / Windows Hello / Android biometric. Restricts
+    // the browser save dialog to the platform authenticator instead of
+    // offering external security keys. On macOS Chrome this encourages
+    // (but does not force) saving to iCloud Keychain so the credential
+    // is visible to Safari too.
+    authenticatorAttachment: "platform",
   };
 
   // Inject PRF extension. WebAuthn spec says the authenticator returns a
