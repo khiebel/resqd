@@ -154,8 +154,23 @@ pub struct AuthState {
 
 impl AuthState {
     pub async fn from_config(config: AuthConfig) -> anyhow::Result<Self> {
-        let builder = WebauthnBuilder::new(&config.rp_id, &config.origin)?
+        // Primary origin is `config.origin`. Additional origins can be
+        // passed through `RESQD_WEBAUTHN_ADDITIONAL_ORIGINS` (comma-
+        // separated) — used during the app.resqd.ai → resqd.ai
+        // consolidation so passkeys registered against either subdomain
+        // verify against the same RP id on either host.
+        let mut builder = WebauthnBuilder::new(&config.rp_id, &config.origin)?
             .rp_name(&config.rp_name);
+        if let Ok(extras) = std::env::var("RESQD_WEBAUTHN_ADDITIONAL_ORIGINS") {
+            for o in extras.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                match Url::parse(o) {
+                    Ok(url) => {
+                        builder = builder.append_allowed_origin(&url);
+                    }
+                    Err(e) => tracing::warn!(origin = %o, error = %e, "invalid additional origin"),
+                }
+            }
+        }
         let webauthn = Arc::new(builder.build()?);
         let aws_conf = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let dynamo = DynamoClient::new(&aws_conf);

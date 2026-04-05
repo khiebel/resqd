@@ -1,28 +1,31 @@
 import Link from "next/link";
+import Image from "next/image";
 
 /**
- * RESQD landing page.
+ * RESQD landing — the canonical marketing + signup page served at
+ * resqd.ai. Single source of truth for everything a visitor sees
+ * before signing in: hero, proof bar, features, how-it-works, pitch,
+ * pricing, trust markers, legal links. The app surface (signup, login,
+ * vault, settings, billing) lives alongside this page in the same
+ * Next.js app, so the user journey from "landed on resqd.ai" to "just
+ * uploaded my first file" stays inside one deployment.
  *
- * This page is the first impression anyone lands on. Its job is to get
- * two audiences to sign up:
- *
- *   1. Security-literate users who will grok "post-quantum + zero-knowledge
- *      + on-chain canary anchoring" and want to try it.
- *   2. Families and individuals with high-value digital assets (tax returns,
- *      crypto keys, estate documents, medical records) who need the promise
- *      to be legible without the jargon.
- *
- * Structure: hero → proof points → how it works → pricing → CTA. Pricing
- * is a placeholder — see docs/BILLING.md for the rationale and real
- * numbers. Nothing on this page is fake-except where marked "alpha".
+ * Content is ported from the old static `site/index.html` with the
+ * waitlist forms replaced by direct signup CTAs. Visual language is
+ * deliberately a blend: the app's amber/slate palette (for consistency
+ * with what users see after sign-in) plus gradient accents in the hero
+ * to signal the crypto/quantum positioning.
  */
+
 export default function Home() {
   return (
     <main className="min-h-screen bg-black text-slate-100">
       <TopNav />
       <Hero />
+      <StatsBar />
       <FeatureGrid />
       <HowItWorks />
+      <Pitch />
       <Pricing />
       <TrustMarkers />
       <FinalCta />
@@ -35,16 +38,31 @@ function TopNav() {
   return (
     <nav className="sticky top-0 z-20 backdrop-blur bg-black/70 border-b border-slate-900">
       <div className="mx-auto max-w-6xl px-6 py-4 flex items-center justify-between">
-        <Link href="/" className="font-bold tracking-tight text-lg">
-          RESQD
-          <span className="ml-2 text-[10px] uppercase tracking-widest text-amber-500 align-middle">
-            alpha
+        <Link href="/" className="flex items-center gap-2.5">
+          <Image
+            src="/marketing/icon.png"
+            alt="RESQD"
+            width={32}
+            height={32}
+            className="rounded-md"
+          />
+          <span className="font-bold tracking-tight text-lg">
+            RESQD
+            <span className="ml-2 text-[10px] uppercase tracking-widest text-amber-500 align-middle">
+              alpha
+            </span>
           </span>
         </Link>
         <div className="flex items-center gap-6 text-sm text-slate-400">
-          <a href="#how" className="hover:text-slate-100">How it works</a>
-          <a href="#pricing" className="hover:text-slate-100">Pricing</a>
-          <Link href="/login/" className="hover:text-slate-100">Sign in</Link>
+          <a href="#how" className="hover:text-slate-100 hidden md:inline">
+            How it works
+          </a>
+          <a href="#pricing" className="hover:text-slate-100 hidden md:inline">
+            Pricing
+          </a>
+          <Link href="/login/" className="hover:text-slate-100">
+            Sign in
+          </Link>
           <Link
             href="/signup/"
             className="rounded-lg bg-amber-500 text-slate-900 font-semibold px-4 py-2"
@@ -59,39 +77,87 @@ function TopNav() {
 
 function Hero() {
   return (
-    <section className="mx-auto max-w-5xl px-6 pt-24 pb-20 text-center">
-      <p className="text-xs uppercase tracking-widest text-amber-500 mb-6">
-        Post-quantum · Multi-cloud · Tamper-evident
-      </p>
-      <h1 className="text-5xl md:text-6xl font-bold tracking-tight leading-[1.05]">
-        Your digital life,
-        <br />
-        <span className="text-amber-400">rescued.</span>
-      </h1>
-      <p className="mt-8 text-lg text-slate-400 max-w-2xl mx-auto leading-relaxed">
-        RESQD is a zero-knowledge vault for the things that matter most —
-        tax returns, medical records, recovery phrases, family archives.
-        Encrypted in your browser with post-quantum crypto, sharded across
-        three clouds, and every access cryptographically sealed on a
-        public blockchain. Even we can&apos;t read what you store.
-      </p>
-      <div className="mt-10 flex items-center justify-center gap-4">
-        <Link
-          href="/signup/"
-          className="rounded-lg bg-amber-500 text-slate-900 font-semibold px-8 py-4 text-sm"
-        >
-          Create your vault — free
-        </Link>
-        <a
-          href="#how"
-          className="rounded-lg border border-slate-700 hover:border-slate-500 px-8 py-4 text-sm text-slate-300"
-        >
-          How it works
-        </a>
+    <section className="relative overflow-hidden">
+      {/* Gradient glows */}
+      <div className="absolute inset-0 pointer-events-none">
+        <div className="absolute top-0 left-1/4 w-[600px] h-[600px] rounded-full bg-amber-500/10 blur-3xl" />
+        <div className="absolute top-32 right-1/4 w-[500px] h-[500px] rounded-full bg-violet-600/10 blur-3xl" />
       </div>
-      <p className="mt-6 text-xs text-slate-600">
-        No credit card. No password. Sign up with your fingerprint.
-      </p>
+
+      <div className="relative mx-auto max-w-5xl px-6 pt-24 pb-16 text-center">
+        <p className="text-xs uppercase tracking-widest text-amber-500 mb-6">
+          Post-quantum · Multi-cloud · Tamper-evident
+        </p>
+        <h1 className="text-5xl md:text-7xl font-bold tracking-tight leading-[1.05]">
+          Your digital life,
+          <br />
+          <span className="bg-gradient-to-r from-amber-300 via-amber-400 to-violet-400 bg-clip-text text-transparent">
+            rescued.
+          </span>
+        </h1>
+        <p className="mt-8 text-lg text-slate-400 max-w-2xl mx-auto leading-relaxed">
+          RESQD is a zero-knowledge vault for the things that matter most —
+          tax returns, medical records, recovery phrases, family archives.
+          Encrypted in your browser with post-quantum crypto, sharded across
+          three clouds, and every access cryptographically sealed on a
+          public blockchain. Even we can&apos;t read what you store.
+        </p>
+        <div className="mt-10 flex items-center justify-center gap-4">
+          <Link
+            href="/signup/"
+            className="rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-900 font-semibold px-8 py-4 text-sm transition-colors"
+          >
+            Create your vault — free
+          </Link>
+          <a
+            href="#how"
+            className="rounded-lg border border-slate-700 hover:border-slate-500 px-8 py-4 text-sm text-slate-300 transition-colors"
+          >
+            How it works
+          </a>
+        </div>
+        <p className="mt-6 text-xs text-slate-600">
+          No credit card. No password. Sign up with your fingerprint.
+        </p>
+
+        <div className="mt-16 mx-auto max-w-4xl">
+          <Image
+            src="/marketing/hero.png"
+            alt="Quantum shield visualization"
+            width={1200}
+            height={600}
+            className="rounded-xl border border-slate-800 w-full"
+            priority
+          />
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function StatsBar() {
+  const stats = [
+    { num: "3", label: "Cloud providers" },
+    { num: "PQ", label: "Post-quantum crypto" },
+    { num: "0", label: "Single points of failure" },
+    { num: "∞", label: "Verifiable access history" },
+  ];
+  return (
+    <section className="border-y border-slate-900">
+      <div className="mx-auto max-w-5xl px-6 py-10">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-8 text-center">
+          {stats.map((s) => (
+            <div key={s.label}>
+              <div className="text-3xl md:text-4xl font-bold bg-gradient-to-r from-amber-300 to-violet-400 bg-clip-text text-transparent">
+                {s.num}
+              </div>
+              <div className="text-xs text-slate-500 mt-1 uppercase tracking-wide">
+                {s.label}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
     </section>
   );
 }
@@ -124,21 +190,21 @@ function FeatureGrid() {
     },
   ];
   return (
-    <section className="border-y border-slate-900 bg-slate-950">
-      <div className="mx-auto max-w-6xl px-6 py-20">
-        <h2 className="text-3xl font-bold text-center mb-4">
+    <section className="border-b border-slate-900 bg-slate-950">
+      <div className="mx-auto max-w-6xl px-6 py-24">
+        <h2 className="text-3xl md:text-4xl font-bold text-center mb-4">
           Every feature. Every tier. No gatekeeping on safety.
         </h2>
         <p className="text-center text-slate-400 max-w-2xl mx-auto mb-14">
           We never charge for security. Post-quantum crypto, multi-cloud
           storage, and on-chain anchoring are the same whether you&apos;re
-          free or enterprise.
+          on free or enterprise.
         </p>
         <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
           {features.map((f) => (
             <div
               key={f.title}
-              className="bg-slate-900 border border-slate-800 rounded-xl p-6 hover:border-slate-700 transition-colors"
+              className="bg-slate-900 border border-slate-800 rounded-xl p-6 hover:border-amber-500/40 transition-colors"
             >
               <h3 className="text-lg font-semibold mb-2">{f.title}</h3>
               <p className="text-sm text-slate-400 leading-relaxed">{f.body}</p>
@@ -175,11 +241,17 @@ function HowItWorks() {
   ];
   return (
     <section id="how" className="mx-auto max-w-5xl px-6 py-24">
-      <h2 className="text-3xl font-bold text-center mb-16">How it works</h2>
+      <h2 className="text-3xl md:text-4xl font-bold text-center mb-4">
+        How it works
+      </h2>
+      <p className="text-center text-slate-400 max-w-2xl mx-auto mb-16">
+        Every step happens in your browser before a single byte reaches
+        our servers.
+      </p>
       <div className="space-y-12">
         {steps.map((s) => (
           <div key={s.n} className="flex gap-8 items-start">
-            <div className="text-4xl font-mono text-amber-500 shrink-0 w-16">
+            <div className="text-4xl font-mono bg-gradient-to-b from-amber-300 to-violet-500 bg-clip-text text-transparent shrink-0 w-16">
               {s.n}
             </div>
             <div className="flex-1 border-l border-slate-800 pl-8">
@@ -188,6 +260,76 @@ function HowItWorks() {
             </div>
           </div>
         ))}
+      </div>
+    </section>
+  );
+}
+
+function Pitch() {
+  return (
+    <section className="border-y border-slate-900 bg-slate-950">
+      <div className="mx-auto max-w-3xl px-6 py-24 text-slate-300 leading-relaxed">
+        <h2 className="text-3xl md:text-4xl font-bold mb-8 bg-gradient-to-r from-amber-300 to-violet-400 bg-clip-text text-transparent">
+          Why the world needs RESQD
+        </h2>
+
+        <div className="space-y-6 text-base">
+          <p>
+            Every day, families lose irreplaceable photos to cloud provider
+            outages. Businesses lose millions to data breaches that silently
+            exfiltrate secrets for months before detection. Crypto holders
+            die without their heirs knowing how to access their wallets.
+            And{" "}
+            <span className="text-slate-100 font-semibold">
+              quantum computers are coming
+            </span>{" "}
+            — rendering today&apos;s encryption obsolete within the decade.
+          </p>
+
+          <p>
+            The solutions people use today are dangerously fragile. iCloud?
+            One account compromise and everything is gone. Google Drive? A
+            single company controls your memories. A password manager? It
+            stores credentials, not your life&apos;s work. An encrypted USB
+            drive? One hardware failure from total loss.
+          </p>
+
+          <p>
+            <span className="text-slate-100 font-semibold">
+              RESQD is different.
+            </span>{" "}
+            We don&apos;t store your data — we rescue it. Your files are
+            encrypted with post-quantum algorithms{" "}
+            <em className="text-slate-100">in your browser</em> before they
+            ever leave your device. Then they&apos;re split into shards and
+            distributed across three independent cloud providers. No single
+            entity — not AWS, not Google, not even RESQD — can read or
+            reconstruct your data.
+          </p>
+
+          <p>
+            But security without proof is just a promise. That&apos;s why
+            every access to your vault rotates a cryptographic canary and
+            commits the result to the blockchain. You don&apos;t have to
+            trust us when we say nobody looked.{" "}
+            <span className="text-slate-100 font-semibold">
+              You can verify it mathematically.
+            </span>
+          </p>
+
+          <p>
+            This isn&apos;t another cloud storage product. It&apos;s the
+            first{" "}
+            <span className="text-slate-100 font-semibold">
+              digital safety deposit box
+            </span>{" "}
+            that uses the laws of mathematics to guarantee what physical
+            vaults use steel walls to approximate:{" "}
+            <em className="text-slate-100">
+              your most treasured assets are safe, and you can prove it.
+            </em>
+          </p>
+        </div>
       </div>
     </section>
   );
@@ -256,12 +398,9 @@ function Pricing() {
     },
   ];
   return (
-    <section
-      id="pricing"
-      className="border-y border-slate-900 bg-gradient-to-b from-slate-950 to-black"
-    >
+    <section id="pricing" className="bg-gradient-to-b from-black to-slate-950">
       <div className="mx-auto max-w-6xl px-6 py-24">
-        <h2 className="text-3xl font-bold text-center mb-3">
+        <h2 className="text-3xl md:text-4xl font-bold text-center mb-3">
           Pay for capacity. Never for safety.
         </h2>
         <p className="text-center text-slate-400 max-w-2xl mx-auto mb-4">
@@ -276,9 +415,9 @@ function Pricing() {
           {tiers.map((t) => (
             <div
               key={t.name}
-              className={`rounded-xl p-6 border ${
+              className={`rounded-xl p-6 border flex flex-col ${
                 t.highlight
-                  ? "bg-amber-500/5 border-amber-500/40 relative"
+                  ? "bg-gradient-to-b from-amber-500/10 to-transparent border-amber-500/40 relative"
                   : "bg-slate-900 border-slate-800"
               }`}
             >
@@ -293,7 +432,7 @@ function Pricing() {
                 <span className="text-4xl font-bold">{t.price}</span>
                 <span className="text-sm text-slate-500">{t.cadence}</span>
               </div>
-              <ul className="space-y-2 text-sm text-slate-300 mb-8">
+              <ul className="space-y-2 text-sm text-slate-300 mb-8 flex-1">
                 {t.features.map((f) => (
                   <li key={f} className="flex gap-2">
                     <span className="text-amber-400">✓</span>
@@ -344,7 +483,8 @@ function TrustMarkers() {
             On-chain
           </div>
           <div className="text-sm text-slate-400">
-            Every access anchored to Base L2 for cryptographic tamper evidence
+            Every access anchored to Base L2 for cryptographic tamper
+            evidence
           </div>
         </div>
       </div>
@@ -355,17 +495,18 @@ function TrustMarkers() {
 function FinalCta() {
   return (
     <section className="border-t border-slate-900 bg-slate-950">
-      <div className="mx-auto max-w-3xl px-6 py-20 text-center">
-        <h2 className="text-3xl font-bold mb-3">
+      <div className="mx-auto max-w-3xl px-6 py-24 text-center">
+        <h2 className="text-3xl md:text-4xl font-bold mb-3">
           Start with your hardest secret.
         </h2>
-        <p className="text-slate-400 mb-8">
+        <p className="text-slate-400 mb-10 leading-relaxed">
           The thing you&apos;d be most devastated to lose — back it up to a
           vault that was designed assuming everyone except you is hostile.
+          Alpha is open. Takes under a minute.
         </p>
         <Link
           href="/signup/"
-          className="inline-block rounded-lg bg-amber-500 text-slate-900 font-semibold px-8 py-4"
+          className="inline-block rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-900 font-semibold px-8 py-4 transition-colors"
         >
           Create your vault
         </Link>
@@ -377,17 +518,27 @@ function FinalCta() {
 function Footer() {
   return (
     <footer className="border-t border-slate-900 text-xs text-slate-500">
-      <div className="mx-auto max-w-6xl px-6 py-8 flex flex-wrap items-center justify-between gap-4">
-        <div>© 2026 RESQD. All rights reserved.</div>
-        <div className="flex gap-6 flex-wrap">
-          <a href="#how" className="hover:text-slate-300">How it works</a>
-          <a href="#pricing" className="hover:text-slate-300">Pricing</a>
-          <Link href="/security-model/" className="hover:text-slate-300">Security</Link>
-          <Link href="/privacy/" className="hover:text-slate-300">Privacy</Link>
-          <Link href="/terms/" className="hover:text-slate-300">Terms</Link>
-          <span className="text-slate-700">·</span>
-          <Link href="/login/" className="hover:text-slate-300">Sign in</Link>
+      <div className="mx-auto max-w-6xl px-6 py-10">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div>© 2026 RESQD · Quantum-secured digital vault</div>
+          <div className="flex gap-5 flex-wrap">
+            <a href="#how" className="hover:text-slate-300">How it works</a>
+            <a href="#pricing" className="hover:text-slate-300">Pricing</a>
+            <Link href="/security-model/" className="hover:text-slate-300">
+              Security
+            </Link>
+            <Link href="/privacy/" className="hover:text-slate-300">
+              Privacy
+            </Link>
+            <Link href="/terms/" className="hover:text-slate-300">
+              Terms
+            </Link>
+          </div>
         </div>
+        <p className="mt-4 text-slate-600">
+          Built with post-quantum cryptography. Your secrets stay secret —
+          forever.
+        </p>
       </div>
     </footer>
   );
