@@ -179,6 +179,21 @@ export default function UploadPage() {
         },
       );
       if (!commitResp.ok) {
+        // 413 from the server means quota exceeded — surface the
+        // specific numbers so the user knows what to delete.
+        if (commitResp.status === 413) {
+          const body = await commitResp.json().catch(() => ({}));
+          const used = body.storage_used_bytes ?? 0;
+          const cap = body.storage_quota_bytes ?? 0;
+          const req = body.requested_bytes ?? 0;
+          const fmt = (n: number) =>
+            n < 1024 * 1024
+              ? `${(n / 1024).toFixed(1)} KB`
+              : `${(n / 1024 / 1024).toFixed(1)} MB`;
+          throw new Error(
+            `Your vault is full. ${fmt(used)} of ${fmt(cap)} used, this file would add ${fmt(req)}. Delete something first.`,
+          );
+        }
         throw new Error(`commit failed: ${await commitResp.text()}`);
       }
       const commit: CommitResponse = await commitResp.json();

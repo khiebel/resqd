@@ -193,17 +193,23 @@ impl AuthState {
 /// changed later (we'd copy-delete the row) without invalidating any
 /// downstream references.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-struct UserRow {
-    email: String,
-    user_id: String,
+pub struct UserRow {
+    pub email: String,
+    pub user_id: String,
     /// base64url of the WebAuthn credential id. Also the partition key of
     /// the `credential_id-index` GSI for reverse lookups.
-    credential_id: String,
+    pub credential_id: String,
     /// Full `Passkey` JSON from webauthn-rs (requires
     /// `danger-allow-state-serialisation` feature).
-    passkey_json: String,
-    display_name: String,
-    created_at: u64,
+    pub passkey_json: String,
+    pub display_name: String,
+    pub created_at: u64,
+    /// Sum of `original_len` across every asset the user has committed
+    /// and not yet deleted. Used as the basis for the per-user storage
+    /// cap — see `QUOTA_BYTES`. `None` in the struct here just means
+    /// "not yet loaded"; the row itself defaults to 0 at registration.
+    #[serde(default)]
+    pub storage_used_bytes: Option<u64>,
 }
 
 /// Row in `resqd-auth-challenges`. Stores the serialized webauthn state
@@ -343,6 +349,17 @@ pub struct SessionResponse {
     pub user_id: String,
     pub email: String,
     pub display_name: String,
+}
+
+#[derive(Serialize)]
+pub struct MeResponse {
+    pub user_id: String,
+    pub email: String,
+    pub display_name: String,
+    /// Bytes currently consumed by this user's vault.
+    pub storage_used_bytes: u64,
+    /// Hard cap enforced on commit. See `QUOTA_BYTES`.
+    pub storage_quota_bytes: u64,
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -641,7 +658,7 @@ fn take_s(item: &HashMap<String, AttributeValue>, key: &str) -> AuthResult<Strin
         .ok_or(AuthError::BadRequest(format!("missing attribute: {key}")))
 }
 
-async fn get_user_by_email(auth: &AuthState, email: &str) -> AuthResult<Option<UserRow>> {
+pub async fn get_user_by_email(auth: &AuthState, email: &str) -> AuthResult<Option<UserRow>> {
     let out = auth
         .dynamo
         .get_item()
@@ -660,6 +677,10 @@ async fn get_user_by_email(auth: &AuthState, email: &str) -> AuthResult<Option<U
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0),
+        storage_used_bytes: item
+            .get("storage_used_bytes")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|s| s.parse().ok()),
     }))
 }
 
@@ -683,6 +704,9 @@ async fn put_user(auth: &AuthState, user: &UserRow) -> AuthResult<()> {
         "created_at".into(),
         AttributeValue::N(user.created_at.to_string()),
     );
+    // Initialize storage counter to zero at registration so later
+    // conditional updates can rely on the attribute existing.
+    item.insert("storage_used_bytes".into(), AttributeValue::N("0".into()));
     auth.dynamo
         .put_item()
         .table_name(&auth.config.users_table)
@@ -707,6 +731,126 @@ async fn put_user(auth: &AuthState, user: &UserRow) -> AuthResult<()> {
 // ────────────────────────────────────────────────────────────────────
 
 const CHALLENGE_TTL_SECS: u64 = 300;
+
+/// Per-user storage cap for the alpha. 100 MiB of committed `original_len`
+/// bytes, which translates to ~150 MiB of raw shards after 4+2 Reed-Solomon
+/// overhead. Enforced atomically in DynamoDB via a conditional `UpdateItem`
+/// so concurrent commits can't race past it. Raise this, or make it
+/// per-tier, once billing is wired up.
+pub const QUOTA_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Outcome of a storage-consumption attempt.
+#[derive(Debug)]
+pub enum ConsumeStorageResult {
+    Ok,
+    Exceeded { used: u64, cap: u64, requested: u64 },
+}
+
+/// Atomically add `bytes` to a user's `storage_used_bytes` counter, or
+/// return `Exceeded` if the addition would push them over `QUOTA_BYTES`.
+/// Uses a single conditional UpdateItem so two concurrent commits can't
+/// both see the same pre-update counter and both succeed.
+///
+/// Legacy user rows that don't have `storage_used_bytes` yet (written
+/// before this feature landed) are treated as if they had 0 used — the
+/// `attribute_not_exists` branch in the condition expression covers it.
+pub async fn try_consume_storage(
+    auth: &AuthState,
+    email: &str,
+    bytes: u64,
+) -> AuthResult<ConsumeStorageResult> {
+    if bytes > QUOTA_BYTES {
+        return Ok(ConsumeStorageResult::Exceeded {
+            used: 0,
+            cap: QUOTA_BYTES,
+            requested: bytes,
+        });
+    }
+    let max_before: i64 = QUOTA_BYTES as i64 - bytes as i64;
+
+    let result = auth
+        .dynamo
+        .update_item()
+        .table_name(&auth.config.users_table)
+        .key("email", AttributeValue::S(email.to_string()))
+        .update_expression("ADD storage_used_bytes :delta")
+        .condition_expression(
+            "attribute_not_exists(storage_used_bytes) OR storage_used_bytes <= :max_before",
+        )
+        .expression_attribute_values(":delta", AttributeValue::N(bytes.to_string()))
+        .expression_attribute_values(
+            ":max_before",
+            AttributeValue::N(max_before.to_string()),
+        )
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedNew)
+        .send()
+        .await;
+
+    match result {
+        Ok(_) => Ok(ConsumeStorageResult::Ok),
+        Err(e) => {
+            let msg = format!("{e:?}");
+            if msg.contains("ConditionalCheckFailed") {
+                // Read back the current usage so the client can show a
+                // helpful "you're over" message instead of a bare 413.
+                let used = get_user_by_email(auth, email)
+                    .await?
+                    .and_then(|u| u.storage_used_bytes)
+                    .unwrap_or(0);
+                Ok(ConsumeStorageResult::Exceeded {
+                    used,
+                    cap: QUOTA_BYTES,
+                    requested: bytes,
+                })
+            } else {
+                Err(AuthError::Dynamo(msg))
+            }
+        }
+    }
+}
+
+/// Decrement a user's storage counter by `bytes`. Called after a
+/// successful delete. Clamps at zero defensively — if the counter ever
+/// drifts below what the manifests say (e.g. a half-applied delete
+/// during a crash), we don't want it wrapping into u64::MAX.
+pub async fn release_storage(auth: &AuthState, email: &str, bytes: u64) -> AuthResult<()> {
+    // We ADD a negative delta. DynamoDB ADD on numbers is signed, so
+    // this works. The condition ensures we never drop the counter
+    // below zero — if storage_used_bytes < bytes, the counter is
+    // clamped to 0 via a second write.
+    let bytes_i: i64 = bytes as i64;
+    let try_signed_add = auth
+        .dynamo
+        .update_item()
+        .table_name(&auth.config.users_table)
+        .key("email", AttributeValue::S(email.to_string()))
+        .update_expression("ADD storage_used_bytes :delta")
+        .condition_expression("storage_used_bytes >= :abs")
+        .expression_attribute_values(":delta", AttributeValue::N((-bytes_i).to_string()))
+        .expression_attribute_values(":abs", AttributeValue::N(bytes_i.to_string()))
+        .send()
+        .await;
+
+    if let Err(e) = try_signed_add {
+        let msg = format!("{e:?}");
+        if msg.contains("ConditionalCheckFailed") {
+            // Counter drift — reset to zero rather than panicking.
+            let _ = auth
+                .dynamo
+                .update_item()
+                .table_name(&auth.config.users_table)
+                .key("email", AttributeValue::S(email.to_string()))
+                .update_expression("SET storage_used_bytes = :zero")
+                .expression_attribute_values(":zero", AttributeValue::N("0".into()))
+                .send()
+                .await;
+            warn!(email = %email, bytes = %bytes, "storage counter drift — reset to 0");
+        } else {
+            return Err(AuthError::Dynamo(msg));
+        }
+    }
+    Ok(())
+}
 
 pub async fn register_begin(
     State(state): State<Arc<AppState>>,
@@ -796,6 +940,7 @@ pub async fn register_finish(
         passkey_json,
         display_name,
         created_at: now_secs(),
+        storage_used_bytes: Some(0),
     };
     put_user(auth, &user).await?;
 
@@ -925,6 +1070,10 @@ async fn get_user_by_credential_id(
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0),
+        storage_used_bytes: item
+            .get("storage_used_bytes")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|s| s.parse().ok()),
     }))
 }
 
@@ -1011,12 +1160,24 @@ pub async fn login_finish(
     Ok(session_response(cookie, body))
 }
 
-pub async fn me(user: AuthUser) -> Json<SessionResponse> {
-    Json(SessionResponse {
+pub async fn me(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> AuthResult<Json<MeResponse>> {
+    let auth = state.auth.as_ref().ok_or(AuthError::Unauthorized)?;
+    // Read the row to get a fresh usage count. Cheap (single GetItem),
+    // and only called on page load / tab focus — not on every vault op.
+    let storage_used_bytes = get_user_by_email(auth, &user.email)
+        .await?
+        .and_then(|u| u.storage_used_bytes)
+        .unwrap_or(0);
+    Ok(Json(MeResponse {
         user_id: user.user_id,
         email: user.email,
         display_name: user.display_name,
-    })
+        storage_used_bytes,
+        storage_quota_bytes: QUOTA_BYTES,
+    }))
 }
 
 // ────────────────────────────────────────────────────────────────────

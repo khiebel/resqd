@@ -36,6 +36,9 @@ export interface SessionUser {
   user_id: string;
   email: string;
   display_name: string;
+  /** Populated by /auth/me (not by the login/signup responses). */
+  storage_used_bytes?: number;
+  storage_quota_bytes?: number;
 }
 
 // ── Base64url helpers ────────────────────────────────────────────────

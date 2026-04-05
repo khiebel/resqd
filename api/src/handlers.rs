@@ -1,6 +1,6 @@
 //! HTTP route handlers.
 
-use crate::auth::AuthUser;
+use crate::auth::{AuthUser, ConsumeStorageResult};
 use crate::state::{AppState, LARGE_BLOB_PREFIX};
 use axum::{
     Json,
@@ -225,21 +225,55 @@ pub enum ApiError {
     NotFound,
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("quota exceeded: used {used} of {cap} bytes, cannot add {requested} more")]
+    QuotaExceeded {
+        used: u64,
+        cap: u64,
+        requested: u64,
+    },
+    #[error("auth: {0}")]
+    Auth(#[from] crate::auth::AuthError),
     #[error("internal error: {0}")]
     Internal(#[from] anyhow::Error),
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, msg) = match &self {
-            ApiError::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
-            ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+        match &self {
+            ApiError::NotFound => {
+                (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": self.to_string() }))).into_response()
+            }
+            ApiError::BadRequest(_) => {
+                (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": self.to_string() }))).into_response()
+            }
+            ApiError::QuotaExceeded { used, cap, requested } => {
+                // 413 Payload Too Large — the client SHOULD NOT retry
+                // and should show a "you're out of space" message with
+                // the exact numbers so the user can decide what to delete.
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    Json(serde_json::json!({
+                        "error": self.to_string(),
+                        "code": "quota_exceeded",
+                        "storage_used_bytes": used,
+                        "storage_quota_bytes": cap,
+                        "requested_bytes": requested,
+                    })),
+                )
+                    .into_response()
+            }
+            ApiError::Auth(crate::auth::AuthError::Unauthorized) => {
+                (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "unauthorized" }))).into_response()
+            }
             _ => {
                 error!(error = %self, "handler error");
-                (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": self.to_string() })),
+                )
+                    .into_response()
             }
-        };
-        (status, Json(serde_json::json!({ "error": msg }))).into_response()
+        }
     }
 }
 
@@ -414,6 +448,19 @@ pub async fn commit(
             return Err(ApiError::BadRequest(format!(
                 "shard {i} not found at {key} — upload all 6 before commit"
             )));
+        }
+    }
+
+    // Quota check. Only applies to authed commits — anonymous legacy
+    // uploads bypass it for compatibility with the pre-auth test data.
+    // This is done AFTER shard existence so a client can't burn someone
+    // else's upload slot by rejecting early.
+    if let (Some(u), Some(auth_state)) = (&user, state.auth.as_ref()) {
+        match crate::auth::try_consume_storage(auth_state, &u.email, req.original_len).await? {
+            ConsumeStorageResult::Ok => {}
+            ConsumeStorageResult::Exceeded { used, cap, requested } => {
+                return Err(ApiError::QuotaExceeded { used, cap, requested });
+            }
         }
     }
 
@@ -711,6 +758,14 @@ pub async fn delete_asset(
     use resqd_storage::ObjectStore;
     let sidecar_key = owner_sidecar_key(&user.user_id, &asset_id);
     state.s3.delete(&sidecar_key).await?;
+
+    // Release the quota held by this asset. Best-effort — if it fails
+    // the user's counter drifts high by this asset's bytes, but we
+    // don't want delete to fail over accounting noise. A periodic
+    // reconciliation job can fix drift later.
+    if let Some(auth_state) = state.auth.as_ref() {
+        let _ = crate::auth::release_storage(auth_state, &user.email, manifest.original_len).await;
+    }
 
     // Delete the 6 shards. Parallelize via join_all — each delete is an
     // independent S3 DeleteObject.

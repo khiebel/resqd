@@ -25,6 +25,47 @@ type ViewState =
   | { phase: "ready"; assets: VaultAsset[] }
   | { phase: "error"; message: string };
 
+function StorageBar({ used, cap }: { used: number; cap: number }) {
+  const pct = cap > 0 ? Math.min(100, (used / cap) * 100) : 0;
+  const warn = pct >= 80;
+  const full = pct >= 100;
+  return (
+    <section className="mb-8 bg-slate-900 border border-slate-800 rounded-lg p-4">
+      <div className="flex items-center justify-between text-xs mb-2">
+        <span className="text-slate-400">
+          {formatBytes(used)} of {formatBytes(cap)} used
+        </span>
+        <span className={full ? "text-red-400" : warn ? "text-amber-400" : "text-slate-500"}>
+          {pct.toFixed(0)}%
+        </span>
+      </div>
+      <div className="h-2 bg-slate-950 rounded-full overflow-hidden">
+        <div
+          className={`h-full rounded-full transition-all ${
+            full
+              ? "bg-red-500"
+              : warn
+                ? "bg-amber-500"
+                : "bg-gradient-to-r from-amber-400 to-violet-500"
+          }`}
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      {full && (
+        <p className="mt-2 text-xs text-red-300">
+          Vault is full. Delete something to make room before uploading more.
+        </p>
+      )}
+      {!full && warn && (
+        <p className="mt-2 text-xs text-amber-300">
+          You&apos;re close to your alpha quota. This is a hard cap during
+          the alpha — more capacity comes with paid tiers.
+        </p>
+      )}
+    </section>
+  );
+}
+
 async function deleteAsset(assetId: string): Promise<void> {
   const resp = await fetch(`${API_URL}/vault/${encodeURIComponent(assetId)}`, {
     method: "DELETE",
@@ -39,6 +80,13 @@ function formatTimestamp(secs: number): string {
   if (!secs) return "—";
   const d = new Date(secs * 1000);
   return d.toLocaleString();
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
 export default function VaultPage() {
@@ -126,7 +174,7 @@ export default function VaultPage() {
 
   return (
     <main className="mx-auto max-w-3xl px-6 py-12 text-slate-100">
-      <header className="flex items-center justify-between mb-8">
+      <header className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-3xl font-bold">My Vault</h1>
           {user && (
@@ -169,6 +217,16 @@ export default function VaultPage() {
           </button>
         </div>
       </header>
+
+      {/* Storage usage bar */}
+      {user &&
+        typeof user.storage_used_bytes === "number" &&
+        typeof user.storage_quota_bytes === "number" && (
+          <StorageBar
+            used={user.storage_used_bytes}
+            cap={user.storage_quota_bytes}
+          />
+        )}
 
       {view.phase === "loading" && (
         <p className="text-slate-500 text-sm">Loading your vault…</p>
