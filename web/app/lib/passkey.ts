@@ -289,6 +289,78 @@ export async function loginWithPasskey(email: string): Promise<SessionUser> {
   return (await finishResp.json()) as SessionUser;
 }
 
+/** Start a conditional-UI sign-in. Runs navigator.credentials.get() with
+ *  `mediation: "conditional"` so the browser autofills passkeys inline
+ *  in any `autocomplete="username webauthn"` field on the page. Returns
+ *  the signed-in user if the flow completes, or `null` if the user
+ *  dismissed the picker / the browser doesn't support conditional UI. */
+export async function loginWithPasskeyConditional(
+  abortSignal?: AbortSignal,
+): Promise<SessionUser | null> {
+  if (!isPasskeySupported()) return null;
+
+  // Some browsers expose `isConditionalMediationAvailable`. If they do
+  // and it says no, don't even try — we'll fall back to the typed-email
+  // flow. If they don't expose it, assume yes and let the browser
+  // decide.
+  const pkc = window.PublicKeyCredential as unknown as {
+    isConditionalMediationAvailable?: () => Promise<boolean>;
+  };
+  if (pkc.isConditionalMediationAvailable) {
+    try {
+      if (!(await pkc.isConditionalMediationAvailable())) return null;
+    } catch {
+      return null;
+    }
+  }
+
+  const beginResp = await fetch(`${API_URL}/auth/login/begin_discoverable`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+  if (!beginResp.ok) return null;
+  const begin = await beginResp.json();
+
+  const requestOptions = toRequestOptions(begin.request_options);
+  (requestOptions as unknown as { extensions: Record<string, unknown> }).extensions = {
+    ...((requestOptions as unknown as { extensions?: Record<string, unknown> })
+      .extensions ?? {}),
+    prf: { eval: { first: PRF_SALT } },
+  };
+
+  let cred: PublicKeyCredential | null;
+  try {
+    cred = (await navigator.credentials.get({
+      publicKey: requestOptions,
+      mediation: "conditional" as CredentialMediationRequirement,
+      signal: abortSignal,
+    } as CredentialRequestOptions)) as PublicKeyCredential | null;
+  } catch (e) {
+    // AbortError is expected when the user navigates away or submits
+    // the form before picking a passkey. Don't surface as an error.
+    if (e instanceof DOMException && e.name === "AbortError") return null;
+    return null;
+  }
+  if (!cred) return null;
+
+  const prfKey = extractPrfKey(cred);
+  if (prfKey) saveMasterKey(prfKey);
+
+  const finishResp = await fetch(`${API_URL}/auth/login/finish_discoverable`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      challenge_id: begin.challenge_id,
+      credential: fromAuthenticationCredential(cred),
+    }),
+  });
+  if (!finishResp.ok) return null;
+  return (await finishResp.json()) as SessionUser;
+}
+
 export async function fetchMe(): Promise<SessionUser | null> {
   try {
     const r = await fetch(`${API_URL}/auth/me`, { credentials: "include" });

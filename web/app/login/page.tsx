@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import Link from "next/link";
 import {
   loginWithPasskey,
+  loginWithPasskeyConditional,
   isPasskeySupported,
   fetchMe,
 } from "../lib/passkey";
@@ -18,8 +19,12 @@ type State =
 export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [state, setState] = useState<State>({ phase: "checking" });
+  const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     (async () => {
       if (!isPasskeySupported()) {
         setState({
@@ -35,11 +40,30 @@ export default function LoginPage() {
         return;
       }
       setState({ phase: "idle" });
+
+      // Kick off conditional-UI login in the background. The browser
+      // will autofill passkey suggestions when the email field is
+      // focused; selecting one completes the sign-in without the user
+      // ever typing an email. If the user types and submits instead,
+      // we abort this in `onSubmit` and fall through to the normal
+      // typed-email flow.
+      const user = await loginWithPasskeyConditional(controller.signal);
+      if (user) {
+        setState({ phase: "done" });
+        window.location.href = "/vault/";
+      }
     })();
+
+    return () => {
+      controller.abort();
+    };
   }, []);
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    // Cancel the conditional-UI background listener so the explicit
+    // typed-email flow can own the authenticator prompt.
+    abortRef.current?.abort();
     setState({ phase: "working" });
     try {
       await loginWithPasskey(email);
@@ -74,6 +98,7 @@ export default function LoginPage() {
             onChange={(e) => setEmail(e.target.value)}
             placeholder="you@example.com"
             disabled={state.phase === "working" || state.phase === "done"}
+            autoComplete="username webauthn"
             className="w-full bg-slate-900 border border-slate-800 rounded-lg p-3 text-sm"
           />
         </div>

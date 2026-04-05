@@ -77,6 +77,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/auth/register/finish", post(auth::register_finish))
         .route("/auth/login/begin", post(auth::login_begin))
         .route("/auth/login/finish", post(auth::login_finish))
+        .route(
+            "/auth/login/begin_discoverable",
+            post(auth::login_begin_discoverable),
+        )
+        .route(
+            "/auth/login/finish_discoverable",
+            post(auth::login_finish_discoverable),
+        )
         .route("/auth/me", get(auth::me))
         .route("/auth/logout", post(auth::logout))
         .route(

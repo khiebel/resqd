@@ -810,6 +810,124 @@ pub async fn register_finish(
     Ok(session_response(cookie, body))
 }
 
+/// Start a discoverable-credential login (a.k.a. "usernameless" or
+/// "conditional UI" sign-in). No email required — the server issues
+/// an authentication challenge with empty allowCredentials and lets
+/// the browser's credential picker decide which passkey to use. The
+/// user is identified on finish from the returned credential's
+/// user handle.
+pub async fn login_begin_discoverable(
+    State(state): State<Arc<AppState>>,
+) -> AuthResult<Json<LoginBeginResponse>> {
+    let auth = state.auth.as_ref().ok_or(AuthError::BadRequest(
+        "auth not configured on this deployment".into(),
+    ))?;
+
+    let (rcr, discoverable_state) = auth.webauthn.start_discoverable_authentication()?;
+    let state_json = serde_json::to_string(&discoverable_state)
+        .map_err(|e| AuthError::Internal(anyhow::anyhow!("serialize disc state: {e}")))?;
+
+    let challenge_id = Uuid::new_v4().to_string();
+    put_challenge(
+        auth,
+        &ChallengeRow {
+            challenge_id: challenge_id.clone(),
+            kind: "discoverable".into(),
+            state_json,
+            email: None,
+            expires_at: now_secs() + CHALLENGE_TTL_SECS,
+        },
+    )
+    .await?;
+
+    let request_options = serde_json::to_value(&rcr)
+        .map_err(|e| AuthError::Internal(anyhow::anyhow!("serialize rcr: {e}")))?;
+
+    Ok(Json(LoginBeginResponse {
+        challenge_id,
+        request_options,
+    }))
+}
+
+/// Finish a discoverable-credential login. Identifies the user from
+/// the returned credential via the credential_id GSI, then verifies
+/// the assertion against that user's stored Passkey.
+pub async fn login_finish_discoverable(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LoginFinishRequest>,
+) -> AuthResult<Response> {
+    let auth = state.auth.as_ref().ok_or(AuthError::BadRequest(
+        "auth not configured on this deployment".into(),
+    ))?;
+
+    let challenge = take_challenge(auth, &req.challenge_id, "discoverable").await?;
+    let disc_state: DiscoverableAuthentication = serde_json::from_str(&challenge.state_json)
+        .map_err(|e| AuthError::Internal(anyhow::anyhow!("decode disc state: {e}")))?;
+
+    // Look up the user by credential_id. The browser returns the
+    // credential's raw_id, which we encoded as base64url-no-pad at
+    // registration time and indexed on the credential_id-index GSI.
+    let credential_id_b64 = BASE64_URL_SAFE_NO_PAD.encode(req.credential.raw_id.as_ref());
+    let user = get_user_by_credential_id(auth, &credential_id_b64).await?;
+    let Some(user) = user else {
+        return Err(AuthError::Unauthorized);
+    };
+
+    let passkey: Passkey = serde_json::from_str(&user.passkey_json)
+        .map_err(|e| AuthError::Internal(anyhow::anyhow!("decode stored passkey: {e}")))?;
+
+    // webauthn-rs finish_discoverable_authentication takes a slice of
+    // DiscoverableKey tuples — (cred_id, Passkey) — to locate the
+    // matching credential. We only expect one to match.
+    let disc_keys = [webauthn_rs::prelude::DiscoverableKey::from(&passkey)];
+    let _result = auth.webauthn.finish_discoverable_authentication(
+        &req.credential,
+        disc_state,
+        &disc_keys,
+    )?;
+
+    info!(user_id = %user.user_id, "discoverable login success");
+
+    let cookie = issue_session_cookie(&auth.config, &user)?;
+    let body = SessionResponse {
+        user_id: user.user_id.clone(),
+        email: user.email.clone(),
+        display_name: user.display_name.clone(),
+    };
+    Ok(session_response(cookie, body))
+}
+
+async fn get_user_by_credential_id(
+    auth: &AuthState,
+    credential_id_b64: &str,
+) -> AuthResult<Option<UserRow>> {
+    let out = auth
+        .dynamo
+        .query()
+        .table_name(&auth.config.users_table)
+        .index_name("credential_id-index")
+        .key_condition_expression("credential_id = :cid")
+        .expression_attribute_values(":cid", AttributeValue::S(credential_id_b64.to_string()))
+        .limit(1)
+        .send()
+        .await?;
+    let item = match out.items().first() {
+        Some(i) => i.clone(),
+        None => return Ok(None),
+    };
+    Ok(Some(UserRow {
+        email: take_s(&item, "email")?,
+        user_id: take_s(&item, "user_id")?,
+        credential_id: take_s(&item, "credential_id")?,
+        passkey_json: take_s(&item, "passkey_json")?,
+        display_name: take_s(&item, "display_name").unwrap_or_default(),
+        created_at: take_s(&item, "created_at")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+    }))
+}
+
 pub async fn login_begin(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LoginBeginRequest>,

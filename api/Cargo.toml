@@ -51,7 +51,7 @@ aws-sdk-dynamodb = "1"
 futures = "0.3"
 
 # Auth: passkey / WebAuthn, session JWT, cookies
-webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation", "conditional-ui"] }
 jsonwebtoken = "9"
 tower-cookies = "0.11"
 base64 = "0.22"

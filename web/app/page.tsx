@@ -163,7 +163,11 @@ function StatsBar() {
 }
 
 function FeatureGrid() {
-  const features = [
+  const features: {
+    title: string;
+    body: string;
+    link?: { href: string; label: string };
+  }[] = [
     {
       title: "Post-quantum encryption",
       body: "ML-KEM-768 key exchange and XChaCha20-Poly1305 AEAD. Every tier, not just enterprise. When quantum computers arrive, your vault doesn't need to be migrated.",
@@ -187,6 +191,7 @@ function FeatureGrid() {
     {
       title: "AI-agent ready",
       body: "First-class MCP server for Claude and other LLM agents. Let AI tools read and write your vault under scoped, revocable credentials — without breaking zero-knowledge.",
+      link: { href: "/mcp/", label: "Connect Claude →" },
     },
   ];
   return (
@@ -204,10 +209,20 @@ function FeatureGrid() {
           {features.map((f) => (
             <div
               key={f.title}
-              className="bg-slate-900 border border-slate-800 rounded-xl p-6 hover:border-amber-500/40 transition-colors"
+              className="bg-slate-900 border border-slate-800 rounded-xl p-6 hover:border-amber-500/40 transition-colors flex flex-col"
             >
               <h3 className="text-lg font-semibold mb-2">{f.title}</h3>
-              <p className="text-sm text-slate-400 leading-relaxed">{f.body}</p>
+              <p className="text-sm text-slate-400 leading-relaxed flex-1">
+                {f.body}
+              </p>
+              {f.link && (
+                <Link
+                  href={f.link.href}
+                  className="mt-3 text-xs text-amber-400 hover:underline"
+                >
+                  {f.link.label}
+                </Link>
+              )}
             </div>
           ))}
         </div>

@@ -144,6 +144,12 @@ export default function VaultPage() {
             + Upload
           </Link>
           <Link
+            href="/mcp/"
+            className="text-xs text-slate-400 hover:text-slate-200"
+          >
+            Connect Claude
+          </Link>
+          <Link
             href="/settings/"
             className="text-xs text-slate-400 hover:text-slate-200"
           >
@@ -173,17 +179,41 @@ export default function VaultPage() {
       )}
 
       {view.phase === "ready" && view.assets.length === 0 && (
-        <section className="border-2 border-dashed border-slate-800 rounded-xl p-12 text-center">
-          <p className="text-slate-400 mb-4">
-            Your vault is empty. Upload your first file to see it here.
-          </p>
-          <Link
-            href="/upload/"
-            className="inline-block rounded-lg bg-amber-500 text-slate-900 font-semibold px-5 py-2 text-sm"
-          >
-            Upload something
-          </Link>
-        </section>
+        <>
+          <section className="border-2 border-dashed border-slate-800 rounded-xl p-12 text-center mb-6">
+            <p className="text-slate-400 mb-4">
+              Your vault is empty. Upload your first file to see it here.
+            </p>
+            <Link
+              href="/upload/"
+              className="inline-block rounded-lg bg-amber-500 text-slate-900 font-semibold px-5 py-2 text-sm"
+            >
+              Upload something
+            </Link>
+          </section>
+
+          <section className="bg-gradient-to-br from-amber-500/5 to-violet-500/5 border border-amber-500/20 rounded-xl p-6 flex items-start gap-4">
+            <div className="text-3xl shrink-0">🤖</div>
+            <div className="flex-1">
+              <h3 className="text-lg font-semibold text-slate-100 mb-1">
+                Or let Claude do it
+              </h3>
+              <p className="text-sm text-slate-400 mb-3 leading-relaxed">
+                RESQD ships a Model Context Protocol server so you can
+                tell Claude &ldquo;upload ~/Documents/tax.pdf to my
+                vault&rdquo; and it happens — encrypted locally, sharded
+                across six clouds, anchored on chain, the whole stack.
+                Zero-knowledge all the way through.
+              </p>
+              <Link
+                href="/mcp/"
+                className="inline-block text-sm text-amber-400 hover:underline font-semibold"
+              >
+                Connect Claude →
+              </Link>
+            </div>
+          </section>
+        </>
       )}
 
       {view.phase === "ready" && view.assets.length > 0 && (
