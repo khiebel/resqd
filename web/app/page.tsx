@@ -1,5 +1,8 @@
 import Link from "next/link";
 import Image from "next/image";
+// Image is used only in TopNav for the logo now that the hero image
+// has been removed. Keeping the import rather than inlining an <img>
+// so Next's image optimizer still handles it.
 
 /**
  * RESQD landing — the canonical marketing + signup page served at
@@ -24,8 +27,6 @@ export default function Home() {
       <Hero />
       <StatsBar />
       <FeatureGrid />
-      <HowItWorks />
-      <Pitch />
       <Pricing />
       <TrustMarkers />
       <FinalCta />
@@ -54,9 +55,15 @@ function TopNav() {
           </span>
         </Link>
         <div className="flex items-center gap-6 text-sm text-slate-400">
-          <a href="#how" className="hover:text-slate-100 hidden md:inline">
+          <Link
+            href="/how-it-works/"
+            className="hover:text-slate-100 hidden md:inline"
+          >
             How it works
-          </a>
+          </Link>
+          <Link href="/why/" className="hover:text-slate-100 hidden md:inline">
+            Why RESQD
+          </Link>
           <a href="#pricing" className="hover:text-slate-100 hidden md:inline">
             Pricing
           </a>
@@ -109,27 +116,16 @@ function Hero() {
           >
             Create your vault — free
           </Link>
-          <a
-            href="#how"
+          <Link
+            href="/how-it-works/"
             className="rounded-lg border border-slate-700 hover:border-slate-500 px-8 py-4 text-sm text-slate-300 transition-colors"
           >
             How it works
-          </a>
+          </Link>
         </div>
         <p className="mt-6 text-xs text-slate-600">
           No credit card. No password. Sign up with your fingerprint.
         </p>
-
-        <div className="mt-16 mx-auto max-w-4xl">
-          <Image
-            src="/marketing/hero.png"
-            alt="Quantum shield visualization"
-            width={1200}
-            height={600}
-            className="rounded-xl border border-slate-800 w-full"
-            priority
-          />
-        </div>
       </div>
     </section>
   );
@@ -225,125 +221,6 @@ function FeatureGrid() {
               )}
             </div>
           ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function HowItWorks() {
-  const steps = [
-    {
-      n: "01",
-      title: "Sign up with a passkey",
-      body: "Your fingerprint, Face ID, or Windows Hello creates a cryptographic identity bound to this device. Your vault key is derived from it and never leaves the browser.",
-    },
-    {
-      n: "02",
-      title: "Drop a file",
-      body: "The browser generates a fresh per-file key, encrypts your file, seals that key under your master key, and Reed-Solomon codes the ciphertext into 6 shards.",
-    },
-    {
-      n: "03",
-      title: "Six clouds, one vault",
-      body: "Each shard goes to a different storage backend. No single cloud — or subpoena — can reconstruct your data. Any 4 of 6 shards is enough to recover.",
-    },
-    {
-      n: "04",
-      title: "Anchored on-chain",
-      body: "Every access rotates a canary commitment and writes it to Base L2. You can verify the read history cryptographically, forever, for less than a penny per access.",
-    },
-  ];
-  return (
-    <section id="how" className="mx-auto max-w-5xl px-6 py-24">
-      <h2 className="text-3xl md:text-4xl font-bold text-center mb-4">
-        How it works
-      </h2>
-      <p className="text-center text-slate-400 max-w-2xl mx-auto mb-16">
-        Every step happens in your browser before a single byte reaches
-        our servers.
-      </p>
-      <div className="space-y-12">
-        {steps.map((s) => (
-          <div key={s.n} className="flex gap-8 items-start">
-            <div className="text-4xl font-mono bg-gradient-to-b from-amber-300 to-violet-500 bg-clip-text text-transparent shrink-0 w-16">
-              {s.n}
-            </div>
-            <div className="flex-1 border-l border-slate-800 pl-8">
-              <h3 className="text-xl font-semibold mb-2">{s.title}</h3>
-              <p className="text-slate-400 leading-relaxed">{s.body}</p>
-            </div>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function Pitch() {
-  return (
-    <section className="border-y border-slate-900 bg-slate-950">
-      <div className="mx-auto max-w-3xl px-6 py-24 text-slate-300 leading-relaxed">
-        <h2 className="text-3xl md:text-4xl font-bold mb-8 bg-gradient-to-r from-amber-300 to-violet-400 bg-clip-text text-transparent">
-          Why the world needs RESQD
-        </h2>
-
-        <div className="space-y-6 text-base">
-          <p>
-            Every day, families lose irreplaceable photos to cloud provider
-            outages. Businesses lose millions to data breaches that silently
-            exfiltrate secrets for months before detection. Crypto holders
-            die without their heirs knowing how to access their wallets.
-            And{" "}
-            <span className="text-slate-100 font-semibold">
-              quantum computers are coming
-            </span>{" "}
-            — rendering today&apos;s encryption obsolete within the decade.
-          </p>
-
-          <p>
-            The solutions people use today are dangerously fragile. iCloud?
-            One account compromise and everything is gone. Google Drive? A
-            single company controls your memories. A password manager? It
-            stores credentials, not your life&apos;s work. An encrypted USB
-            drive? One hardware failure from total loss.
-          </p>
-
-          <p>
-            <span className="text-slate-100 font-semibold">
-              RESQD is different.
-            </span>{" "}
-            We don&apos;t store your data — we rescue it. Your files are
-            encrypted with post-quantum algorithms{" "}
-            <em className="text-slate-100">in your browser</em> before they
-            ever leave your device. Then they&apos;re split into shards and
-            distributed across three independent cloud providers. No single
-            entity — not AWS, not Google, not even RESQD — can read or
-            reconstruct your data.
-          </p>
-
-          <p>
-            But security without proof is just a promise. That&apos;s why
-            every access to your vault rotates a cryptographic canary and
-            commits the result to the blockchain. You don&apos;t have to
-            trust us when we say nobody looked.{" "}
-            <span className="text-slate-100 font-semibold">
-              You can verify it mathematically.
-            </span>
-          </p>
-
-          <p>
-            This isn&apos;t another cloud storage product. It&apos;s the
-            first{" "}
-            <span className="text-slate-100 font-semibold">
-              digital safety deposit box
-            </span>{" "}
-            that uses the laws of mathematics to guarantee what physical
-            vaults use steel walls to approximate:{" "}
-            <em className="text-slate-100">
-              your most treasured assets are safe, and you can prove it.
-            </em>
-          </p>
         </div>
       </div>
     </section>
@@ -537,7 +414,12 @@ function Footer() {
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div>© 2026 RESQD · Quantum-secured digital vault</div>
           <div className="flex gap-5 flex-wrap">
-            <a href="#how" className="hover:text-slate-300">How it works</a>
+            <Link href="/how-it-works/" className="hover:text-slate-300">
+              How it works
+            </Link>
+            <Link href="/why/" className="hover:text-slate-300">
+              Why RESQD
+            </Link>
             <a href="#pricing" className="hover:text-slate-300">Pricing</a>
             <Link href="/security-model/" className="hover:text-slate-300">
               Security
