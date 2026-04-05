@@ -83,7 +83,16 @@ WEBAUTHN_RP_ID=${RESQD_WEBAUTHN_RP_ID:-resqd-app.pages.dev}
 WEBAUTHN_ORIGIN=${RESQD_WEBAUTHN_ORIGIN:-https://resqd-app.pages.dev}
 CORS_ORIGINS=${RESQD_CORS_ORIGINS:-https://resqd-app.pages.dev\\,https://resqd.ai\\,https://app.resqd.ai}
 
-ENV_VARS="Variables={RESQD_S3_BUCKET=resqd-vault-64553a1a,RESQD_CHAIN_ENABLED=true,RESQD_CHAIN_RPC_URL=https://sepolia.base.org,RESQD_CHAIN_CONTRACT=0xd45453477aa729C157E4840e81F81D4437Ec99f3,RESQD_CHAIN_SIGNER_KEY=$RESQD_CHAIN_SIGNER_KEY,RUST_LOG=info,RESQD_AUTH_ENABLED=true,RESQD_WEBAUTHN_RP_ID=$WEBAUTHN_RP_ID,RESQD_WEBAUTHN_RP_NAME=RESQD,RESQD_WEBAUTHN_ORIGIN=$WEBAUTHN_ORIGIN,RESQD_JWT_SECRET=$RESQD_JWT_SECRET,RESQD_USERS_TABLE=resqd-users,RESQD_CHALLENGES_TABLE=resqd-auth-challenges,RESQD_COOKIE_SECURE=true,RESQD_COOKIE_SAMESITE=None,RESQD_CORS_ORIGINS=$CORS_ORIGINS}"
+# Best-effort OFAC / export-control geo block. Comma-separated
+# ISO-3166-1 alpha-2 country codes. The Lambda middleware in
+# api/src/lib.rs reads the cf-ipcountry header CF injects and returns
+# 451 for these. VPN defeats it; that's fine, the intent is a
+# good-faith compliance posture, not an impenetrable wall. See
+# docs/JURISDICTION.md for the authoritative list, rationale, and
+# appeal path.
+BLOCKED_COUNTRIES=${RESQD_BLOCKED_COUNTRIES:-CU\\,IR\\,KP\\,SY\\,RU\\,BY\\,CN}
+
+ENV_VARS="Variables={RESQD_S3_BUCKET=resqd-vault-64553a1a,RESQD_CHAIN_ENABLED=true,RESQD_CHAIN_RPC_URL=https://sepolia.base.org,RESQD_CHAIN_CONTRACT=0xd45453477aa729C157E4840e81F81D4437Ec99f3,RESQD_CHAIN_SIGNER_KEY=$RESQD_CHAIN_SIGNER_KEY,RUST_LOG=info,RESQD_AUTH_ENABLED=true,RESQD_WEBAUTHN_RP_ID=$WEBAUTHN_RP_ID,RESQD_WEBAUTHN_RP_NAME=RESQD,RESQD_WEBAUTHN_ORIGIN=$WEBAUTHN_ORIGIN,RESQD_JWT_SECRET=$RESQD_JWT_SECRET,RESQD_USERS_TABLE=resqd-users,RESQD_CHALLENGES_TABLE=resqd-auth-challenges,RESQD_COOKIE_SECURE=true,RESQD_COOKIE_SAMESITE=None,RESQD_CORS_ORIGINS=$CORS_ORIGINS,RESQD_BLOCKED_COUNTRIES=$BLOCKED_COUNTRIES}"
 
 if aws lambda get-function --function-name "$FUNCTION_NAME" --region "$REGION" >/dev/null 2>&1; then
   echo "==> Updating existing function $FUNCTION_NAME"

@@ -183,6 +183,25 @@ export default function SecurityModelPage() {
           </ul>
         </Section>
 
+        <Section title="Jurisdiction and geo restrictions">
+          <p>
+            RESQD is operated from the United States and makes a
+            best-effort attempt to block access from jurisdictions
+            where providing a strong-crypto privacy service to the
+            general public is illegal, sanctioned, or carries
+            meaningful legal risk. This is a known, unilateral trust
+            boundary — we list it here alongside the others.
+          </p>
+          <p>
+            Full block list, enforcement layers, logging policy, and
+            the appeal path are documented at{" "}
+            <a href="/jurisdiction/" className="text-amber-400">
+              /jurisdiction/
+            </a>
+            .
+          </p>
+        </Section>
+
         <Section title="Open source and verifiability">
           <p>
             The Rust crypto core that runs in your browser as WebAssembly

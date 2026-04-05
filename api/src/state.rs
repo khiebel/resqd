@@ -32,6 +32,13 @@ pub struct AppConfig {
     pub auth_enabled: bool,
     /// Auth config (only required when `auth_enabled`).
     pub auth: Option<AuthConfig>,
+    /// Uppercase ISO-3166-1 alpha-2 country codes we refuse to serve.
+    /// Set via `RESQD_BLOCKED_COUNTRIES` (comma-separated). Empty list
+    /// = no blocking. Enforcement is middleware-level based on the
+    /// `cf-ipcountry` header Cloudflare injects — best-effort only,
+    /// documented in `docs/JURISDICTION.md`. A real CF dashboard rule
+    /// should sit in front of this for defence-in-depth.
+    pub blocked_countries: Vec<String>,
 }
 
 impl AppConfig {
@@ -66,6 +73,16 @@ impl AppConfig {
             None
         };
 
+        let blocked_countries = std::env::var("RESQD_BLOCKED_COUNTRIES")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(|v| v.trim().to_ascii_uppercase())
+                    .filter(|v| v.len() == 2)
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Ok(Self {
             s3_bucket,
             gcs_bucket,
@@ -73,6 +90,7 @@ impl AppConfig {
             chain,
             auth_enabled,
             auth,
+            blocked_countries,
         })
     }
 }

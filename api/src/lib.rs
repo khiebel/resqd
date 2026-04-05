@@ -21,12 +21,15 @@ pub mod state;
 pub use state::{AppConfig, AppState};
 
 use axum::Router;
-use axum::extract::DefaultBodyLimit;
-use axum::http::{HeaderValue, Method};
+use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::http::{HeaderValue, Method, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
+use tracing::warn;
 
 /// Max request body size. API Gateway HTTP API allows 10 MB and Lambda
 /// sync invoke caps at 6 MB, so we bound at 5 MB to leave headroom for
@@ -115,13 +118,166 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            geo_block_middleware,
+        ))
         .layer(cors)
         .with_state(state)
+}
+
+/// Reject requests from countries on the block list.
+///
+/// **Intent:** best-effort compliance with US OFAC sanctions and
+/// export-control restrictions. Anyone with a VPN can trivially
+/// defeat this; that's fine — the goal is to demonstrate good-faith
+/// compliance, not build an impenetrable wall, and the legal position
+/// `docs/JURISDICTION.md` outlines only requires best-effort.
+///
+/// **Mechanism:** trusts the `cf-ipcountry` header Cloudflare injects
+/// on every request that reaches the origin via the CF network. If
+/// the header is missing (e.g. local dev, direct-to-Lambda test) the
+/// request is allowed through — missing country info is NOT treated
+/// as blocked, because that would lock the ops team and the smoke
+/// test harness out. A real deploy MUST have the CF tunnel / origin
+/// rule in place so the header is always present in prod.
+///
+/// **Defence in depth:** a Cloudflare WAF rule should also sit in
+/// front of this at the edge so blocked traffic never touches the
+/// origin at all. The Lambda middleware is the fallback for the
+/// "CF rule misconfigured" failure mode.
+///
+/// Emits a 451 Unavailable For Legal Reasons with a JSON body
+/// pointing at `/jurisdiction/` on the marketing site. Never reveals
+/// the full block list to the caller — just echoes their own
+/// detected country code so they can verify they're in the right
+/// place to appeal.
+pub async fn geo_block_middleware(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let blocked = &state.config.blocked_countries;
+    if blocked.is_empty() {
+        return next.run(req).await;
+    }
+
+    // Always allow preflight and health — preflight because the
+    // browser hasn't run any app code yet and needs OPTIONS to
+    // resolve before it can even show the block page, and /health
+    // because Lambda warmup and CloudWatch probes would otherwise
+    // fail-closed.
+    if req.method() == Method::OPTIONS || req.uri().path() == "/health" {
+        return next.run(req).await;
+    }
+
+    let country = req
+        .headers()
+        .get("cf-ipcountry")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_ascii_uppercase());
+
+    let Some(country) = country else {
+        // Missing header — allow, per the "CF tunnel may be bypassed
+        // in dev" rationale above.
+        return next.run(req).await;
+    };
+
+    if blocked.iter().any(|c| c == &country) {
+        warn!(country = %country, path = %req.uri().path(), "geo-blocked request");
+        return (
+            StatusCode::from_u16(451).unwrap(),
+            axum::Json(serde_json::json!({
+                "error": "Service not available in your region",
+                "code": "geo_blocked",
+                "detected_country": country,
+                "more_info": "https://resqd.ai/jurisdiction/",
+            })),
+        )
+            .into_response();
+    }
+
+    next.run(req).await
 }
 
 /// Parse the allow-list of CORS origins. Env var takes precedence; the
 /// fallback covers local dev + the current Pages deployment + the future
 /// custom domain so deploys don't break if the env var is forgotten.
+#[cfg(test)]
+mod geo_tests {
+    //! Unit tests for the geo-block middleware. The full `AppState`
+    //! is heavyweight (real AWS clients), so we test the middleware's
+    //! decision logic via a thin pure function that mirrors it.
+    //!
+    //! If you change the logic in `geo_block_middleware`, mirror the
+    //! change here to keep the tests meaningful.
+    use super::*;
+
+    fn decide(country: Option<&str>, blocked: &[&str], path: &str, method: &Method) -> bool {
+        // Returns true iff the request should be BLOCKED.
+        if blocked.is_empty() {
+            return false;
+        }
+        if *method == Method::OPTIONS || path == "/health" {
+            return false;
+        }
+        let Some(c) = country else {
+            return false;
+        };
+        let upper = c.trim().to_ascii_uppercase();
+        blocked.iter().any(|b| b.to_ascii_uppercase() == upper)
+    }
+
+    #[test]
+    fn empty_block_list_allows_everyone() {
+        assert!(!decide(Some("CN"), &[], "/vault", &Method::GET));
+    }
+
+    #[test]
+    fn blocked_country_rejected() {
+        assert!(decide(Some("CN"), &["CN", "RU"], "/vault", &Method::GET));
+        assert!(decide(Some("ru"), &["CN", "RU"], "/vault", &Method::POST));
+    }
+
+    #[test]
+    fn allowed_country_passes() {
+        assert!(!decide(Some("US"), &["CN", "RU"], "/vault", &Method::GET));
+        assert!(!decide(Some("GB"), &["CN"], "/auth/me", &Method::GET));
+    }
+
+    #[test]
+    fn missing_header_passes() {
+        // Local dev / direct Lambda tests must not be blocked by
+        // accident just because there's no cf-ipcountry header.
+        assert!(!decide(None, &["CN"], "/vault", &Method::GET));
+    }
+
+    #[test]
+    fn options_preflight_always_passes() {
+        // CORS preflight must never 451 — the browser needs the
+        // OPTIONS to succeed before any app code runs, including
+        // the code that would render the block page.
+        assert!(!decide(Some("CN"), &["CN"], "/vault", &Method::OPTIONS));
+    }
+
+    #[test]
+    fn health_check_always_passes() {
+        // Lambda warmup probes and CloudWatch synthetic checks hit
+        // /health — they come from AWS internal IPs without a
+        // cf-ipcountry header, but we want the rule to also be
+        // immune to a badly-classified probe origin.
+        assert!(!decide(Some("CN"), &["CN"], "/health", &Method::GET));
+    }
+
+    #[test]
+    fn case_insensitive_header_match() {
+        // CF headers are technically case-stable but downstream
+        // proxies sometimes munge them; match insensitively.
+        assert!(decide(Some("cn"), &["CN"], "/vault", &Method::GET));
+        assert!(decide(Some("Cn"), &["CN"], "/vault", &Method::GET));
+    }
+}
+
 fn cors_origins() -> Vec<String> {
     if let Ok(s) = std::env::var("RESQD_CORS_ORIGINS") {
         return s
