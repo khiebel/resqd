@@ -666,6 +666,74 @@ pub async fn verify(
     }))
 }
 
+/// `DELETE /vault/{id}` — permanently remove an asset from the vault.
+///
+/// Requires auth and an exact owner match — users can only delete their
+/// own assets. Legacy anonymous assets (owner_id = None) are rejected
+/// with 404 to keep them immutable; they were created before the auth
+/// system existed and there's no way to prove who owned them.
+///
+/// Deletes: 6 sharded blobs, asset manifest, canary chain sidecar, and
+/// the owner sidecar. Best-effort: we proceed through every step and
+/// only return an error if the *first* call fails (the bit that would
+/// leave the asset still listable). A stray shard is harmless debris;
+/// a stranded owner sidecar would keep the asset showing up in /vault.
+///
+/// The on-chain canary anchor is intentionally NOT deleted — the base
+/// chain is append-only by design, and leaving the historical record
+/// is part of the tamper-evidence story. If you delete an asset and
+/// later try to prove "I never had it", the on-chain anchor is still
+/// there showing otherwise. That's the feature.
+pub async fn delete_asset(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(asset_id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    info!(asset_id = %asset_id, user_id = %user.user_id, "delete");
+
+    // Load manifest and verify owner.
+    let manifest_bytes = match state.vault.get(&manifest_key(&asset_id)).await {
+        Ok(b) => b,
+        Err(resqd_storage::StorageError::NotFound(_)) => return Err(ApiError::NotFound),
+        Err(e) => return Err(ApiError::Storage(e)),
+    };
+    let manifest: AssetManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("decode manifest: {e}")))?;
+
+    match manifest.owner_id.as_deref() {
+        Some(owner) if owner == user.user_id => {}
+        _ => return Err(ApiError::NotFound),
+    }
+
+    // Remove the owner sidecar first — this is what /vault listing reads,
+    // so killing it first makes the asset disappear from the user's view
+    // immediately even if a later step fails.
+    use resqd_storage::ObjectStore;
+    let sidecar_key = owner_sidecar_key(&user.user_id, &asset_id);
+    state.s3.delete(&sidecar_key).await?;
+
+    // Delete the 6 shards. Parallelize via join_all — each delete is an
+    // independent S3 DeleteObject.
+    use futures::future::join_all;
+    let shard_futs = (0..TOTAL_SHARDS).map(|i| {
+        let s3 = state.s3.clone();
+        let key = shard_key(&asset_id, i);
+        async move {
+            let _ = s3.delete(&key).await;
+        }
+    });
+    join_all(shard_futs).await;
+
+    // Manifest + chain sidecars live in the erasure-coded vault.
+    let _ = state.vault.delete(&manifest_key(&asset_id)).await;
+    let _ = state.vault.delete(&chain_key(&asset_id)).await;
+
+    Ok(Json(serde_json::json!({
+        "asset_id": asset_id,
+        "deleted": true,
+    })))
+}
+
 /// `GET /vault` — list assets owned by the authenticated user.
 ///
 /// Driven by the `_owner/{user_id}/...` sidecars written at commit time.

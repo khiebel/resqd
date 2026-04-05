@@ -25,6 +25,16 @@ type ViewState =
   | { phase: "ready"; assets: VaultAsset[] }
   | { phase: "error"; message: string };
 
+async function deleteAsset(assetId: string): Promise<void> {
+  const resp = await fetch(`${API_URL}/vault/${encodeURIComponent(assetId)}`, {
+    method: "DELETE",
+    credentials: "include",
+  });
+  if (!resp.ok) {
+    throw new Error(`delete failed: ${resp.status} ${await resp.text()}`);
+  }
+}
+
 function formatTimestamp(secs: number): string {
   if (!secs) return "—";
   const d = new Date(secs * 1000);
@@ -91,6 +101,27 @@ export default function VaultPage() {
   const onLogout = async () => {
     await logout();
     window.location.href = "/login/";
+  };
+
+  const onDelete = async (asset: VaultAsset) => {
+    const label = asset.name ? `"${asset.name}"` : `asset ${asset.asset_id.slice(0, 8)}…`;
+    if (!window.confirm(`Permanently delete ${label}? This cannot be undone.`)) {
+      return;
+    }
+    try {
+      await deleteAsset(asset.asset_id);
+      // Optimistic remove — no need to refetch the whole list.
+      setView((v) =>
+        v.phase === "ready"
+          ? { phase: "ready", assets: v.assets.filter((a) => a.asset_id !== asset.asset_id) }
+          : v,
+      );
+    } catch (e) {
+      setView({
+        phase: "error",
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
   };
 
   return (
@@ -179,13 +210,20 @@ export default function VaultPage() {
                   <td className="py-3 px-4 text-xs text-slate-400">
                     {formatTimestamp(a.created_at)}
                   </td>
-                  <td className="py-3 px-4 text-right">
+                  <td className="py-3 px-4 text-right whitespace-nowrap">
                     <Link
                       href={`/fetch/?id=${encodeURIComponent(a.asset_id)}`}
-                      className="text-amber-400 hover:underline text-xs"
+                      className="text-amber-400 hover:underline text-xs mr-4"
                     >
                       Open →
                     </Link>
+                    <button
+                      onClick={() => onDelete(a)}
+                      className="text-xs text-slate-500 hover:text-red-400"
+                      aria-label="Delete asset"
+                    >
+                      Delete
+                    </button>
                   </td>
                 </tr>
               ))}

@@ -83,7 +83,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/vault", get(handlers::list_vault).post(handlers::upload))
         .route("/vault/init", post(handlers::init))
         .route("/vault/{id}/commit", post(handlers::commit))
-        .route("/vault/{id}", get(handlers::fetch))
+        .route(
+            "/vault/{id}",
+            get(handlers::fetch).delete(handlers::delete_asset),
+        )
         .route("/vault/{id}/verify", get(handlers::verify))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
