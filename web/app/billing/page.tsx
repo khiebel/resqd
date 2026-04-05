@@ -65,9 +65,9 @@ const TIERS: Tier[] = [
     tagline: "Built for families and estates.",
     storage: "50 GB",
     features: [
-      "Up to 5 family members",
-      "Shared vault folders",
-      "Estate triggers + scheduled unlock",
+      "Up to 5 family members (coming soon)",
+      "Shared vault folders (coming soon)",
+      "Estate triggers + scheduled unlock (coming soon)",
       "Everything in Vault",
       "Priority support (24h)",
     ],

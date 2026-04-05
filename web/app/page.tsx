@@ -265,9 +265,9 @@ function Pricing() {
       tagline: "Built for families and estates.",
       features: [
         "50 GB storage",
-        "Up to 5 family members",
-        "Estate triggers & scheduled unlock",
-        "Shared vault folders",
+        "Up to 5 family members (coming soon)",
+        "Estate triggers & scheduled unlock (coming soon)",
+        "Shared vault folders (coming soon)",
         "Priority support (24h)",
       ],
       cta: "Choose Heirloom",
