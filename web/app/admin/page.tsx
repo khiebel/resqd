@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { API_URL } from "../lib/resqdCrypto";
-import { fetchMe } from "../lib/passkey";
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -123,18 +122,6 @@ export default function AdminPage() {
 
   useEffect(() => {
     (async () => {
-      // Admin needs a passkey session (the API uses it to verify
-      // the admin email). If no session exists, show a sign-in
-      // prompt instead of fetching and getting 401.
-      const me = await fetchMe();
-      if (!me) {
-        setError(
-          "Sign in with your passkey first, then come back here. " +
-          "The admin console uses your passkey session to verify admin access."
-        );
-        setLoading(false);
-        return;
-      }
       try {
         const [s, u, r] = await Promise.all([
           fetchAdmin("/admin/stats"),
@@ -196,14 +183,9 @@ export default function AdminPage() {
       <main className="mx-auto max-w-5xl px-6 py-16 text-slate-100">
         <h1 className="text-3xl font-bold mb-4">Admin Console</h1>
         <p className="text-red-400 mb-4">{error}</p>
-        <div className="flex gap-4">
-          <Link href="/login/" className="text-amber-400 text-sm hover:underline">
-            Sign in →
-          </Link>
-          <Link href="/vault/" className="text-slate-400 text-sm hover:underline">
-            ← Back to vault
-          </Link>
-        </div>
+        <Link href="/vault/" className="text-slate-400 text-sm hover:underline">
+          ← Back to vault
+        </Link>
       </main>
     );
   }
