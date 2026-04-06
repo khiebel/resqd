@@ -79,9 +79,9 @@ echo "==> Packaged $(du -h "$ZIP" | awk '{print $1}')"
 # frontend is served from — passkeys are bound to a specific RP id and
 # won't work if the app is reached through a different domain. Change
 # this + re-register when moving to the custom domain.
-WEBAUTHN_RP_ID=${RESQD_WEBAUTHN_RP_ID:-resqd-app.pages.dev}
-WEBAUTHN_ORIGIN=${RESQD_WEBAUTHN_ORIGIN:-https://resqd-app.pages.dev}
-CORS_ORIGINS=${RESQD_CORS_ORIGINS:-https://resqd-app.pages.dev\\,https://resqd.ai\\,https://app.resqd.ai}
+WEBAUTHN_RP_ID=${RESQD_WEBAUTHN_RP_ID:-resqd.ai}
+WEBAUTHN_ORIGIN=${RESQD_WEBAUTHN_ORIGIN:-https://resqd.ai}
+CORS_ORIGINS=${RESQD_CORS_ORIGINS:-https://resqd.ai\\,https://app.resqd.ai\\,https://resqd-app.pages.dev}
 
 # Best-effort OFAC / export-control geo block. Comma-separated
 # ISO-3166-1 alpha-2 country codes. The Lambda middleware in
