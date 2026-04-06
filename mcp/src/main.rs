@@ -35,10 +35,12 @@
 use anyhow::{Context, Result, anyhow};
 use base64::prelude::*;
 use rand::RngCore;
-use resqd_core::{crypto::encrypt, erasure};
+use resqd_core::{crypto::{encrypt, share}, erasure};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::io::Write as _;
+use std::sync::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -54,6 +56,11 @@ struct Config {
     api_url: String,
     api_token: String,
     master_key: [u8; 32],
+    /// Optional X25519 private identity, needed for reading shared and
+    /// ring-owned assets. Without this the MCP server can still upload,
+    /// list, and fetch personal assets, but shared/ring reads will fail
+    /// with a clear error telling the user which env var to set.
+    x25519_privkey: Option<[u8; 32]>,
 }
 
 impl Config {
@@ -85,10 +92,28 @@ impl Config {
         let mut master_key = [0u8; 32];
         master_key.copy_from_slice(&key_bytes);
 
+        // X25519 identity — optional. Needed for shared/ring reads.
+        let x25519_privkey = std::env::var("RESQD_X25519_PRIVKEY_B64")
+            .ok()
+            .and_then(|b64| {
+                let trimmed = b64.trim();
+                let bytes = BASE64_URL_SAFE_NO_PAD
+                    .decode(trimmed)
+                    .or_else(|_| BASE64_URL_SAFE.decode(trimmed))
+                    .or_else(|_| BASE64_STANDARD_NO_PAD.decode(trimmed))
+                    .or_else(|_| BASE64_STANDARD.decode(trimmed))
+                    .ok()?;
+                if bytes.len() != 32 { return None; }
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&bytes);
+                Some(k)
+            });
+
         Ok(Self {
             api_url: api_url.trim_end_matches('/').to_string(),
             api_token,
             master_key,
+            x25519_privkey,
         })
     }
 }
@@ -181,6 +206,9 @@ fn fresh_per_asset_key() -> [u8; 32] {
 struct ApiClient {
     http: reqwest::Client,
     cfg: Config,
+    /// In-memory cache of unwrapped ring privkeys. Lazily populated on
+    /// first access to a ring-owned asset.
+    ring_privkeys: Mutex<HashMap<String, [u8; 32]>>,
 }
 
 impl ApiClient {
@@ -188,7 +216,115 @@ impl ApiClient {
         let http = reqwest::Client::builder()
             .user_agent(format!("resqd-mcp/{SERVER_VERSION}"))
             .build()?;
-        Ok(Self { http, cfg })
+        Ok(Self {
+            http,
+            cfg,
+            ring_privkeys: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Get (or lazily fetch + unwrap) the ring privkey for a ring.
+    async fn get_ring_privkey(&self, ring_id: &str) -> Result<[u8; 32]> {
+        // Check cache first.
+        if let Some(k) = self.ring_privkeys.lock().unwrap().get(ring_id) {
+            return Ok(*k);
+        }
+        let x_priv = self.cfg.x25519_privkey.ok_or_else(|| {
+            anyhow!("RESQD_X25519_PRIVKEY_B64 required to read ring-owned assets")
+        })?;
+        // Fetch membership.
+        let resp = self.http
+            .get(self.url(&format!("/rings/{ring_id}/me")))
+            .bearer_auth(&self.cfg.api_token)
+            .send()
+            .await
+            .context("GET /rings/{id}/me")?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("ring membership fetch failed: {}", resp.status()));
+        }
+        let data: Value = resp.json().await?;
+        let wrapped_b64 = data.get("wrapped_ring_privkey_b64")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("ring privkey not available (estate locked?)"))?;
+        let inviter_pub_b64 = data.get("inviter_pubkey_x25519_b64")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("inviter pubkey missing from membership"))?;
+        let inviter_pub = BASE64_STANDARD.decode(inviter_pub_b64).context("inviter pub b64")?;
+        if inviter_pub.len() != 32 {
+            return Err(anyhow!("inviter pub is {} bytes", inviter_pub.len()));
+        }
+        let mut inv_pub = [0u8; 32];
+        inv_pub.copy_from_slice(&inviter_pub);
+        // Derive the wrap key the inviter used: recipient_wrap_key(my_priv, inviter_pub, ring_id).
+        let wrap_key = share::recipient_wrap_key(&x_priv, &inv_pub, ring_id);
+        // Unwrap the ring privkey.
+        let outer = BASE64_STANDARD.decode(wrapped_b64).context("wrapped ring priv b64")?;
+        let s = std::str::from_utf8(&outer).context("wrapped ring priv utf8")?;
+        let ring_priv_bytes = decrypt_blob_json(&wrap_key, s)?;
+        if ring_priv_bytes.len() != 32 {
+            return Err(anyhow!("ring privkey is {} bytes", ring_priv_bytes.len()));
+        }
+        let mut ring_priv = [0u8; 32];
+        ring_priv.copy_from_slice(&ring_priv_bytes);
+        self.ring_privkeys.lock().unwrap().insert(ring_id.to_string(), ring_priv);
+        Ok(ring_priv)
+    }
+
+    /// Derive the per-asset unwrap key for any role.
+    async fn derive_asset_key(
+        &self,
+        manifest: &FetchResponse,
+        asset_id: &str,
+    ) -> Result<[u8; 32]> {
+        let wrapped_b64 = manifest.wrapped_key_b64.as_deref()
+            .ok_or_else(|| anyhow!("no wrapped key — legacy unkeyed asset"))?;
+        let role = manifest.role.as_deref().unwrap_or("owner");
+
+        let unwrap_key: [u8; 32] = match role {
+            "ring_member" => {
+                let ring_id = manifest.ring_id.as_deref()
+                    .ok_or_else(|| anyhow!("ring_member but no ring_id"))?;
+                let up_pub_b64 = manifest.uploader_pubkey_x25519_b64.as_deref()
+                    .ok_or_else(|| anyhow!("ring_member but no uploader_pubkey"))?;
+                let up_pub_bytes = BASE64_STANDARD.decode(up_pub_b64)?;
+                if up_pub_bytes.len() != 32 {
+                    return Err(anyhow!("uploader pub {} bytes", up_pub_bytes.len()));
+                }
+                let mut up_pub = [0u8; 32];
+                up_pub.copy_from_slice(&up_pub_bytes);
+                let ring_priv = self.get_ring_privkey(ring_id).await?;
+                share::recipient_wrap_key(&ring_priv, &up_pub, asset_id)
+            }
+            "sharee" => {
+                let x_priv = self.cfg.x25519_privkey.ok_or_else(|| {
+                    anyhow!("RESQD_X25519_PRIVKEY_B64 required to read shared assets")
+                })?;
+                let sender_pub_b64 = manifest.sender_pubkey_x25519_b64.as_deref()
+                    .ok_or_else(|| anyhow!("sharee but no sender_pubkey"))?;
+                let sender_pub_bytes = BASE64_STANDARD.decode(sender_pub_b64)?;
+                if sender_pub_bytes.len() != 32 {
+                    return Err(anyhow!("sender pub {} bytes", sender_pub_bytes.len()));
+                }
+                let mut sp = [0u8; 32];
+                sp.copy_from_slice(&sender_pub_bytes);
+                share::recipient_wrap_key(&x_priv, &sp, asset_id)
+            }
+            _ => {
+                // Owner — unwrap under master key.
+                return Ok(self.cfg.master_key);
+            }
+        };
+
+        // Unwrap the per-asset key under the derived wrap key.
+        let outer = BASE64_STANDARD.decode(wrapped_b64).context("wrapped key b64")?;
+        let s = std::str::from_utf8(&outer).context("wrapped key utf8")?;
+        let key_bytes = decrypt_blob_json(&unwrap_key, s)?;
+        if key_bytes.len() != 32 {
+            return Err(anyhow!("per-asset key {} bytes", key_bytes.len()));
+        }
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&key_bytes);
+        Ok(k)
     }
 
     fn url(&self, path: &str) -> String {
@@ -340,6 +476,16 @@ struct VaultListItem {
     created_at: u64,
     #[serde(default)]
     encrypted_meta_b64: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    shared_by_email: Option<String>,
+    #[serde(default)]
+    sender_pubkey_x25519_b64: Option<String>,
+    #[serde(default)]
+    ring_id: Option<String>,
+    #[serde(default)]
+    uploader_pubkey_x25519_b64: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -355,6 +501,14 @@ struct FetchResponse {
     #[serde(default)]
     #[allow(dead_code)]
     encrypted_meta_b64: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    sender_pubkey_x25519_b64: Option<String>,
+    #[serde(default)]
+    ring_id: Option<String>,
+    #[serde(default)]
+    uploader_pubkey_x25519_b64: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -445,32 +599,76 @@ async fn tool_upload_file(api: &ApiClient, args: &Value) -> Result<Value> {
 
 async fn tool_list_vault(api: &ApiClient) -> Result<Value> {
     let resp = api.list_vault().await?;
-    let items: Vec<Value> = resp
-        .assets
-        .iter()
-        .map(|a| {
-            let (name, mime) = a
-                .encrypted_meta_b64
-                .as_ref()
-                .and_then(|b64| {
-                    let outer = BASE64_STANDARD.decode(b64.as_bytes()).ok()?;
-                    let s = std::str::from_utf8(&outer).ok()?;
-                    let plaintext = decrypt_blob_json(&api.cfg.master_key, s).ok()?;
-                    let parsed: Value = serde_json::from_slice(&plaintext).ok()?;
-                    Some((
+    let mut items: Vec<Value> = Vec::with_capacity(resp.assets.len());
+    for a in &resp.assets {
+        let role = a.role.as_deref().unwrap_or("owner");
+        // Derive the right key for meta decryption based on role.
+        let (name, mime) = if let Some(b64) = &a.encrypted_meta_b64 {
+            let meta_key: Option<[u8; 32]> = match role {
+                "ring_member" => {
+                    // Ring meta is sealed under the same ECDH wrap key
+                    // as the per-asset key. But we don't have an asset_id
+                    // for the HKDF info... we do have it: a.asset_id.
+                    // Need ring privkey + uploader pubkey.
+                    if let (Some(ring_id), Some(up_pub_b64)) =
+                        (&a.ring_id, &a.uploader_pubkey_x25519_b64)
+                    {
+                        if let Ok(ring_priv) = api.get_ring_privkey(ring_id).await {
+                            if let Ok(up_bytes) = BASE64_STANDARD.decode(up_pub_b64) {
+                                if up_bytes.len() == 32 {
+                                    let mut up = [0u8; 32];
+                                    up.copy_from_slice(&up_bytes);
+                                    Some(share::recipient_wrap_key(&ring_priv, &up, &a.asset_id))
+                                } else { None }
+                            } else { None }
+                        } else { None }
+                    } else { None }
+                }
+                "sharee" => {
+                    if let (Some(x_priv), Some(sp_b64)) =
+                        (api.cfg.x25519_privkey, &a.sender_pubkey_x25519_b64)
+                    {
+                        if let Ok(sp_bytes) = BASE64_STANDARD.decode(sp_b64) {
+                            if sp_bytes.len() == 32 {
+                                let mut sp = [0u8; 32];
+                                sp.copy_from_slice(&sp_bytes);
+                                Some(share::recipient_wrap_key(&x_priv, &sp, &a.asset_id))
+                            } else { None }
+                        } else { None }
+                    } else { None }
+                }
+                _ => Some(api.cfg.master_key),
+            };
+            if let Some(key) = meta_key {
+                let outer = BASE64_STANDARD.decode(b64.as_bytes()).ok();
+                let decrypted = outer
+                    .and_then(|o| std::str::from_utf8(&o).ok().map(|s| s.to_string()))
+                    .and_then(|s| decrypt_blob_json(&key, &s).ok());
+                if let Some(plain) = decrypted {
+                    let parsed: Value = serde_json::from_slice(&plain).unwrap_or_default();
+                    (
                         parsed.get("name").and_then(|v| v.as_str()).map(String::from),
                         parsed.get("mime").and_then(|v| v.as_str()).map(String::from),
-                    ))
-                })
-                .unwrap_or((None, None));
-            json!({
-                "asset_id": a.asset_id,
-                "created_at": a.created_at,
-                "name": name,
-                "mime": mime,
-            })
-        })
-        .collect();
+                    )
+                } else { (None, None) }
+            } else { (None, None) }
+        } else { (None, None) };
+
+        let mut item = json!({
+            "asset_id": a.asset_id,
+            "created_at": a.created_at,
+            "name": name,
+            "mime": mime,
+            "role": role,
+        });
+        if let Some(email) = &a.shared_by_email {
+            item["shared_by"] = json!(email);
+        }
+        if let Some(rid) = &a.ring_id {
+            item["ring_id"] = json!(rid);
+        }
+        items.push(item);
+    }
     Ok(json!({ "count": resp.count, "assets": items }))
 }
 
@@ -487,21 +685,10 @@ async fn tool_fetch_file(api: &ApiClient, args: &Value) -> Result<Value> {
 
     let manifest = api.fetch_manifest(asset_id).await?;
 
-    // Unwrap the per-asset key. Legacy assets without a wrapped key
-    // decrypt directly under the master key (matches web fetch page).
-    let asset_key: [u8; 32] = if let Some(b64) = &manifest.wrapped_key_b64 {
-        let outer = BASE64_STANDARD.decode(b64.as_bytes()).context("outer wrap b64")?;
-        let s = std::str::from_utf8(&outer).context("outer wrap utf8")?;
-        let key_bytes = decrypt_blob_json(&api.cfg.master_key, s)?;
-        if key_bytes.len() != 32 {
-            return Err(anyhow!(
-                "unwrapped per-asset key is {} bytes, expected 32",
-                key_bytes.len()
-            ));
-        }
-        let mut k = [0u8; 32];
-        k.copy_from_slice(&key_bytes);
-        k
+    // Unwrap the per-asset key. Role-aware: owner uses master key,
+    // sharee uses ECDH wrap key, ring_member uses ring privkey ECDH.
+    let asset_key: [u8; 32] = if manifest.wrapped_key_b64.is_some() {
+        api.derive_asset_key(&manifest, asset_id).await?
     } else {
         api.cfg.master_key
     };
