@@ -280,6 +280,105 @@ pub async fn list_rings(
     }))
 }
 
+/// `POST /admin/rings/{ring_id}/unlock-executor/{user_email}` — manually
+/// unlock an executor after the admin has verified proof of death. This
+/// is the primary estate trigger mechanism — automatic triggers
+/// (inactivity/scheduled) are secondary opt-in fallbacks, not the
+/// default.
+///
+/// The admin clicks this after reviewing a death certificate or
+/// equivalent documentation submitted through the heir-claim flow.
+/// Sets `estate_unlocked_at` on the executor's membership row so
+/// they can unwrap the ring privkey on their next login.
+pub async fn unlock_executor(
+    State(state): State<Arc<AppState>>,
+    user: Option<AuthUser>,
+    axum::extract::Path((ring_id, target_email)): axum::extract::Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, Response> {
+    let admin_email = require_admin(&user)?;
+    let auth = state.auth.as_ref().ok_or_else(|| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"no auth"}))).into_response()
+    })?;
+
+    // Resolve the target user.
+    let target_email = target_email.trim().to_ascii_lowercase();
+    let target = crate::auth::get_user_by_email(auth, &target_email)
+        .await
+        .map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()
+        })?
+        .ok_or_else(|| {
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "user not found"}))).into_response()
+        })?;
+
+    // Verify this user is actually an Executor on this ring.
+    let membership = auth
+        .dynamo
+        .get_item()
+        .table_name(&auth.config.rings_table)
+        .key("pk", AttributeValue::S(format!("RING#{ring_id}")))
+        .key("sk", AttributeValue::S(format!("MEMBER#{}", target.user_id)))
+        .send()
+        .await
+        .map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()
+        })?;
+    let item = membership.item.ok_or_else(|| {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "user is not a member of this ring"}))).into_response()
+    })?;
+    let role = take_s(&item, "role");
+    if role != "executor" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("user has role '{}', not 'executor'", role)})),
+        ).into_response());
+    }
+
+    // Check if already unlocked.
+    let already = take_n(&item, "estate_unlocked_at");
+    if already > 0 {
+        return Ok(Json(serde_json::json!({
+            "ring_id": ring_id,
+            "executor_email": target_email,
+            "already_unlocked_at": already,
+            "message": "executor was already unlocked"
+        })));
+    }
+
+    // Set estate_unlocked_at.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    auth.dynamo
+        .update_item()
+        .table_name(&auth.config.rings_table)
+        .key("pk", AttributeValue::S(format!("RING#{ring_id}")))
+        .key("sk", AttributeValue::S(format!("MEMBER#{}", target.user_id)))
+        .update_expression("SET estate_unlocked_at = :t")
+        .expression_attribute_values(":t", AttributeValue::N(now.to_string()))
+        .send()
+        .await
+        .map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()
+        })?;
+
+    info!(
+        admin = %admin_email,
+        ring_id = %ring_id,
+        executor = %target_email,
+        "admin unlocked executor — estate trigger fired manually"
+    );
+
+    Ok(Json(serde_json::json!({
+        "ring_id": ring_id,
+        "executor_email": target_email,
+        "unlocked_at": now,
+        "message": "executor unlocked — they can now access ring assets on next login"
+    })))
+}
+
 /// `GET /admin/stats` — aggregate system stats.
 pub async fn stats(
     State(state): State<Arc<AppState>>,

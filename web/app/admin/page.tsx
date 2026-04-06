@@ -35,6 +35,19 @@ interface AdminStats {
   rings_with_triggers: number;
 }
 
+interface AdminRingMember {
+  user_id: string;
+  email: string;
+  role: string;
+  invited_at: number;
+}
+
+interface AdminRingDetail {
+  ring_id: string;
+  name: string;
+  members: AdminRingMember[];
+}
+
 type Tab = "stats" | "users" | "rings";
 
 function formatBytes(n: number): string {
@@ -87,6 +100,8 @@ export default function AdminPage() {
   const [stats, setStats] = useState<AdminStats | null>(null);
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [rings, setRings] = useState<AdminRing[]>([]);
+  const [selectedRing, setSelectedRing] = useState<AdminRingDetail | null>(null);
+  const [unlocking, setUnlocking] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -136,6 +151,37 @@ export default function AdminPage() {
       }
     })();
   }, [fetchAdmin]);
+
+  const viewRingMembers = useCallback(async (ringId: string) => {
+    try {
+      // Uses the regular ring detail endpoint (admin has a passkey session)
+      const data = await fetchAdmin(`/rings/${encodeURIComponent(ringId)}`);
+      setSelectedRing(data);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, [fetchAdmin]);
+
+  const unlockExecutor = useCallback(async (ringId: string, executorEmail: string) => {
+    if (!confirm(`Unlock executor ${executorEmail} on this ring? This grants them full read access to all ring assets. Only do this after verifying proof of death.`)) return;
+    setUnlocking(true);
+    try {
+      const resp = await fetch(
+        `${API_URL}/admin/rings/${encodeURIComponent(ringId)}/unlock-executor/${encodeURIComponent(executorEmail)}`,
+        { method: "POST", credentials: "include" },
+      );
+      if (!resp.ok) throw new Error(await resp.text());
+      const result = await resp.json();
+      setError(null);
+      alert(result.message || "Executor unlocked");
+      // Refresh the ring detail
+      await viewRingMembers(ringId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUnlocking(false);
+    }
+  }, [viewRingMembers]);
 
   if (loading) {
     return (
@@ -324,10 +370,76 @@ export default function AdminPage() {
                     <td className="py-3 px-4 text-xs text-slate-400">
                       {formatTimestamp(r.created_at)}
                     </td>
+                    <td className="py-3 px-4 text-right">
+                      <button
+                        onClick={() => viewRingMembers(r.ring_id)}
+                        className="text-xs text-amber-400 hover:underline"
+                      >
+                        Members →
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
+          )}
+
+          {/* Ring member detail + executor unlock */}
+          {selectedRing && (
+            <div className="mt-6 bg-slate-950 border border-slate-800 rounded-xl p-5">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-lg font-semibold">{selectedRing.name} — Members</h3>
+                <button
+                  onClick={() => setSelectedRing(null)}
+                  className="text-xs text-slate-500 hover:text-slate-300"
+                >
+                  Close
+                </button>
+              </div>
+              <table className="w-full text-sm">
+                <thead className="text-slate-400 text-xs uppercase">
+                  <tr>
+                    <th className="text-left py-2 font-medium">Email</th>
+                    <th className="text-left py-2 font-medium">Role</th>
+                    <th className="text-left py-2 font-medium">Joined</th>
+                    <th className="text-right py-2 font-medium">Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {selectedRing.members.map((m) => (
+                    <tr key={m.user_id} className="border-t border-slate-800">
+                      <td className="py-2 text-slate-300 font-mono text-xs">{m.email}</td>
+                      <td className="py-2">
+                        <span className={`text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded ${
+                          m.role === "executor"
+                            ? "bg-red-500/20 text-red-300"
+                            : "bg-violet-500/20 text-violet-300"
+                        }`}>
+                          {m.role}
+                        </span>
+                      </td>
+                      <td className="py-2 text-xs text-slate-400">{formatTimestamp(m.invited_at)}</td>
+                      <td className="py-2 text-right">
+                        {m.role === "executor" && (
+                          <button
+                            onClick={() => unlockExecutor(selectedRing.ring_id, m.email)}
+                            disabled={unlocking}
+                            className="rounded bg-red-600 text-white text-xs font-semibold px-3 py-1 hover:bg-red-500 disabled:opacity-30"
+                          >
+                            {unlocking ? "Unlocking…" : "Unlock (proof of death)"}
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <p className="mt-3 text-xs text-slate-500 leading-relaxed">
+                Only unlock an executor after verifying proof of death (death
+                certificate, legal documentation). This grants permanent read
+                access to all ring assets and cannot be reversed.
+              </p>
+            </div>
           )}
         </section>
       )}

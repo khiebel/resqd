@@ -135,6 +135,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/users", get(admin::list_users))
         .route("/admin/rings", get(admin::list_rings))
         .route("/admin/stats", get(admin::stats))
+        .route(
+            "/admin/rings/{ring_id}/unlock-executor/{email}",
+            post(admin::unlock_executor),
+        )
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
