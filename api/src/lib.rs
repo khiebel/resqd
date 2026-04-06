@@ -14,6 +14,7 @@
 //! anchors the new commitment on-chain before returning the bytes. This is
 //! non-negotiable — it's the core tamper-evidence guarantee.
 
+pub mod admin;
 pub mod auth;
 pub mod handlers;
 pub mod rings;
@@ -130,6 +131,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/rings/{id}/me", get(rings::my_membership))
         .route("/rings/{id}/trigger", axum::routing::put(rings::set_trigger))
+        // Admin control plane. All handlers gate on admin email.
+        .route("/admin/users", get(admin::list_users))
+        .route("/admin/rings", get(admin::list_rings))
+        .route("/admin/stats", get(admin::stats))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
