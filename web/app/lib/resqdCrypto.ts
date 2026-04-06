@@ -64,11 +64,13 @@ export async function getCrypto(): Promise<WasmApi> {
       // The wasm-bindgen glue is in public/ so it's served as a static file.
       // Dynamic import via a runtime-built URL keeps Next's bundler from
       // trying to resolve it at build time.
-      const glueUrl = "/resqd-wasm/resqd_core.js";
+      // Cache-bust: the WASM glue JS has a static filename (no content
+      // hash) so CF Pages edge cache serves stale copies after deploys.
+      // Append a build-time version tag so a redeploy forces a fresh fetch.
+      const v = "20260405";
+      const glueUrl = `/resqd-wasm/resqd_core.js?v=${v}`;
       const mod = await import(/* webpackIgnore: true */ glueUrl);
-      // wasm-bindgen default export initializes the module. Pass an explicit
-      // URL to the .wasm file so it resolves relative to the page origin.
-      await mod.default({ module_or_path: "/resqd-wasm/resqd_core_bg.wasm" });
+      await mod.default({ module_or_path: `/resqd-wasm/resqd_core_bg.wasm?v=${v}` });
       return mod as WasmApi;
     })();
   }
