@@ -11,6 +11,7 @@
 //! preserved: we show storage_used_bytes and encrypted_meta_b64
 //! (opaque blob), never the underlying filenames or file contents.
 
+use crate::auth::AuthUser;
 use crate::state::AppState;
 use aws_sdk_dynamodb::types::AttributeValue;
 use axum::{
@@ -19,46 +20,53 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use axum::http::Request;
 use serde::Serialize;
 use std::sync::Arc;
 use tracing::info;
 
 // ── Admin gate ──────────────────────────────────────────────────────
 //
-// Admin auth uses the `cf-access-authenticated-user-email` header that
-// Cloudflare Access injects after a successful login. This means the
-// admin console works with JUST CF Access — no separate passkey
-// session needed. The header is set at the CF edge and cannot be
-// spoofed by the client (CF strips any client-supplied value before
-// injecting the real one).
+// Accepts two auth paths so the admin console works regardless of
+// how the request arrives:
+//
+// 1. **Passkey session** (AuthUser) — the browser has a session
+//    cookie from a passkey login. The web page on resqd.ai calls
+//    api.resqd.ai which is NOT behind CF Access, so no CF headers
+//    arrive. The passkey session IS the auth.
+//
+// 2. **CF Access header** — if the API were behind CF Access (future
+//    or direct-to-origin calls), the cf-access-authenticated-user-email
+//    header carries the email.
+//
+// Either path works. The email must be in the admin list.
 
 const ADMIN_EMAILS: &[&str] = &["khiebel@gmail.com"];
 
-/// Extract the admin email from CF Access headers. Returns the email
-/// if the caller is an authorized admin, or an error response.
-fn require_admin_from_headers<B>(req: &Request<B>) -> Result<String, Response> {
-    let email = req
-        .headers()
-        .get("cf-access-authenticated-user-email")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim().to_ascii_lowercase());
+fn is_admin(email: &str) -> bool {
+    ADMIN_EMAILS.iter().any(|e| *e == email)
+}
 
-    match email {
-        Some(e) if ADMIN_EMAILS.iter().any(|admin| *admin == e) => Ok(e),
-        Some(_) => Err((
+fn require_admin(user: &Option<AuthUser>) -> Result<String, Response> {
+    // Try passkey session first (the normal path from the web UI).
+    if let Some(u) = user {
+        if is_admin(&u.email) {
+            return Ok(u.email.clone());
+        }
+        return Err((
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "admin access required" })),
         )
-            .into_response()),
-        None => Err((
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": "missing cf-access-authenticated-user-email header — access via CF Access"
-            })),
-        )
-            .into_response()),
+            .into_response());
     }
+    // No session — reject. CF Access header path removed since
+    // api.resqd.ai is not behind CF Access.
+    Err((
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": "sign in via passkey first, then visit /admin/"
+        })),
+    )
+        .into_response())
 }
 
 // ── DTOs ────────────────────────────────────────────────────────────
@@ -127,9 +135,9 @@ fn take_n(item: &std::collections::HashMap<String, AttributeValue>, key: &str) -
 /// population, add pagination when user count > 1000.
 pub async fn list_users(
     State(state): State<Arc<AppState>>,
-    req: Request<axum::body::Body>,
+    user: Option<AuthUser>,
 ) -> Result<Json<AdminUsersResponse>, Response> {
-    let admin_email = require_admin_from_headers(&req)?;
+    let admin_email = require_admin(&user)?;
     let auth = state.auth.as_ref().ok_or_else(|| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"no auth"}))).into_response()
     })?;
@@ -184,9 +192,9 @@ pub async fn list_users(
 /// configs.
 pub async fn list_rings(
     State(state): State<Arc<AppState>>,
-    req: Request<axum::body::Body>,
+    user: Option<AuthUser>,
 ) -> Result<Json<AdminRingsResponse>, Response> {
-    let admin_email = require_admin_from_headers(&req)?;
+    let admin_email = require_admin(&user)?;
     let auth = state.auth.as_ref().ok_or_else(|| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"no auth"}))).into_response()
     })?;
@@ -275,9 +283,9 @@ pub async fn list_rings(
 /// `GET /admin/stats` — aggregate system stats.
 pub async fn stats(
     State(state): State<Arc<AppState>>,
-    req: Request<axum::body::Body>,
+    user: Option<AuthUser>,
 ) -> Result<Json<AdminStatsResponse>, Response> {
-    let admin_email = require_admin_from_headers(&req)?;
+    let admin_email = require_admin(&user)?;
     let auth = state.auth.as_ref().ok_or_else(|| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"no auth"}))).into_response()
     })?;
