@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { API_URL } from "../lib/resqdCrypto";
-import { fetchMe, type SessionUser } from "../lib/passkey";
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -83,7 +82,6 @@ function StatCard({
 // ── Main ────────────────────────────────────────────────────────────
 
 export default function AdminPage() {
-  const [user, setUser] = useState<SessionUser | null>(null);
   const [tab, setTab] = useState<Tab>("stats");
   const [stats, setStats] = useState<AdminStats | null>(null);
   const [users, setUsers] = useState<AdminUser[]>([]);
@@ -96,7 +94,10 @@ export default function AdminPage() {
       credentials: "include",
     });
     if (resp.status === 403) {
-      throw new Error("admin access denied");
+      throw new Error("admin access denied — your email is not in the admin list");
+    }
+    if (resp.status === 401) {
+      throw new Error("unauthorized — admin endpoints require CF Access authentication");
     }
     if (!resp.ok) {
       throw new Error(`${resp.status} ${await resp.text()}`);
@@ -106,12 +107,6 @@ export default function AdminPage() {
 
   useEffect(() => {
     (async () => {
-      const me = await fetchMe();
-      if (!me) {
-        window.location.href = "/login/";
-        return;
-      }
-      setUser(me);
       try {
         const [s, u, r] = await Promise.all([
           fetchAdmin("/admin/stats"),
@@ -155,7 +150,7 @@ export default function AdminPage() {
         <div>
           <h1 className="text-3xl font-bold">Admin Console</h1>
           <p className="text-xs text-slate-500 mt-1">
-            RESQD control plane · {user?.email}
+            RESQD control plane
           </p>
         </div>
         <Link

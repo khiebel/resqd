@@ -11,7 +11,6 @@
 //! preserved: we show storage_used_bytes and encrypted_meta_b64
 //! (opaque blob), never the underlying filenames or file contents.
 
-use crate::auth::AuthUser;
 use crate::state::AppState;
 use aws_sdk_dynamodb::types::AttributeValue;
 use axum::{
@@ -20,27 +19,45 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use axum::http::Request;
 use serde::Serialize;
 use std::sync::Arc;
 use tracing::info;
 
 // ── Admin gate ──────────────────────────────────────────────────────
+//
+// Admin auth uses the `cf-access-authenticated-user-email` header that
+// Cloudflare Access injects after a successful login. This means the
+// admin console works with JUST CF Access — no separate passkey
+// session needed. The header is set at the CF edge and cannot be
+// spoofed by the client (CF strips any client-supplied value before
+// injecting the real one).
 
 const ADMIN_EMAILS: &[&str] = &["khiebel@gmail.com"];
 
-fn is_admin(user: &AuthUser) -> bool {
-    ADMIN_EMAILS.iter().any(|e| *e == user.email)
-}
+/// Extract the admin email from CF Access headers. Returns the email
+/// if the caller is an authorized admin, or an error response.
+fn require_admin_from_headers<B>(req: &Request<B>) -> Result<String, Response> {
+    let email = req
+        .headers()
+        .get("cf-access-authenticated-user-email")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_ascii_lowercase());
 
-fn require_admin(user: &AuthUser) -> Result<(), Response> {
-    if is_admin(user) {
-        Ok(())
-    } else {
-        Err((
+    match email {
+        Some(e) if ADMIN_EMAILS.iter().any(|admin| *admin == e) => Ok(e),
+        Some(_) => Err((
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "admin access required" })),
         )
-            .into_response())
+            .into_response()),
+        None => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "missing cf-access-authenticated-user-email header — access via CF Access"
+            })),
+        )
+            .into_response()),
     }
 }
 
@@ -110,9 +127,9 @@ fn take_n(item: &std::collections::HashMap<String, AttributeValue>, key: &str) -
 /// population, add pagination when user count > 1000.
 pub async fn list_users(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<AdminUsersResponse>, Response> {
-    require_admin(&user)?;
+    let admin_email = require_admin_from_headers(&req)?;
     let auth = state.auth.as_ref().ok_or_else(|| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"no auth"}))).into_response()
     })?;
@@ -154,7 +171,7 @@ pub async fn list_users(
 
     users.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
-    info!(admin = %user.email, count = users.len(), "admin list_users");
+    info!(admin = %admin_email, count = users.len(), "admin list_users");
 
     Ok(Json(AdminUsersResponse {
         count: users.len(),
@@ -167,9 +184,9 @@ pub async fn list_users(
 /// configs.
 pub async fn list_rings(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<AdminRingsResponse>, Response> {
-    require_admin(&user)?;
+    let admin_email = require_admin_from_headers(&req)?;
     let auth = state.auth.as_ref().ok_or_else(|| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"no auth"}))).into_response()
     })?;
@@ -247,7 +264,7 @@ pub async fn list_rings(
 
     rings.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
-    info!(admin = %user.email, count = rings.len(), "admin list_rings");
+    info!(admin = %admin_email, count = rings.len(), "admin list_rings");
 
     Ok(Json(AdminRingsResponse {
         count: rings.len(),
@@ -258,9 +275,9 @@ pub async fn list_rings(
 /// `GET /admin/stats` — aggregate system stats.
 pub async fn stats(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<AdminStatsResponse>, Response> {
-    require_admin(&user)?;
+    let admin_email = require_admin_from_headers(&req)?;
     let auth = state.auth.as_ref().ok_or_else(|| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"no auth"}))).into_response()
     })?;
@@ -317,7 +334,7 @@ pub async fn stats(
         })?;
     let total_ring_members = members_scan.count() as usize;
 
-    info!(admin = %user.email, "admin stats");
+    info!(admin = %admin_email, "admin stats");
 
     Ok(Json(AdminStatsResponse {
         user_count,
