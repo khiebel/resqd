@@ -456,7 +456,9 @@ export function x25519_sender_wrap_key(sender_private_b64, recipient_public_b64,
         wasm.__wbindgen_free(deferred5_0, deferred5_1, 1);
     }
 }
-import * as import1 from "env"
+// Shim: chrono's wasmbind bridge imports env.now for Date.now().
+// Bare "env" is not a valid ES module specifier in the browser.
+const import1 = { now: () => Date.now() };
 
 function __wbg_get_imports() {
     const import0 = {
