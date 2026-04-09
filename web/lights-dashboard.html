@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>lights.hiebel.ai</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0a0a0f;--card:#14141f;--card-border:#1e1e2e;--text:#e8e8f0;--text-muted:#6b6b80;--amber:#f5a623;--amber-dim:rgba(245,166,35,0.15);--amber-glow:rgba(245,166,35,0.3);--red:#e74c3c;--green:#2ecc71;--blue:#3498db;--purple:#9b59b6;--glass:rgba(20,20,35,0.7);--glass-border:rgba(255,255,255,0.06);--radius:12px;--transition:0.3s ease}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
+.topbar{position:sticky;top:0;z-index:100;display:flex;align-items:center;justify-content:space-between;padding:12px 20px;background:rgba(10,10,15,0.92);backdrop-filter:blur(20px);border-bottom:1px solid var(--glass-border)}
+.topbar-title{font-size:1.15rem;font-weight:600;letter-spacing:-0.02em;display:flex;align-items:center;gap:10px}
+.status-dot{width:8px;height:8px;border-radius:50%;background:var(--red);transition:background var(--transition);flex-shrink:0}
+.status-dot.connected{background:var(--green);box-shadow:0 0 8px rgba(46,204,113,0.5)}
+.topbar-actions{display:flex;gap:8px}
+.btn{padding:8px 16px;border:none;border-radius:8px;font-size:0.82rem;font-weight:600;cursor:pointer;transition:all var(--transition);text-transform:uppercase;letter-spacing:0.04em}
+.btn-on{background:var(--amber);color:#000}.btn-on:hover{background:#ffb940;transform:translateY(-1px)}
+.btn-off{background:rgba(255,255,255,0.08);color:var(--text-muted)}.btn-off:hover{background:rgba(255,255,255,0.14)}
+.btn-scene{background:var(--glass);border:1px solid var(--glass-border);color:var(--text);padding:10px 18px;border-radius:10px;font-size:0.85rem;font-weight:500;backdrop-filter:blur(8px)}
+.btn-scene:hover{border-color:var(--amber);color:var(--amber);transform:translateY(-1px)}
+.btn-scene:active{transform:scale(0.97)}
+.scenes{display:flex;gap:8px;padding:14px 20px;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+.scenes::-webkit-scrollbar{display:none}
+.scenes .btn-scene .scene-icon{margin-right:6px}
+.container{padding:12px 16px 100px;max-width:1200px;margin:0 auto}
+.grid{display:grid;grid-template-columns:1fr;gap:14px}
+@media(min-width:640px){.grid{grid-template-columns:repeat(2,1fr)}}
+@media(min-width:960px){.grid{grid-template-columns:repeat(3,1fr)}}
+.card{background:var(--glass);border:1px solid var(--glass-border);border-radius:var(--radius);backdrop-filter:blur(12px);overflow:hidden;transition:border-color var(--transition),box-shadow var(--transition)}
+.card.has-on{border-color:var(--amber-glow);box-shadow:0 0 20px rgba(245,166,35,0.08)}
+.card.has-offline{border-color:rgba(231,76,60,0.4)}
+.card-header{display:flex;align-items:center;justify-content:space-between;padding:14px 16px 10px;cursor:pointer;user-select:none}
+.card-header:hover{background:rgba(255,255,255,0.02)}
+.room-name{font-size:0.95rem;font-weight:600;display:flex;align-items:center;gap:8px}
+.room-name .chevron{transition:transform var(--transition);font-size:0.7rem;color:var(--text-muted)}
+.room-name .chevron.collapsed{transform:rotate(-90deg)}
+.room-controls{display:flex;gap:6px}
+.room-controls .btn{padding:4px 10px;font-size:0.7rem;border-radius:6px}
+.card-body{padding:0 16px 14px;transition:max-height 0.4s ease,opacity 0.3s ease;overflow:hidden}
+.card-body.collapsed{max-height:0!important;padding-top:0;padding-bottom:0;opacity:0}
+.device-row{display:flex;align-items:center;gap:10px;padding:8px 0;border-top:1px solid rgba(255,255,255,0.04)}
+.device-row:first-child{border-top:none}
+.device-row.loading{opacity:0.45;pointer-events:none}
+.device-row.offline .device-label::after{content:"Offline";margin-left:8px;font-size:0.65rem;background:var(--red);color:#fff;padding:1px 6px;border-radius:4px;font-weight:600}
+.device-label{flex:1;font-size:0.85rem;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.device-label .device-type{font-size:0.65rem;color:var(--text-muted);margin-left:6px;text-transform:uppercase;letter-spacing:0.05em}
+.brightness-val{font-size:0.75rem;color:var(--text-muted);min-width:32px;text-align:right;font-variant-numeric:tabular-nums}
+/* Toggle switch */
+.toggle{position:relative;width:44px;height:24px;flex-shrink:0}
+.toggle input{opacity:0;width:0;height:0;position:absolute}
+.toggle-track{position:absolute;inset:0;background:rgba(255,255,255,0.1);border-radius:12px;cursor:pointer;transition:background var(--transition)}
+.toggle input:checked+.toggle-track{background:var(--amber)}
+.toggle-thumb{position:absolute;top:2px;left:2px;width:20px;height:20px;background:#fff;border-radius:50%;transition:transform var(--transition);box-shadow:0 1px 4px rgba(0,0,0,0.3);pointer-events:none}
+.toggle input:checked~.toggle-thumb{transform:translateX(20px)}
+/* Slider */
+.slider-wrap{flex:1;max-width:140px;min-width:80px}
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:6px;border-radius:3px;background:rgba(255,255,255,0.1);outline:none;cursor:pointer}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;background:var(--amber);cursor:pointer;box-shadow:0 0 6px rgba(245,166,35,0.4)}
+input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;background:var(--amber);cursor:pointer;border:none}
+/* Activity panel */
+.activity-section{margin-top:24px}
+.activity-header{display:flex;align-items:center;justify-content:space-between;padding:12px 0;cursor:pointer;user-select:none}
+.activity-header h3{font-size:0.95rem;font-weight:600;display:flex;align-items:center;gap:8px}
+.activity-header .chevron{transition:transform var(--transition);font-size:0.7rem;color:var(--text-muted)}
+.activity-header .chevron.collapsed{transform:rotate(-90deg)}
+.activity-body{max-height:300px;overflow-y:auto;border-radius:var(--radius);background:var(--glass);border:1px solid var(--glass-border);scrollbar-width:thin;scrollbar-color:rgba(255,255,255,0.1) transparent}
+.activity-body.collapsed{display:none}
+.activity-body::-webkit-scrollbar{width:6px}
+.activity-body::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.1);border-radius:3px}
+table{width:100%;border-collapse:collapse;font-size:0.8rem}
+th{text-align:left;padding:8px 12px;font-weight:600;color:var(--text-muted);font-size:0.72rem;text-transform:uppercase;letter-spacing:0.06em;border-bottom:1px solid var(--glass-border);position:sticky;top:0;background:var(--card)}
+td{padding:6px 12px;border-bottom:1px solid rgba(255,255,255,0.03)}
+.badge{display:inline-block;padding:1px 7px;border-radius:4px;font-size:0.68rem;font-weight:600}
+.badge-claude{background:rgba(52,152,219,0.2);color:var(--blue)}
+.badge-dashboard{background:var(--amber-dim);color:var(--amber)}
+.badge-switch{background:rgba(46,204,113,0.15);color:var(--green)}
+.badge-timer{background:rgba(155,89,182,0.2);color:var(--purple)}
+.badge-poll{background:rgba(255,255,255,0.06);color:var(--text-muted)}
+.badge-unknown{background:rgba(255,255,255,0.06);color:var(--text-muted)}
+.empty-state{text-align:center;padding:40px 20px;color:var(--text-muted);font-size:0.9rem}
+@media(max-width:639px){.topbar-title span.full{display:none}.topbar-title span.short{display:inline}.btn-scene{padding:8px 14px;font-size:0.8rem}}
+@media(min-width:640px){.topbar-title span.short{display:none}}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-title">
+    <span class="status-dot" id="statusDot"></span>
+    <span class="full">lights.hiebel.ai</span>
+    <span class="short">Lights</span>
+  </div>
+  <div class="topbar-actions">
+    <button class="btn btn-on" onclick="controlAll('on')">All On</button>
+    <button class="btn btn-off" onclick="controlAll('off')">All Off</button>
+  </div>
+</div>
+
+<div class="scenes" id="scenes">
+  <button class="btn btn-scene" onclick="sceneGoodMorning()"><span class="scene-icon">☀️</span>Good Morning</button>
+  <button class="btn btn-scene" onclick="sceneMovieNight()"><span class="scene-icon">🎬</span>Movie Night</button>
+  <button class="btn btn-scene" onclick="sceneBedtime()"><span class="scene-icon">🌙</span>Bedtime</button>
+  <button class="btn btn-scene" onclick="controlAll('off')"><span class="scene-icon">⬛</span>All Off</button>
+</div>
+
+<div class="container">
+  <div class="grid" id="roomGrid"></div>
+  <div class="activity-section">
+    <div class="activity-header" onclick="toggleActivity()">
+      <h3><span class="chevron" id="activityChevron">▼</span> Recent Activity</h3>
+    </div>
+    <div class="activity-body" id="activityBody">
+      <table>
+        <thead><tr><th>Time</th><th>Device</th><th>Event</th><th>Source</th></tr></thead>
+        <tbody id="activityTable"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+const ROOMS = [
+  {name:"Great Room", devices:["Great Room","Spot Lights"]},
+  {name:"Master Bedroom", devices:["Master Bedroom Main","Master Lamp 1","Master Lamp 2"]},
+  {name:"Upstairs", devices:["Bonus Room","Upstairs Hallway"]},
+  {name:"Kids' Rooms", devices:["Grant's Bedroom","Jack's Bedroom","Jenna's Bedroom"]},
+  {name:"Grant's Bathroom", devices:["Grant Bathroom Vanity","Grant Bathroom Main"]},
+  {name:"Outdoor", devices:["Deck Lights","Spot Lights"]},
+  {name:"WiZ Lights", devices:[]}
+];
+
+let deviceMap = {};
+let collapsed = {};
+let activityCollapsed = false;
+let pendingControls = new Set();
+
+const headers = {"X-Source":"dashboard"};
+
+async function apiFetch(url){
+  const r = await fetch(url, {headers});
+  if(!r.ok) throw new Error(r.status);
+  return r.json();
+}
+
+async function fetchStatus(){
+  try{
+    const data = await apiFetch("/api/status");
+    document.getElementById("statusDot").classList.add("connected");
+    deviceMap = {};
+    (data.devices||[]).forEach(d => deviceMap[d.label||d.id] = d);
+    renderRooms(data);
+  } catch(e){
+    document.getElementById("statusDot").classList.remove("connected");
+  }
+}
+
+async function fetchEvents(){
+  try{
+    const data = await apiFetch("/api/events?hours=24&limit=20");
+    renderEvents(data.events||[]);
+  } catch(e){}
+}
+
+function renderRooms(data){
+  const grid = document.getElementById("roomGrid");
+  const rooms = [...ROOMS];
+  // Populate WiZ room dynamically
+  const wizRoom = rooms.find(r=>r.name==="WiZ Lights");
+  const knownDevices = new Set();
+  rooms.forEach(r=>{if(r.name!=="WiZ Lights") r.devices.forEach(d=>knownDevices.add(d))});
+  wizRoom.devices = Object.keys(deviceMap).filter(l=>deviceMap[l].type==="wiz");
+
+  let html = "";
+  rooms.forEach((room,ri)=>{
+    const devices = room.devices.map(name=>deviceMap[name]).filter(Boolean);
+    // Deduplicate by id
+    const seen = new Set();
+    const uniq = [];
+    devices.forEach(d=>{if(!seen.has(d.id)){seen.add(d.id);uniq.push(d)}});
+    if(uniq.length===0 && room.name!=="WiZ Lights") return;
+
+    const anyOn = uniq.some(d=>d.on);
+    const anyOffline = uniq.some(d=>d.error);
+    const isCollapsed = collapsed[room.name]||false;
+    const cls = [anyOn?"has-on":"",anyOffline?"has-offline":""].filter(Boolean).join(" ");
+
+    html += `<div class="card ${cls}">
+      <div class="card-header" onclick="toggleRoom('${room.name}')">
+        <div class="room-name"><span class="chevron ${isCollapsed?'collapsed':''}">▼</span>${room.name}</div>
+        <div class="room-controls" onclick="event.stopPropagation()">
+          <button class="btn btn-on" onclick="controlRoom('${room.name}','on')">On</button>
+          <button class="btn btn-off" onclick="controlRoom('${room.name}','off')">Off</button>
+        </div>
+      </div>
+      <div class="card-body ${isCollapsed?'collapsed':''}" ${!isCollapsed?`style="max-height:${uniq.length*60+20}px"`:''}>`;
+
+    uniq.forEach(d=>{
+      const hasDim = d.features && (d.features.includes("dimmer")||d.features.includes("rgb")||d.features.includes("dimmable"));
+      const loading = pendingControls.has(d.id);
+      const offlineCls = d.error?"offline":"";
+      const br = d.brightness!=null?d.brightness:(d.on?100:0);
+
+      html += `<div class="device-row ${loading?'loading':''} ${offlineCls}">
+        <label class="toggle">
+          <input type="checkbox" ${d.on?'checked':''} onchange="toggleDevice('${d.label||d.id}','${d.id}',this.checked)">
+          <span class="toggle-track"></span>
+          <span class="toggle-thumb"></span>
+        </label>
+        <span class="device-label">${d.label||d.id}<span class="device-type">${d.type||''}</span></span>`;
+      if(hasDim){
+        html += `<div class="slider-wrap">
+          <input type="range" min="0" max="100" value="${br}"
+            oninput="updateBrVal(this)"
+            onchange="setBrightness('${d.label||d.id}','${d.id}',this.value)">
+        </div>
+        <span class="brightness-val" id="br-${d.id}">${br}%</span>`;
+      }
+      html += `</div>`;
+    });
+
+    html += `</div></div>`;
+  });
+
+  if(!html) html = `<div class="empty-state">No devices found. Check API connection.</div>`;
+  grid.innerHTML = html;
+}
+
+function renderEvents(events){
+  const tbody = document.getElementById("activityTable");
+  if(!events.length){
+    tbody.innerHTML = `<tr><td colspan="4" style="text-align:center;color:var(--text-muted);padding:20px">No recent events</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = events.map(e=>{
+    const src = e.source||"unknown";
+    const badgeCls = {claude:"badge-claude",dashboard:"badge-dashboard",switch:"badge-switch",caseta:"badge-switch",timer:"badge-timer",poll:"badge-poll"}[src]||"badge-unknown";
+    return `<tr>
+      <td>${timeAgo(e.timestamp)}</td>
+      <td>${e.device||'-'}</td>
+      <td>${e.event||'-'}${e.brightness!=null?' ('+e.brightness+'%)':''}</td>
+      <td><span class="badge ${badgeCls}">${src}</span></td>
+    </tr>`;
+  }).join("");
+}
+
+function timeAgo(ts){
+  if(!ts) return "-";
+  const diff = (Date.now() - new Date(ts).getTime())/1000;
+  if(diff<60) return Math.floor(diff)+"s ago";
+  if(diff<3600) return Math.floor(diff/60)+"m ago";
+  if(diff<86400) return Math.floor(diff/3600)+"h ago";
+  return Math.floor(diff/86400)+"d ago";
+}
+
+function updateBrVal(el){
+  const row = el.closest(".device-row");
+  const span = row.querySelector(".brightness-val");
+  if(span) span.textContent = el.value+"%";
+}
+
+async function sendControl(params, deviceId){
+  if(deviceId) pendingControls.add(deviceId);
+  renderRooms({devices:Object.values(deviceMap)});
+  try{
+    const qs = Object.entries(params).map(([k,v])=>k+"="+encodeURIComponent(v)).join("&");
+    await apiFetch("/api/control?"+qs);
+  } catch(e){}
+  if(deviceId) setTimeout(()=>pendingControls.delete(deviceId),600);
+  setTimeout(fetchStatus, 500);
+}
+
+function toggleDevice(name, id, on){
+  sendControl({device:name, action:on?"on":"off"}, id);
+}
+
+function setBrightness(name, id, val){
+  sendControl({device:name, action:"on", brightness:val}, id);
+}
+
+function controlAll(action){
+  sendControl({device:"all", action});
+}
+
+function controlRoom(roomName, action){
+  const room = ROOMS.find(r=>r.name===roomName);
+  if(!room) return;
+  const devices = room.devices.filter(n=>deviceMap[n]);
+  devices.forEach(n=>{
+    sendControl({device:n, action}, deviceMap[n]?.id);
+  });
+}
+
+function toggleRoom(name){
+  collapsed[name] = !collapsed[name];
+  renderRooms({devices:Object.values(deviceMap)});
+}
+
+function toggleActivity(){
+  activityCollapsed = !activityCollapsed;
+  document.getElementById("activityBody").classList.toggle("collapsed", activityCollapsed);
+  document.getElementById("activityChevron").classList.toggle("collapsed", activityCollapsed);
+}
+
+// Scenes
+function sceneGoodMorning(){
+  Object.values(deviceMap).forEach(d=>{
+    const hasDim = d.features&&(d.features.includes("dimmer")||d.features.includes("dimmable")||d.features.includes("rgb"));
+    if(hasDim) sendControl({device:d.label||d.id, action:"on", brightness:80}, d.id);
+    else sendControl({device:d.label||d.id, action:"on"}, d.id);
+  });
+}
+function sceneMovieNight(){
+  Object.values(deviceMap).forEach(d=>{
+    const name = d.label||d.id;
+    if(name==="Great Room"){
+      sendControl({device:name, action:"on", brightness:20}, d.id);
+    } else {
+      sendControl({device:name, action:"off"}, d.id);
+    }
+  });
+}
+function sceneBedtime(){
+  Object.values(deviceMap).forEach(d=>{
+    const name = d.label||d.id;
+    if(name==="Master Bedroom Main"||name==="Master Lamp 1"||name==="Master Lamp 2"){
+      sendControl({device:name, action:"on", brightness:30}, d.id);
+    } else {
+      sendControl({device:name, action:"off"}, d.id);
+    }
+  });
+}
+
+// Init
+fetchStatus();
+fetchEvents();
+setInterval(fetchStatus, 10000);
+setInterval(fetchEvents, 15000);
+</script>
+</body>
+</html>

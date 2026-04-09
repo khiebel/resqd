@@ -135,6 +135,22 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/users", get(admin::list_users))
         .route("/admin/rings", get(admin::list_rings))
         .route("/admin/stats", get(admin::stats))
+        .route("/admin/audit", get(admin::audit))
+        .route("/admin/security", get(admin::security))
+        .route("/admin/metrics", get(admin::metrics))
+        .route("/admin/estate", get(admin::estate))
+        .route(
+            "/admin/users/{email}/disable",
+            post(admin::disable_user),
+        )
+        .route(
+            "/admin/users/{email}/enable",
+            post(admin::enable_user),
+        )
+        .route(
+            "/admin/users/{email}/reset-quota",
+            post(admin::reset_quota),
+        )
         .route(
             "/admin/rings/{ring_id}/unlock-executor/{email}",
             post(admin::unlock_executor),
@@ -143,10 +159,60 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            origin_secret_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             geo_block_middleware,
         ))
         .layer(cors)
         .with_state(state)
+}
+
+/// Reject requests that bypass the Cloudflare Worker.
+///
+/// When `RESQD_ORIGIN_SECRET` is set, every request must carry a matching
+/// `x-origin-secret` header. The Worker injects this before forwarding;
+/// direct-to-API-Gateway callers won't have it. OPTIONS (CORS preflight)
+/// and /health are exempt so the browser and Lambda warmup probes still
+/// work.
+pub async fn origin_secret_middleware(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(ref expected) = state.config.origin_secret else {
+        // No secret configured — allow everything (local dev / tests).
+        return next.run(req).await;
+    };
+
+    // Always allow preflight and health.
+    if req.method() == Method::OPTIONS || req.uri().path() == "/health" {
+        return next.run(req).await;
+    }
+
+    let provided = req
+        .headers()
+        .get("x-origin-secret")
+        .and_then(|v| v.to_str().ok());
+
+    match provided {
+        Some(v) if v == expected.as_str() => next.run(req).await,
+        _ => {
+            warn!(
+                path = %req.uri().path(),
+                "rejected request: missing or invalid x-origin-secret"
+            );
+            (
+                StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({
+                    "error": "Forbidden",
+                    "code": "origin_bypass",
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Reject requests from countries on the block list.

@@ -39,6 +39,10 @@ pub struct AppConfig {
     /// documented in `docs/JURISDICTION.md`. A real CF dashboard rule
     /// should sit in front of this for defence-in-depth.
     pub blocked_countries: Vec<String>,
+    /// Shared secret the Cloudflare Worker injects as `x-origin-secret`.
+    /// If set, requests without a matching header are rejected with 403.
+    /// This prevents direct-to-API-Gateway access that bypasses CF Access.
+    pub origin_secret: Option<String>,
 }
 
 impl AppConfig {
@@ -83,6 +87,8 @@ impl AppConfig {
             })
             .unwrap_or_default();
 
+        let origin_secret = std::env::var("RESQD_ORIGIN_SECRET").ok().filter(|s| !s.is_empty());
+
         Ok(Self {
             s3_bucket,
             gcs_bucket,
@@ -91,6 +97,7 @@ impl AppConfig {
             auth_enabled,
             auth,
             blocked_countries,
+            origin_secret,
         })
     }
 }
@@ -109,6 +116,10 @@ pub struct AppState {
     /// when `auth_enabled = false`. Handlers that need auth must check
     /// this and return 400/401.
     pub auth: Option<AuthState>,
+    /// CloudWatch client for metrics endpoint.
+    pub cloudwatch: aws_sdk_cloudwatch::Client,
+    /// S3 client for admin metrics (vault object stats).
+    pub s3_admin: aws_sdk_s3::Client,
 }
 
 impl AppState {
@@ -171,12 +182,19 @@ impl AppState {
             None
         };
 
+        // Admin-only AWS clients — reuse the default credential chain.
+        let aws_conf = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let cloudwatch = aws_sdk_cloudwatch::Client::new(&aws_conf);
+        let s3_admin = aws_sdk_s3::Client::new(&aws_conf);
+
         Ok(Self {
             config,
             vault,
             s3: s3_concrete,
             chain,
             auth,
+            cloudwatch,
+            s3_admin,
         })
     }
 }
