@@ -7,12 +7,15 @@ import {
   loginWithPasskeyConditional,
   isPasskeySupported,
   fetchMe,
+  loadMasterKey,
+  reauthForMasterKey,
 } from "../lib/passkey";
 
 type State =
   | { phase: "idle" }
   | { phase: "checking" }
   | { phase: "working" }
+  | { phase: "unlock" }
   | { phase: "done" }
   | { phase: "error"; message: string };
 
@@ -36,7 +39,13 @@ export default function LoginPage() {
       }
       const me = await fetchMe();
       if (me) {
-        window.location.href = "/vault/";
+        if (loadMasterKey()) {
+          window.location.href = "/vault/";
+          return;
+        }
+        // Valid session but no master key (sessionStorage cleared).
+        // Show inline unlock prompt instead of redirecting to vault.
+        setState({ phase: "unlock" });
         return;
       }
       setState({ phase: "idle" });
@@ -49,8 +58,16 @@ export default function LoginPage() {
       // typed-email flow.
       const user = await loginWithPasskeyConditional(controller.signal);
       if (user) {
-        setState({ phase: "done" });
-        window.location.href = "/vault/";
+        if (loadMasterKey()) {
+          setState({ phase: "done" });
+          window.location.href = "/vault/";
+        } else {
+          setState({
+            phase: "error",
+            message:
+              "Signed in, but your browser does not support the PRF extension needed to derive your encryption key. Use Chrome or Safari on a Mac/PC — iOS does not support PRF yet.",
+          });
+        }
       }
     })();
 
@@ -67,6 +84,14 @@ export default function LoginPage() {
     setState({ phase: "working" });
     try {
       await loginWithPasskey(email);
+      if (!loadMasterKey()) {
+        setState({
+          phase: "error",
+          message:
+            "Signed in, but your browser does not support the PRF extension needed to derive your encryption key. Use Chrome or Safari on a Mac/PC — iOS does not support PRF yet.",
+        });
+        return;
+      }
       setState({ phase: "done" });
       setTimeout(() => {
         window.location.href = "/vault/";
@@ -78,6 +103,47 @@ export default function LoginPage() {
       });
     }
   };
+
+  const onUnlock = async () => {
+    setState({ phase: "working" });
+    try {
+      const ok = await reauthForMasterKey();
+      if (ok) {
+        setState({ phase: "done" });
+        setTimeout(() => {
+          window.location.href = "/vault/";
+        }, 400);
+      } else {
+        setState({
+          phase: "error",
+          message: "Could not unlock — try signing in again.",
+        });
+      }
+    } catch (err) {
+      setState({
+        phase: "error",
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+
+  if (state.phase === "unlock") {
+    return (
+      <main className="mx-auto max-w-md px-6 py-16 text-slate-100">
+        <h1 className="text-3xl font-bold mb-2">Unlock your vault</h1>
+        <p className="text-sm text-slate-400 mb-8">
+          Your session is active but your encryption key needs to be re-derived.
+          Tap below to authenticate with Touch ID.
+        </p>
+        <button
+          onClick={onUnlock}
+          className="w-full rounded-lg bg-amber-500 text-slate-900 font-semibold px-5 py-3 text-sm"
+        >
+          Unlock with Touch ID
+        </button>
+      </main>
+    );
+  }
 
   return (
     <main className="mx-auto max-w-md px-6 py-16 text-slate-100">

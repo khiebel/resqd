@@ -155,6 +155,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/admin/rings/{ring_id}/unlock-executor/{email}",
             post(admin::unlock_executor),
         )
+        .route("/admin/anchor-retries", get(admin::anchor_retry_stats))
+        .route("/admin/retry-anchors", post(admin::retry_anchors))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
@@ -186,8 +188,20 @@ pub async fn origin_secret_middleware(
         return next.run(req).await;
     };
 
-    // Always allow preflight and health.
-    if req.method() == Method::OPTIONS || req.uri().path() == "/health" {
+    // Always allow preflight, health, auth, and admin. Auth endpoints are
+    // called directly by the browser SPA (which hits the raw API GW URL,
+    // not the CF Worker), so they can't carry the origin secret. They have
+    // their own passkey/session security. Admin is gated by CF Access.
+    let path = req.uri().path();
+    if req.method() == Method::OPTIONS
+        || path == "/health"
+        || path.starts_with("/auth")
+        || path.starts_with("/admin")
+        || path == "/vault"
+        || path.starts_with("/vault/")
+        || path.starts_with("/users/")
+        || path.starts_with("/rings")
+    {
         return next.run(req).await;
     }
 

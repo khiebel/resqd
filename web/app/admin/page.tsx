@@ -67,14 +67,19 @@ interface SecuritySummary {
   generated_at: number;
 }
 
+interface MetricPoint {
+  timestamp: number;
+  value: number;
+}
+
 interface InfraMetrics {
   lambda: {
-    invocations: number[];
-    errors: number[];
-    duration: number[];
+    invocations: MetricPoint[];
+    errors: MetricPoint[];
+    duration: MetricPoint[];
   };
   dynamo: Record<string, { item_count: number; size_bytes: number }>;
-  s3: { object_count: number; total_bytes: number };
+  s3: { object_count: number; total_size_bytes: number };
   generated_at: number;
 }
 
@@ -848,22 +853,22 @@ export default function AdminPage() {
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
                 <StatCard
                   label="Total invocations"
-                  value={infra.lambda.invocations.reduce((a, b) => a + b, 0)}
-                  sub={`Hourly: ${infra.lambda.invocations.join(", ")}`}
+                  value={infra.lambda.invocations.reduce((a, b) => a + b.value, 0)}
+                  sub={`Hourly: ${infra.lambda.invocations.map((p) => p.value).join(", ")}`}
                 />
                 <StatCard
                   label="Total errors"
-                  value={infra.lambda.errors.reduce((a, b) => a + b, 0)}
-                  sub={`Hourly: ${infra.lambda.errors.join(", ")}`}
+                  value={infra.lambda.errors.reduce((a, b) => a + b.value, 0)}
+                  sub={`Hourly: ${infra.lambda.errors.map((p) => p.value).join(", ")}`}
                 />
                 <StatCard
                   label="Avg duration"
                   value={
                     infra.lambda.duration.length > 0
-                      ? `${Math.round(infra.lambda.duration.reduce((a, b) => a + b, 0) / infra.lambda.duration.length)}ms`
+                      ? `${Math.round(infra.lambda.duration.reduce((a, b) => a + b.value, 0) / infra.lambda.duration.length)}ms`
                       : "\u2014"
                   }
-                  sub={`Hourly: ${infra.lambda.duration.map((d) => `${Math.round(d)}ms`).join(", ")}`}
+                  sub={`Hourly: ${infra.lambda.duration.map((p) => `${Math.round(p.value)}ms`).join(", ")}`}
                 />
               </div>
 
@@ -889,7 +894,7 @@ export default function AdminPage() {
                 />
                 <StatCard
                   label="Total size"
-                  value={formatBytes(infra.s3.total_bytes)}
+                  value={formatBytes(infra.s3.total_size_bytes)}
                 />
               </div>
             </>

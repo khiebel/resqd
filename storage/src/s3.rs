@@ -128,11 +128,17 @@ impl ObjectStore for S3Store {
             .send()
             .await
             .map_err(|e| {
-                let s = format!("{e}");
-                if s.contains("NoSuchKey") || s.contains("NotFound") {
+                if e.as_service_error()
+                    .map_or(false, |se| se.is_no_such_key())
+                {
                     StorageError::NotFound(key.to_string())
                 } else {
-                    StorageError::S3(format!("get {key}: {e}"))
+                    let s = format!("{e}");
+                    if s.contains("NoSuchKey") || s.contains("NotFound") {
+                        StorageError::NotFound(key.to_string())
+                    } else {
+                        StorageError::S3(format!("get {key}: {e}"))
+                    }
                 }
             })?;
 

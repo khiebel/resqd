@@ -37,6 +37,8 @@ import {
   getCrypto,
 } from "./resqdCrypto";
 import { bytesToB64u, loadMasterKey, loadX25519Identity } from "./passkey";
+import { entropyToMnemonic } from "@scure/bip39";
+import { wordlist } from "@scure/bip39/wordlists/english.js";
 
 /** Recovery Kit format version currently emitted. */
 export const RECOVERY_KIT_VERSION = 1;
@@ -104,6 +106,8 @@ export interface RecoveryKit {
      *  master key in plaintext inside it — the user is responsible
      *  for storing the kit itself somewhere safe. */
     master_key_b64: string;
+    /** BIP-39 mnemonic (24 words) encoding the master key for paper backup. */
+    master_key_mnemonic: string;
     x25519_pubkey_b64: string;
     x25519_privkey_b64: string;
   };
@@ -269,6 +273,7 @@ export async function exportRecoveryKit(
       user_id: me.user_id,
       email: me.email,
       master_key_b64: bytesToB64u(masterKey),
+      master_key_mnemonic: entropyToMnemonic(masterKey, wordlist),
       x25519_pubkey_b64: ident.pubB64,
       x25519_privkey_b64: ident.privB64,
     },

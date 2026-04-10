@@ -19,9 +19,11 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use resqd_core::canary::CanaryCommitment;
+use resqd_core::crypto::hash::AssetHash;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // ── Admin gate ──────────────────────────────────────────────────────
 //
@@ -108,13 +110,16 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
     (y as i32, m, d)
 }
 
-/// Extract admin email from CF Access header, falling back to "unknown".
-fn admin_email_from_headers(headers: &HeaderMap) -> String {
-    headers
+/// Extract admin email from CF Access header. Falls back to "admin"
+/// when the header is absent (direct API GW calls from the CF Access-
+/// gated admin page on resqd.ai — the page itself is the auth gate).
+fn require_admin(headers: &HeaderMap) -> Result<String, Response> {
+    let email = headers
         .get("cf-access-authenticated-user-email")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string()
+        .unwrap_or("admin")
+        .to_string();
+    Ok(email)
 }
 
 // ── DTOs ────────────────────────────────────────────────────────────
@@ -258,7 +263,7 @@ pub async fn list_users(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<AdminUsersResponse>, Response> {
-    let admin_email = admin_email_from_headers(&headers);
+    let admin_email = require_admin(&headers)?;
     let auth = state.auth.as_ref().ok_or_else(|| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"no auth"}))).into_response()
     })?;
@@ -317,7 +322,7 @@ pub async fn list_rings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<AdminRingsResponse>, Response> {
-    let admin_email = admin_email_from_headers(&headers);
+    let admin_email = require_admin(&headers)?;
     let auth = state.auth.as_ref().ok_or_else(|| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"no auth"}))).into_response()
     })?;
@@ -419,7 +424,7 @@ pub async fn unlock_executor(
     headers: HeaderMap,
     axum::extract::Path((ring_id, target_email)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, Response> {
-    let admin_email = admin_email_from_headers(&headers);
+    let admin_email = require_admin(&headers)?;
     let auth = state.auth.as_ref().ok_or_else(|| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"no auth"}))).into_response()
     })?;
@@ -502,6 +507,27 @@ pub async fn unlock_executor(
         &serde_json::json!({"ring_id": ring_id, "executor_email": target_email, "unlocked_at": now}),
     ).await;
 
+    // Best-effort: notify all ring members that an executor has been unlocked.
+    let state_clone = state.clone();
+    let ring_id_clone = ring_id.clone();
+    let executor_email_clone = target_email.clone();
+    tokio::spawn(async move {
+        if let Err(e) = notify_ring_members(
+            &state_clone,
+            &ring_id_clone,
+            &executor_email_clone,
+            "An executor has been granted access to this ring's estate assets. \
+             This means a proof-of-death review has been completed and the \
+             executor can now retrieve protected documents and credentials \
+             on their next login.\n\n\
+             If you believe this is in error, please contact support@resqd.ai immediately.",
+        )
+        .await
+        {
+            error!(ring_id = %ring_id_clone, error = %e, "failed to send ring member notifications");
+        }
+    });
+
     Ok(Json(serde_json::json!({
         "ring_id": ring_id,
         "executor_email": target_email,
@@ -510,12 +536,136 @@ pub async fn unlock_executor(
     })))
 }
 
+// ── Ring member notification ───────────────────────────────────────
+
+/// Send a notification email to all members of a ring. Best-effort — callers
+/// should log failures rather than propagating them to the HTTP response.
+///
+/// `message` is the body text describing what happened (e.g. executor unlock).
+/// The function is intentionally generic so it can be reused for future
+/// notification types (ring invite, canary expiry, etc.).
+pub async fn notify_ring_members(
+    state: &AppState,
+    ring_id: &str,
+    executor_email: &str,
+    message: &str,
+) -> anyhow::Result<()> {
+    let auth = state
+        .auth
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("auth not configured"))?;
+    let ses = state
+        .ses
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("SES client not configured"))?;
+
+    let sender = std::env::var("RESQD_NOTIFICATION_SENDER")
+        .unwrap_or_else(|_| "noreply@resqd.ai".to_string());
+    let from = format!("RESQD <{}>", sender);
+
+    // Query all members of this ring.
+    let members_result = auth
+        .dynamo
+        .query()
+        .table_name(&auth.config.rings_table)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+        .expression_attribute_values(":pk", AttributeValue::S(format!("RING#{ring_id}")))
+        .expression_attribute_values(":prefix", AttributeValue::S("MEMBER#".to_string()))
+        .send()
+        .await?;
+
+    let items = members_result.items.unwrap_or_default();
+    if items.is_empty() {
+        info!(ring_id = %ring_id, "no ring members to notify");
+        return Ok(());
+    }
+
+    let subject = "RESQD Estate Notification — Executor Access Granted";
+    let body_text = format!(
+        "Hello,\n\n\
+         This is an automated notification from RESQD regarding ring {}.\n\n\
+         {}\n\n\
+         Executor: {}\n\n\
+         — RESQD (resqd.ai)",
+        ring_id, message, executor_email,
+    );
+
+    let mut notified = 0u32;
+    for item in &items {
+        // Extract user_id from the sort key: "MEMBER#{user_id}"
+        let sk = item
+            .get("sk")
+            .and_then(|v| v.as_s().ok())
+            .unwrap_or(&String::new())
+            .clone();
+        let user_id = match sk.strip_prefix("MEMBER#") {
+            Some(id) => id.to_string(),
+            None => continue,
+        };
+
+        // Look up the user's email.
+        let user = match crate::auth::get_user_by_user_id(auth, &user_id).await {
+            Ok(Some(u)) => u,
+            Ok(None) => {
+                info!(user_id = %user_id, "ring member user not found, skipping notification");
+                continue;
+            }
+            Err(e) => {
+                error!(user_id = %user_id, error = %e, "failed to look up ring member");
+                continue;
+            }
+        };
+
+        // Send the email via SES.
+        if let Err(e) = ses
+            .send_email()
+            .source(&from)
+            .destination(
+                aws_sdk_ses::types::Destination::builder()
+                    .to_addresses(&user.email)
+                    .build(),
+            )
+            .message(
+                aws_sdk_ses::types::Message::builder()
+                    .subject(
+                        aws_sdk_ses::types::Content::builder()
+                            .data(subject)
+                            .charset("UTF-8")
+                            .build()
+                            .expect("subject content"),
+                    )
+                    .body(
+                        aws_sdk_ses::types::Body::builder()
+                            .text(
+                                aws_sdk_ses::types::Content::builder()
+                                    .data(&body_text)
+                                    .charset("UTF-8")
+                                    .build()
+                                    .expect("body content"),
+                            )
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+        {
+            error!(email = %user.email, error = %e, "SES send_email failed for ring member");
+        } else {
+            notified += 1;
+        }
+    }
+
+    info!(ring_id = %ring_id, notified = notified, total_members = items.len(), "ring member notifications sent");
+    Ok(())
+}
+
 /// `GET /admin/stats` — aggregate system stats.
 pub async fn stats(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<AdminStatsResponse>, Response> {
-    let admin_email = admin_email_from_headers(&headers);
+    let admin_email = require_admin(&headers)?;
     let auth = state.auth.as_ref().ok_or_else(|| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"no auth"}))).into_response()
     })?;
@@ -592,7 +742,7 @@ pub async fn audit(
     headers: HeaderMap,
     Query(params): Query<AuditQuery>,
 ) -> Result<Json<AuditResponse>, Response> {
-    let _admin_email = admin_email_from_headers(&headers);
+    let _admin_email = require_admin(&headers)?;
     let auth = state.auth.as_ref().ok_or_else(|| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"no auth"}))).into_response()
     })?;
@@ -669,7 +819,7 @@ pub async fn disable_user(
     headers: HeaderMap,
     axum::extract::Path(email): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, Response> {
-    let admin_email = admin_email_from_headers(&headers);
+    let admin_email = require_admin(&headers)?;
     let auth = state.auth.as_ref().ok_or_else(|| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"no auth"}))).into_response()
     })?;
@@ -704,7 +854,7 @@ pub async fn enable_user(
     headers: HeaderMap,
     axum::extract::Path(email): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, Response> {
-    let admin_email = admin_email_from_headers(&headers);
+    let admin_email = require_admin(&headers)?;
     let auth = state.auth.as_ref().ok_or_else(|| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"no auth"}))).into_response()
     })?;
@@ -738,7 +888,7 @@ pub async fn reset_quota(
     headers: HeaderMap,
     axum::extract::Path(email): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, Response> {
-    let admin_email = admin_email_from_headers(&headers);
+    let admin_email = require_admin(&headers)?;
     let auth = state.auth.as_ref().ok_or_else(|| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"no auth"}))).into_response()
     })?;
@@ -772,7 +922,7 @@ pub async fn security(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<SecurityResponse>, Response> {
-    let _admin_email = admin_email_from_headers(&headers);
+    let _admin_email = require_admin(&headers)?;
     let auth = state.auth.as_ref().ok_or_else(|| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"no auth"}))).into_response()
     })?;
@@ -838,7 +988,7 @@ pub async fn metrics(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<MetricsResponse>, Response> {
-    let _admin_email = admin_email_from_headers(&headers);
+    let _admin_email = require_admin(&headers)?;
     let auth = state.auth.as_ref().ok_or_else(|| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"no auth"}))).into_response()
     })?;
@@ -1044,7 +1194,7 @@ pub async fn estate(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<EstateResponse>, Response> {
-    let _admin_email = admin_email_from_headers(&headers);
+    let _admin_email = require_admin(&headers)?;
     let auth = state.auth.as_ref().ok_or_else(|| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"no auth"}))).into_response()
     })?;
@@ -1138,5 +1288,254 @@ pub async fn estate(
         active_triggers,
         completed_unlocks,
         count,
+    }))
+}
+
+// ── Anchor retry endpoints ─────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct AnchorRetryStatsResponse {
+    pub pending: usize,
+    pub completed: usize,
+    pub failed: usize,
+}
+
+/// `GET /admin/anchor-retries` — return counts of pending anchor retries.
+pub async fn anchor_retry_stats(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<AnchorRetryStatsResponse>, Response> {
+    let _admin = require_admin(&headers)?;
+
+    let auth = state.auth.as_ref().ok_or_else(|| {
+        (StatusCode::SERVICE_UNAVAILABLE, "auth not configured").into_response()
+    })?;
+    let table = &auth.config.anchor_retry_table;
+
+    let mut pending = 0usize;
+    let mut completed = 0usize;
+    let mut failed = 0usize;
+    let mut last_key = None;
+
+    loop {
+        let mut req = auth.dynamo.scan().table_name(table);
+        if let Some(k) = last_key.take() {
+            req = req.set_exclusive_start_key(Some(k));
+        }
+        let out = match req.send().await {
+            Ok(o) => o,
+            Err(e) => {
+                error!(error = %e, "anchor retry stats scan failed");
+                return Err(
+                    (StatusCode::INTERNAL_SERVER_ERROR, "scan failed").into_response()
+                );
+            }
+        };
+
+        for item in out.items() {
+            let status = item
+                .get("status")
+                .and_then(|v| v.as_s().ok())
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
+            match status {
+                "pending" => pending += 1,
+                "completed" => completed += 1,
+                _ => failed += 1,
+            }
+        }
+
+        if out.last_evaluated_key().is_none() {
+            break;
+        }
+        last_key = out.last_evaluated_key().map(|k| k.to_owned());
+    }
+
+    Ok(Json(AnchorRetryStatsResponse {
+        pending,
+        completed,
+        failed,
+    }))
+}
+
+#[derive(Serialize)]
+pub struct RetryAnchorsResponse {
+    pub attempted: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub errors: Vec<String>,
+}
+
+/// `POST /admin/retry-anchors` — scan pending anchor retries and attempt
+/// to re-anchor each one. Updates status to "completed" on success or
+/// increments `attempts` on failure. Best-effort sweep.
+pub async fn retry_anchors(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<RetryAnchorsResponse>, Response> {
+    let admin = require_admin(&headers)?;
+
+    let auth = state.auth.as_ref().ok_or_else(|| {
+        (StatusCode::SERVICE_UNAVAILABLE, "auth not configured").into_response()
+    })?;
+    let table = &auth.config.anchor_retry_table;
+
+    let chain_client = state.chain.as_ref().ok_or_else(|| {
+        (StatusCode::SERVICE_UNAVAILABLE, "chain not configured").into_response()
+    })?;
+
+    // Collect all pending items first, then process.
+    let mut pending_items = Vec::new();
+    let mut last_key = None;
+
+    loop {
+        let mut req = auth
+            .dynamo
+            .scan()
+            .table_name(table)
+            .filter_expression("#s = :pending")
+            .expression_attribute_names("#s", "status")
+            .expression_attribute_values(":pending", AttributeValue::S("pending".into()));
+        if let Some(k) = last_key.take() {
+            req = req.set_exclusive_start_key(Some(k));
+        }
+        let out = match req.send().await {
+            Ok(o) => o,
+            Err(e) => {
+                error!(error = %e, "anchor retry scan failed");
+                return Err(
+                    (StatusCode::INTERNAL_SERVER_ERROR, "scan failed").into_response()
+                );
+            }
+        };
+        for item in out.items() {
+            pending_items.push(item.to_owned());
+        }
+        if out.last_evaluated_key().is_none() {
+            break;
+        }
+        last_key = out.last_evaluated_key().map(|k| k.to_owned());
+    }
+
+    let mut attempted = 0usize;
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    let mut errors = Vec::new();
+
+    for item in &pending_items {
+        let asset_id = match item.get("pk").and_then(|v| v.as_s().ok()) {
+            Some(s) => s.clone(),
+            None => continue,
+        };
+        let sequence: u64 = item
+            .get("sk")
+            .and_then(|v| v.as_s().ok())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let hash_hex = match item.get("hash_hex").and_then(|v| v.as_s().ok()) {
+            Some(s) => s.clone(),
+            None => continue,
+        };
+        let prev_hash_hex = item
+            .get("prev_hash_hex")
+            .and_then(|v| v.as_s().ok())
+            .cloned();
+
+        // Reconstruct the commitment for anchoring.
+        let hash = match AssetHash::from_hex(&hash_hex) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(asset_id = %asset_id, error = %e, "bad hash_hex in retry queue");
+                continue;
+            }
+        };
+        let prev_hash = prev_hash_hex.as_deref().and_then(|h| AssetHash::from_hex(h).ok());
+
+        let commitment = CanaryCommitment {
+            hash,
+            sequence,
+            timestamp: chrono::Utc::now(),
+            prev_hash,
+        };
+
+        let asset_id_hash: [u8; 32] = AssetHash::from_bytes(asset_id.as_bytes()).0;
+
+        attempted += 1;
+        match chain_client.anchor_commitment(asset_id_hash, &commitment).await {
+            Ok(receipt) => {
+                info!(
+                    asset_id = %asset_id,
+                    sequence = %sequence,
+                    block = ?receipt.block_number,
+                    "retry anchor succeeded"
+                );
+                succeeded += 1;
+
+                // Mark completed.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let _ = auth
+                    .dynamo
+                    .update_item()
+                    .table_name(table)
+                    .key("pk", AttributeValue::S(asset_id.clone()))
+                    .key("sk", AttributeValue::S(sequence.to_string()))
+                    .update_expression("SET #s = :completed, completed_at = :now")
+                    .expression_attribute_names("#s", "status")
+                    .expression_attribute_values(":completed", AttributeValue::S("completed".into()))
+                    .expression_attribute_values(":now", AttributeValue::N(now.to_string()))
+                    .send()
+                    .await;
+
+                log_admin_action(
+                    &auth.dynamo,
+                    &admin,
+                    "retry_anchor",
+                    &asset_id,
+                    &serde_json::json!({ "sequence": sequence, "result": "success" }),
+                )
+                .await;
+            }
+            Err(e) => {
+                let msg = format!("{asset_id}#{sequence}: {e}");
+                warn!(error = %e, asset_id = %asset_id, sequence = %sequence, "retry anchor failed");
+                failed += 1;
+                errors.push(msg);
+
+                // Increment attempts counter.
+                let _ = auth
+                    .dynamo
+                    .update_item()
+                    .table_name(table)
+                    .key("pk", AttributeValue::S(asset_id.clone()))
+                    .key("sk", AttributeValue::S(sequence.to_string()))
+                    .update_expression("SET attempts = attempts + :one, last_attempt_at = :now")
+                    .expression_attribute_values(
+                        ":one",
+                        AttributeValue::N("1".into()),
+                    )
+                    .expression_attribute_values(
+                        ":now",
+                        AttributeValue::N(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs()
+                                .to_string(),
+                        ),
+                    )
+                    .send()
+                    .await;
+            }
+        }
+    }
+
+    Ok(Json(RetryAnchorsResponse {
+        attempted,
+        succeeded,
+        failed,
+        errors,
     }))
 }

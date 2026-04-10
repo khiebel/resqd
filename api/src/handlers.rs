@@ -24,6 +24,44 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Queue a failed anchor for later retry. Best-effort — never fails the
+/// main request. Writes to the `resqd-anchor-retries` DynamoDB table so
+/// an admin can sweep and re-anchor later via `POST /admin/retry-anchors`.
+async fn queue_anchor_retry(
+    state: &AppState,
+    asset_id: &str,
+    sequence: u64,
+    hash_hex: &str,
+    prev_hash_hex: Option<&str>,
+) {
+    let Some(auth) = &state.auth else { return };
+    let table = &auth.config.anchor_retry_table;
+    let now = now_secs();
+    let expires_at = now + 7 * 24 * 3600; // 7-day TTL
+
+    let mut builder = auth
+        .dynamo
+        .put_item()
+        .table_name(table)
+        .item("pk", aws_sdk_dynamodb::types::AttributeValue::S(asset_id.to_string()))
+        .item("sk", aws_sdk_dynamodb::types::AttributeValue::S(sequence.to_string()))
+        .item("hash_hex", aws_sdk_dynamodb::types::AttributeValue::S(hash_hex.to_string()))
+        .item("created_at", aws_sdk_dynamodb::types::AttributeValue::N(now.to_string()))
+        .item("status", aws_sdk_dynamodb::types::AttributeValue::S("pending".to_string()))
+        .item("attempts", aws_sdk_dynamodb::types::AttributeValue::N("0".to_string()))
+        .item("expires_at", aws_sdk_dynamodb::types::AttributeValue::N(expires_at.to_string()));
+
+    if let Some(ph) = prev_hash_hex {
+        builder = builder.item("prev_hash_hex", aws_sdk_dynamodb::types::AttributeValue::S(ph.to_string()));
+    }
+
+    if let Err(e) = builder.send().await {
+        error!(error = %e, asset_id = %asset_id, sequence = %sequence, "failed to queue anchor retry");
+    } else {
+        info!(asset_id = %asset_id, sequence = %sequence, "queued anchor retry");
+    }
+}
+
 /// Owner sidecar key. Written on commit so the listing endpoint can
 /// enumerate a user's assets via `ListObjectsV2` with this prefix.
 fn owner_sidecar_key(user_id: &str, asset_id: &str) -> String {
@@ -512,10 +550,12 @@ pub async fn upload(
             }
             Err(e) => {
                 error!(error = %e, asset_id = %asset_id, "anchor failed");
-                // Don't fail the upload — log and continue. The chain
-                // state can be reconciled later. This is an explicit
-                // design tradeoff: prefer availability over consistency
-                // for the MVP. Revisit when we add an anchor retry queue.
+                // Don't fail the upload — log and continue. Queue for
+                // later retry via POST /admin/retry-anchors.
+                queue_anchor_retry(
+                    &state, &asset_id, initial.sequence,
+                    &initial.hash.to_hex(), None,
+                ).await;
                 false
             }
         }
@@ -537,9 +577,9 @@ pub async fn upload(
 /// The client erasure-codes its encrypted blob client-side via WASM,
 /// PUTs each shard to its slot, then calls `/vault/{id}/commit` with
 /// the original byte length to finalize.
-pub async fn init(State(state): State<Arc<AppState>>) -> ApiResult<Json<InitResponse>> {
+pub async fn init(State(state): State<Arc<AppState>>, user: AuthUser) -> ApiResult<Json<InitResponse>> {
     let asset_id = Uuid::new_v4().to_string();
-    info!(asset_id = %asset_id, "init sharded upload");
+    info!(asset_id = %asset_id, user_id = %user.user_id, "init sharded upload");
 
     let mut shards = Vec::with_capacity(TOTAL_SHARDS);
     for i in 0..TOTAL_SHARDS {
@@ -574,11 +614,11 @@ pub async fn init(State(state): State<Arc<AppState>>) -> ApiResult<Json<InitResp
 /// allowed for legacy/test flows.
 pub async fn commit(
     State(state): State<Arc<AppState>>,
-    user: Option<AuthUser>,
+    user: AuthUser,
     Path(asset_id): Path<String>,
     Json(req): Json<CommitRequest>,
 ) -> ApiResult<Json<CommitResponse>> {
-    info!(asset_id = %asset_id, original_len = req.original_len, owner = ?user.as_ref().map(|u| &u.user_id), "commit sharded upload");
+    info!(asset_id = %asset_id, original_len = req.original_len, owner = %user.user_id, "commit sharded upload");
 
     // Idempotency: if the manifest already exists, return the existing state
     // rather than re-creating the chain. Prevents double-anchoring on retries.
@@ -586,8 +626,8 @@ pub async fn commit(
         let manifest: AssetManifest = serde_json::from_slice(&existing)
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("decode manifest: {e}")))?;
         // If the existing manifest has an owner, only the owner can re-commit.
-        if let (Some(existing_owner), Some(authed)) = (&manifest.owner_id, &user) {
-            if existing_owner != &authed.user_id {
+        if let Some(existing_owner) = &manifest.owner_id {
+            if existing_owner != &user.user_id {
                 return Err(ApiError::NotFound);
             }
         }
@@ -619,12 +659,11 @@ pub async fn commit(
         }
     }
 
-    // Quota check. Only applies to authed commits — anonymous legacy
-    // uploads bypass it for compatibility with the pre-auth test data.
-    // This is done AFTER shard existence so a client can't burn someone
-    // else's upload slot by rejecting early.
-    if let (Some(u), Some(auth_state)) = (&user, state.auth.as_ref()) {
-        match crate::auth::try_consume_storage(auth_state, &u.email, req.original_len).await? {
+    // Quota check — reject if the upload would exceed the user's storage cap.
+    // Done AFTER shard existence so a client can't burn someone else's
+    // upload slot by rejecting early.
+    if let Some(auth_state) = state.auth.as_ref() {
+        match crate::auth::try_consume_storage(auth_state, &user.email, req.original_len).await? {
             ConsumeStorageResult::Ok => {}
             ConsumeStorageResult::Exceeded { used, cap, requested } => {
                 return Err(ApiError::QuotaExceeded { used, cap, requested });
@@ -641,11 +680,8 @@ pub async fn commit(
         let auth_state = state.auth.as_ref().ok_or(ApiError::Auth(
             crate::auth::AuthError::Unauthorized,
         ))?;
-        let caller = user.as_ref().ok_or(ApiError::Auth(
-            crate::auth::AuthError::Unauthorized,
-        ))?;
         let membership = crate::rings::get_caller_membership_pub(
-            auth_state, ring_id, &caller.user_id,
+            auth_state, ring_id, &user.user_id,
         )
         .await
         .map_err(|_| ApiError::NotFound)?
@@ -662,7 +698,7 @@ pub async fn commit(
                 "uploader_pubkey_x25519_b64 required when ring_id is present".into(),
             ),
         )?;
-        let caller_row = crate::auth::get_user_by_email(auth_state, &caller.email)
+        let caller_row = crate::auth::get_user_by_email(auth_state, &user.email)
             .await
             .map_err(ApiError::from)?
             .ok_or(ApiError::Internal(anyhow::anyhow!("caller missing")))?;
@@ -675,7 +711,7 @@ pub async fn commit(
     }
 
     // Build the manifest + canary chain sidecar.
-    let owner_id = user.as_ref().map(|u| u.user_id.clone());
+    let owner_id = Some(user.user_id.clone());
     let created_at = now_secs();
     let manifest = AssetManifest {
         mode: "sharded".into(),
@@ -751,7 +787,11 @@ pub async fn commit(
                 true
             }
             Err(e) => {
-                error!(error = %e, asset_id = %asset_id, "anchor failed");
+                error!(error = %e, asset_id = %asset_id, "anchor failed (commit)");
+                queue_anchor_retry(
+                    &state, &asset_id, initial.sequence,
+                    &initial.hash.to_hex(), None,
+                ).await;
                 false
             }
         }
@@ -811,6 +851,11 @@ pub async fn fetch(
         let asset_id_hash: [u8; 32] = AssetHash::from_bytes(asset_id.as_bytes()).0;
         if let Err(e) = client.anchor_commitment(asset_id_hash, &new_commitment).await {
             error!(error = %e, asset_id = %asset_id, "rotation anchor failed");
+            let prev = new_commitment.prev_hash.as_ref().map(|h| h.to_hex());
+            queue_anchor_retry(
+                &state, &asset_id, new_commitment.sequence,
+                &new_commitment.hash.to_hex(), prev.as_deref(),
+            ).await;
         }
     }
 

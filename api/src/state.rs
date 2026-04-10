@@ -120,6 +120,8 @@ pub struct AppState {
     pub cloudwatch: aws_sdk_cloudwatch::Client,
     /// S3 client for admin metrics (vault object stats).
     pub s3_admin: aws_sdk_s3::Client,
+    /// SES client for sending notification emails (best-effort).
+    pub ses: Option<aws_sdk_ses::Client>,
 }
 
 impl AppState {
@@ -186,6 +188,7 @@ impl AppState {
         let aws_conf = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let cloudwatch = aws_sdk_cloudwatch::Client::new(&aws_conf);
         let s3_admin = aws_sdk_s3::Client::new(&aws_conf);
+        let ses = Some(aws_sdk_ses::Client::new(&aws_conf));
 
         Ok(Self {
             config,
@@ -195,6 +198,7 @@ impl AppState {
             auth,
             cloudwatch,
             s3_admin,
+            ses,
         })
     }
 }

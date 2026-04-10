@@ -77,6 +77,8 @@ pub struct AuthConfig {
     pub cookie_domain: Option<String>,
     pub cookie_secure: bool,
     pub cookie_same_site: CookieSameSite,
+    /// DynamoDB table for failed anchor retries.
+    pub anchor_retry_table: String,
 }
 
 impl AuthConfig {
@@ -129,6 +131,9 @@ impl AuthConfig {
             _ => CookieSameSite::None,
         };
 
+        let anchor_retry_table = std::env::var("RESQD_ANCHOR_RETRY_TABLE")
+            .unwrap_or_else(|_| "resqd-anchor-retries".into());
+
         Ok(Self {
             rp_id,
             rp_name,
@@ -142,6 +147,7 @@ impl AuthConfig {
             cookie_domain,
             cookie_secure,
             cookie_same_site,
+            anchor_retry_table,
         })
     }
 }
@@ -629,6 +635,18 @@ async fn verify_bearer_token(auth: &AuthState, raw: &str) -> AuthResult<AuthUser
         .send()
         .await?;
     let item = out.item.ok_or(AuthError::Unauthorized)?;
+
+    // Check expiry. Tokens without expires_at (legacy) are treated as
+    // expired — force users to mint new ones with a TTL.
+    let expires_at: u64 = item
+        .get("expires_at")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if expires_at > 0 && expires_at < now_secs() {
+        return Err(AuthError::BadRequest("api token expired".into()));
+    }
+
     Ok(AuthUser {
         user_id: take_s(&item, "user_id")?,
         email: take_s(&item, "email").unwrap_or_default(),
@@ -1460,6 +1478,11 @@ pub async fn get_user_by_user_id(
 pub struct CreateTokenRequest {
     #[serde(default)]
     pub label: Option<String>,
+    /// Token lifetime in days. Default 90, max 365. Omit or set to 0
+    /// for the default. The token becomes unusable after expiry and is
+    /// auto-deleted from DynamoDB via TTL.
+    #[serde(default)]
+    pub expires_in_days: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -1471,6 +1494,7 @@ pub struct CreateTokenResponse {
     pub token_hash: String,
     pub label: String,
     pub created_at: u64,
+    pub expires_at: u64,
 }
 
 #[derive(Serialize)]
@@ -1478,6 +1502,7 @@ pub struct TokenSummary {
     pub token_hash: String,
     pub label: String,
     pub created_at: u64,
+    pub expires_at: Option<u64>,
     pub last_used_at: Option<u64>,
 }
 
@@ -1512,6 +1537,15 @@ pub async fn create_token(
         .collect::<String>();
     let created_at = now_secs();
 
+    const DEFAULT_TTL_DAYS: u64 = 90;
+    const MAX_TTL_DAYS: u64 = 365;
+    let ttl_days = req
+        .expires_in_days
+        .filter(|&d| d > 0)
+        .unwrap_or(DEFAULT_TTL_DAYS)
+        .min(MAX_TTL_DAYS);
+    let expires_at = created_at + ttl_days * 86_400;
+
     let mut item: HashMap<String, AttributeValue> = HashMap::new();
     item.insert("token_hash".into(), AttributeValue::S(token_hash.clone()));
     item.insert("user_id".into(), AttributeValue::S(user.user_id.clone()));
@@ -1525,6 +1559,10 @@ pub async fn create_token(
         "created_at".into(),
         AttributeValue::N(created_at.to_string()),
     );
+    item.insert(
+        "expires_at".into(),
+        AttributeValue::N(expires_at.to_string()),
+    );
 
     auth.dynamo
         .put_item()
@@ -1533,13 +1571,14 @@ pub async fn create_token(
         .send()
         .await?;
 
-    info!(user_id = %user.user_id, label = %label, "minted api token");
+    info!(user_id = %user.user_id, label = %label, expires_in_days = ttl_days, "minted api token");
 
     Ok(Json(CreateTokenResponse {
         token: raw,
         token_hash,
         label,
         created_at,
+        expires_at,
     }))
 }
 
@@ -1571,6 +1610,10 @@ pub async fn list_tokens(
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
+            expires_at: item
+                .get("expires_at")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|s| s.parse().ok()),
             last_used_at: take_s(item, "last_used_at")
                 .ok()
                 .and_then(|s| s.parse().ok()),

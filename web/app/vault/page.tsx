@@ -8,6 +8,7 @@ import {
   loadMasterKey,
   loadX25519Identity,
   ensureRingPrivkey,
+  reauthForMasterKey,
   logout,
   type SessionUser,
 } from "../lib/passkey";
@@ -465,11 +466,19 @@ export default function VaultPage() {
     [shareDialog],
   );
 
+  const [needsUnlock, setNeedsUnlock] = useState(false);
+  const [unlocking, setUnlocking] = useState(false);
+
   useEffect(() => {
     (async () => {
       const me = await fetchMe();
       if (!me) {
         window.location.href = "/login/";
+        return;
+      }
+      if (!loadMasterKey()) {
+        setUser(me);
+        setNeedsUnlock(true);
         return;
       }
       setUser(me);
@@ -571,6 +580,35 @@ export default function VaultPage() {
       });
     }
   };
+
+  if (needsUnlock) {
+    return (
+      <main className="mx-auto max-w-md px-6 py-16 text-slate-100">
+        <h1 className="text-3xl font-bold mb-2">Unlock your vault</h1>
+        <p className="text-sm text-slate-400 mb-8">
+          Your session is active but your encryption key needs to be re-derived.
+          Tap below to authenticate with Touch ID.
+        </p>
+        <button
+          onClick={async () => {
+            setUnlocking(true);
+            const ok = await reauthForMasterKey();
+            if (ok) {
+              setNeedsUnlock(false);
+              window.location.reload();
+            } else {
+              setUnlocking(false);
+              window.location.href = "/login/";
+            }
+          }}
+          disabled={unlocking}
+          className="w-full rounded-lg bg-amber-500 text-slate-900 font-semibold px-5 py-3 text-sm disabled:opacity-30"
+        >
+          {unlocking ? "Waiting for authenticator…" : "Unlock with Touch ID"}
+        </button>
+      </main>
+    );
+  }
 
   return (
     <main className="mx-auto max-w-3xl px-6 py-12 text-slate-100">

@@ -1360,6 +1360,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-ses"
+version = "1.100.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3a4b0c9cb3e35d4aa1e3504570df42dee50dd0b1911c6509d165be1a2286e9"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http 0.63.6",
+ "aws-smithy-json 0.62.5",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-sso"
 version = "1.97.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4839,9 +4864,11 @@ dependencies = [
  "aws-sdk-cloudwatch",
  "aws-sdk-dynamodb",
  "aws-sdk-s3",
+ "aws-sdk-ses",
  "axum",
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "futures",
  "http 1.4.0",
  "jsonwebtoken",

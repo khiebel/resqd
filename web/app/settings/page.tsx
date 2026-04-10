@@ -6,10 +6,13 @@ import { API_URL } from "../lib/resqdCrypto";
 import {
   fetchMe,
   loadMasterKey,
+  loadX25519Identity,
   bytesToB64u,
   type SessionUser,
 } from "../lib/passkey";
 import { exportRecoveryKit, type ExportProgress } from "../lib/recoveryKit";
+import { entropyToMnemonic } from "@scure/bip39";
+import { wordlist } from "@scure/bip39/wordlists/english.js";
 
 interface TokenSummary {
   token_hash: string;
@@ -44,7 +47,9 @@ export default function SettingsPage() {
   const [creating, setCreating] = useState(false);
   const [justCreated, setJustCreated] = useState<CreateTokenResponse | null>(null);
   const [masterKeyB64, setMasterKeyB64] = useState<string | null>(null);
+  const [x25519PrivB64, setX25519PrivB64] = useState<string | null>(null);
   const [keyVisible, setKeyVisible] = useState(false);
+  const [mnemonicVisible, setMnemonicVisible] = useState(false);
   const [kitProgress, setKitProgress] = useState<ExportProgress | null>(null);
   const [kitBusy, setKitBusy] = useState(false);
 
@@ -68,6 +73,8 @@ export default function SettingsPage() {
       setUser(me);
       const mk = loadMasterKey();
       if (mk) setMasterKeyB64(bytesToB64u(mk));
+      const ident = loadX25519Identity();
+      if (ident) setX25519PrivB64(ident.privB64);
       await refreshTokens();
       setLoading(false);
     })();
@@ -136,6 +143,7 @@ export default function SettingsPage() {
               RESQD_API_URL: API_URL,
               RESQD_API_TOKEN: token,
               ...(masterKey ? { RESQD_MASTER_KEY_B64: masterKey } : {}),
+              ...(x25519PrivB64 ? { RESQD_X25519_PRIVKEY_B64: x25519PrivB64 } : {}),
             },
           },
         },
@@ -329,12 +337,30 @@ export default function SettingsPage() {
             <code className="block bg-slate-950 border border-slate-800 rounded p-3 text-xs font-mono text-amber-300 break-all">
               {keyVisible ? masterKeyB64 : "•".repeat(masterKeyB64.length)}
             </code>
-            <button
-              onClick={() => copy(masterKeyB64)}
-              className="text-xs text-amber-400 hover:underline"
-            >
-              Copy master key
-            </button>
+            <div className="flex items-center gap-4">
+              <button
+                onClick={() => copy(masterKeyB64)}
+                className="text-xs text-amber-400 hover:underline"
+              >
+                Copy master key
+              </button>
+              <button
+                onClick={() => setMnemonicVisible(!mnemonicVisible)}
+                className="text-xs text-slate-400 hover:text-slate-200"
+              >
+                {mnemonicVisible ? "Hide 24 words" : "Show as 24 words"}
+              </button>
+            </div>
+            {mnemonicVisible && (
+              <div className="mt-2">
+                <span className="text-xs uppercase text-slate-500 tracking-wide block mb-1">
+                  BIP-39 Mnemonic (write these down)
+                </span>
+                <code className="block bg-slate-950 border border-slate-800 rounded p-3 text-xs font-mono text-green-300 leading-relaxed">
+                  {entropyToMnemonic(loadMasterKey()!, wordlist)}
+                </code>
+              </div>
+            )}
           </div>
         ) : (
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 text-sm text-slate-400">
@@ -346,6 +372,36 @@ export default function SettingsPage() {
           </div>
         )}
       </section>
+
+      {/* ─────────────── X25519 identity export ─────────────── */}
+
+      {x25519PrivB64 && (
+        <section className="mt-10">
+          <h2 className="text-xl font-semibold mb-1">X25519 identity</h2>
+          <p className="text-xs text-slate-500 mb-4">
+            Your X25519 private key, used for decrypting shared and ring-owned
+            assets. The MCP server needs this as{" "}
+            <code className="text-slate-400">RESQD_X25519_PRIVKEY_B64</code>{" "}
+            to read assets shared with you.
+          </p>
+          <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="text-xs uppercase text-slate-500 tracking-wide">
+                RESQD_X25519_PRIVKEY_B64
+              </span>
+            </div>
+            <code className="block bg-slate-950 border border-slate-800 rounded p-3 text-xs font-mono text-amber-300 break-all">
+              {"•".repeat(x25519PrivB64.length)}
+            </code>
+            <button
+              onClick={() => copy(x25519PrivB64)}
+              className="text-xs text-amber-400 hover:underline"
+            >
+              Copy X25519 private key
+            </button>
+          </div>
+        </section>
+      )}
 
       {/* ─────────────── Recovery Kit ─────────────── */}
 

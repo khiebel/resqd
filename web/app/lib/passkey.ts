@@ -577,6 +577,58 @@ export async function loginWithPasskeyConditional(
   return session;
 }
 
+/** Re-derive the PRF master key when the user has a valid session but
+ *  sessionStorage was cleared (e.g. browser restart). Triggers a passkey
+ *  assertion via the discoverable flow — the user taps Touch ID / Face ID
+ *  once, and the PRF output is saved back to sessionStorage. Returns true
+ *  on success, false if the user cancels or PRF is unavailable. */
+export async function reauthForMasterKey(): Promise<boolean> {
+  if (!isPasskeySupported()) return false;
+
+  const beginResp = await fetch(`${API_URL}/auth/login/begin_discoverable`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+  if (!beginResp.ok) return false;
+  const begin = await beginResp.json();
+
+  const requestOptions = toRequestOptions(begin.request_options);
+  (requestOptions as unknown as { extensions: Record<string, unknown> }).extensions = {
+    ...((requestOptions as unknown as { extensions?: Record<string, unknown> })
+      .extensions ?? {}),
+    prf: { eval: { first: PRF_SALT } },
+  };
+
+  let cred: PublicKeyCredential | null;
+  try {
+    cred = (await navigator.credentials.get({
+      publicKey: requestOptions,
+    })) as PublicKeyCredential | null;
+  } catch {
+    return false;
+  }
+  if (!cred) return false;
+
+  const prfKey = extractPrfKey(cred);
+  if (!prfKey) return false;
+  saveMasterKey(prfKey);
+
+  // Complete the ceremony so the server doesn't leave a dangling challenge.
+  await fetch(`${API_URL}/auth/login/finish_discoverable`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      challenge_id: begin.challenge_id,
+      credential: fromAuthenticationCredential(cred),
+    }),
+  });
+
+  return true;
+}
+
 export async function fetchMe(): Promise<SessionUser | null> {
   try {
     const r = await fetch(`${API_URL}/auth/me`, { credentials: "include" });
