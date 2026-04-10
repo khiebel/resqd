@@ -430,6 +430,9 @@ function Footer() {
             <Link href="/terms/" className="hover:text-slate-300">
               Terms
             </Link>
+            <Link href="/about/" className="hover:text-slate-300">
+              About
+            </Link>
           </div>
         </div>
         <p className="mt-4 text-slate-600">
