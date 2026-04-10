@@ -2,6 +2,55 @@
 /* eslint-disable */
 
 /**
+ * Stateful streaming decryptor. Create one per file, feed the same chunk
+ * JSONs back in the order they were sealed, call `finish()` to assert
+ * the stream was not truncated.
+ */
+export class WasmStreamDecryptor {
+    free(): void;
+    [Symbol.dispose](): void;
+    chunksOpened(): number;
+    /**
+     * Call once all chunks have been opened. Returns an error if no
+     * chunk was ever marked `is_last` (truncation attack).
+     */
+    finish(): void;
+    /**
+     * Create a decryptor from a 32-byte key and the header JSON returned
+     * by `WasmStreamEncryptor.headerJson()`.
+     */
+    constructor(key: Uint8Array, header_json: string);
+    /**
+     * Open a sealed chunk (exactly the JSON returned by `sealChunk`).
+     * Returns the plaintext bytes.
+     */
+    openChunk(chunk_json: string): Uint8Array;
+}
+
+/**
+ * Stateful streaming encryptor. Create one per file, call `sealChunk`
+ * for each slice of plaintext, set `is_last=true` on the final slice.
+ */
+export class WasmStreamEncryptor {
+    free(): void;
+    [Symbol.dispose](): void;
+    chunksSealed(): number;
+    /**
+     * Get the stream header as JSON. Persist this alongside the sealed
+     * chunks and hand it to `WasmStreamDecryptor` on the read side.
+     */
+    headerJson(): string;
+    isFinished(): boolean;
+    constructor(key: Uint8Array, chunk_size: number);
+    /**
+     * Seal the next chunk. `is_last` MUST be true on the final chunk or
+     * the decryptor will report a truncation error at `finish()`.
+     * Returns JSON: `{"counter":N,"is_last":bool,"ciphertext_b64":"..."}`.
+     */
+    sealChunk(plaintext: Uint8Array, is_last: boolean): string;
+}
+
+/**
  * Create a new canary chain for an asset. Returns JSON.
  */
 export function canary_create(asset_id: string): string;
@@ -121,6 +170,8 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
+    readonly __wbg_wasmstreamdecryptor_free: (a: number, b: number) => void;
+    readonly __wbg_wasmstreamencryptor_free: (a: number, b: number) => void;
     readonly canary_create: (a: number, b: number) => [number, number, number, number];
     readonly canary_rotate: (a: number, b: number) => [number, number, number, number];
     readonly canary_verify: (a: number, b: number) => [bigint, number, number];
@@ -136,10 +187,19 @@ export interface InitOutput {
     readonly kem_decapsulate: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly kem_encapsulate: (a: number, b: number) => [number, number, number, number];
     readonly kem_generate: () => [number, number, number, number];
+    readonly wasmstreamdecryptor_chunksOpened: (a: number) => number;
+    readonly wasmstreamdecryptor_finish: (a: number) => [number, number];
+    readonly wasmstreamdecryptor_new: (a: number, b: number, c: number, d: number) => [number, number, number];
+    readonly wasmstreamdecryptor_openChunk: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly wasmstreamencryptor_headerJson: (a: number) => [number, number, number, number];
+    readonly wasmstreamencryptor_isFinished: (a: number) => number;
+    readonly wasmstreamencryptor_new: (a: number, b: number, c: number) => [number, number, number];
+    readonly wasmstreamencryptor_sealChunk: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly x25519_generate_identity: () => [number, number, number, number];
     readonly x25519_public_from_private: (a: number, b: number) => [number, number, number, number];
     readonly x25519_recipient_wrap_key: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly x25519_sender_wrap_key: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+    readonly wasmstreamencryptor_chunksSealed: (a: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;
     readonly __externref_table_alloc: () => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;

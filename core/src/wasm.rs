@@ -9,7 +9,7 @@
 
 use wasm_bindgen::prelude::*;
 
-use crate::crypto::{hash, encrypt, kem, keys, share};
+use crate::crypto::{hash, encrypt, kem, keys, share, stream};
 use crate::erasure;
 use crate::canary::CanaryChain;
 
@@ -77,6 +77,175 @@ pub fn decrypt_data(key: &[u8], blob_json: &str) -> Result<Vec<u8>, JsError> {
 
     encrypt::decrypt(&key_arr, &blob)
         .map_err(|e| JsError::new(&e.to_string()))
+}
+
+// ── Streaming encryption (Track 1, Chunk 1.2) ────────────────────────
+//
+// Stateful wrappers around crypto::stream::{StreamEncryptor, StreamDecryptor}
+// so the browser can feed a File.stream() through WASM 1 MB at a time
+// without ever holding the whole payload in memory.
+//
+// Wire format across the FFI boundary:
+//   header:  {"stream_id_b64":"...","chunk_size":N}
+//   chunk:   {"counter":N,"is_last":bool,"ciphertext_b64":"..."}
+//
+// Callers MUST mark the final chunk with is_last=true — the decryptor
+// treats a missing is_last marker as a truncation attack.
+
+/// Stateful streaming encryptor. Create one per file, call `sealChunk`
+/// for each slice of plaintext, set `is_last=true` on the final slice.
+#[wasm_bindgen]
+pub struct WasmStreamEncryptor {
+    inner: stream::StreamEncryptor,
+}
+
+#[wasm_bindgen]
+impl WasmStreamEncryptor {
+    #[wasm_bindgen(constructor)]
+    pub fn new(key: &[u8], chunk_size: u32) -> Result<WasmStreamEncryptor, JsError> {
+        if key.len() != 32 {
+            return Err(JsError::new("key must be 32 bytes"));
+        }
+        let key_arr: [u8; 32] = key.try_into().unwrap();
+        Ok(Self {
+            inner: stream::StreamEncryptor::new(&key_arr, chunk_size),
+        })
+    }
+
+    /// Get the stream header as JSON. Persist this alongside the sealed
+    /// chunks and hand it to `WasmStreamDecryptor` on the read side.
+    #[wasm_bindgen(js_name = headerJson)]
+    pub fn header_json(&self) -> Result<String, JsError> {
+        let h = self.inner.header();
+        #[derive(serde::Serialize)]
+        struct WasmHeader {
+            stream_id_b64: String,
+            chunk_size: u32,
+        }
+        let out = WasmHeader {
+            stream_id_b64: base64_encode(&h.stream_id),
+            chunk_size: h.chunk_size,
+        };
+        serde_json::to_string(&out).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Seal the next chunk. `is_last` MUST be true on the final chunk or
+    /// the decryptor will report a truncation error at `finish()`.
+    /// Returns JSON: `{"counter":N,"is_last":bool,"ciphertext_b64":"..."}`.
+    #[wasm_bindgen(js_name = sealChunk)]
+    pub fn seal_chunk(&mut self, plaintext: &[u8], is_last: bool) -> Result<String, JsError> {
+        let sealed = self
+            .inner
+            .seal_chunk(plaintext, is_last)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+
+        #[derive(serde::Serialize)]
+        struct WasmChunk {
+            counter: u32,
+            is_last: bool,
+            ciphertext_b64: String,
+        }
+        let out = WasmChunk {
+            counter: sealed.counter,
+            is_last: sealed.is_last,
+            ciphertext_b64: base64_encode(&sealed.ciphertext),
+        };
+        serde_json::to_string(&out).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    #[wasm_bindgen(js_name = chunksSealed)]
+    pub fn chunks_sealed(&self) -> u32 {
+        self.inner.chunks_sealed()
+    }
+
+    #[wasm_bindgen(js_name = isFinished)]
+    pub fn is_finished(&self) -> bool {
+        self.inner.is_finished()
+    }
+}
+
+/// Stateful streaming decryptor. Create one per file, feed the same chunk
+/// JSONs back in the order they were sealed, call `finish()` to assert
+/// the stream was not truncated.
+#[wasm_bindgen]
+pub struct WasmStreamDecryptor {
+    inner: stream::StreamDecryptor,
+}
+
+#[wasm_bindgen]
+impl WasmStreamDecryptor {
+    /// Create a decryptor from a 32-byte key and the header JSON returned
+    /// by `WasmStreamEncryptor.headerJson()`.
+    #[wasm_bindgen(constructor)]
+    pub fn new(key: &[u8], header_json: &str) -> Result<WasmStreamDecryptor, JsError> {
+        if key.len() != 32 {
+            return Err(JsError::new("key must be 32 bytes"));
+        }
+        let key_arr: [u8; 32] = key.try_into().unwrap();
+
+        #[derive(serde::Deserialize)]
+        struct WasmHeader {
+            stream_id_b64: String,
+            chunk_size: u32,
+        }
+        let parsed: WasmHeader = serde_json::from_str(header_json)
+            .map_err(|e| JsError::new(&format!("parse header: {e}")))?;
+
+        let stream_id_bytes = base64_decode(&parsed.stream_id_b64)?;
+        if stream_id_bytes.len() != 20 {
+            return Err(JsError::new(&format!(
+                "stream_id must decode to 20 bytes, got {}",
+                stream_id_bytes.len()
+            )));
+        }
+        let mut stream_id = [0u8; 20];
+        stream_id.copy_from_slice(&stream_id_bytes);
+
+        let header = stream::StreamHeader {
+            stream_id,
+            chunk_size: parsed.chunk_size,
+        };
+        Ok(Self {
+            inner: stream::StreamDecryptor::new(&key_arr, header),
+        })
+    }
+
+    /// Open a sealed chunk (exactly the JSON returned by `sealChunk`).
+    /// Returns the plaintext bytes.
+    #[wasm_bindgen(js_name = openChunk)]
+    pub fn open_chunk(&mut self, chunk_json: &str) -> Result<Vec<u8>, JsError> {
+        #[derive(serde::Deserialize)]
+        struct WasmChunk {
+            counter: u32,
+            is_last: bool,
+            ciphertext_b64: String,
+        }
+        let parsed: WasmChunk = serde_json::from_str(chunk_json)
+            .map_err(|e| JsError::new(&format!("parse chunk: {e}")))?;
+
+        let sealed = stream::SealedChunk {
+            counter: parsed.counter,
+            is_last: parsed.is_last,
+            ciphertext: base64_decode(&parsed.ciphertext_b64)?,
+        };
+
+        self.inner
+            .open_chunk(&sealed)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Call once all chunks have been opened. Returns an error if no
+    /// chunk was ever marked `is_last` (truncation attack).
+    pub fn finish(&self) -> Result<(), JsError> {
+        self.inner
+            .finish()
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    #[wasm_bindgen(js_name = chunksOpened)]
+    pub fn chunks_opened(&self) -> u32 {
+        self.inner.chunks_opened()
+    }
 }
 
 // ── Key Derivation ───────────────────────────────────────────────────

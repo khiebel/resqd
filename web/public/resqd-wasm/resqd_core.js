@@ -1,6 +1,176 @@
 /* @ts-self-types="./resqd_core.d.ts" */
 
 /**
+ * Stateful streaming decryptor. Create one per file, feed the same chunk
+ * JSONs back in the order they were sealed, call `finish()` to assert
+ * the stream was not truncated.
+ */
+export class WasmStreamDecryptor {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        WasmStreamDecryptorFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_wasmstreamdecryptor_free(ptr, 0);
+    }
+    /**
+     * @returns {number}
+     */
+    chunksOpened() {
+        const ret = wasm.wasmstreamdecryptor_chunksOpened(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Call once all chunks have been opened. Returns an error if no
+     * chunk was ever marked `is_last` (truncation attack).
+     */
+    finish() {
+        const ret = wasm.wasmstreamdecryptor_finish(this.__wbg_ptr);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * Create a decryptor from a 32-byte key and the header JSON returned
+     * by `WasmStreamEncryptor.headerJson()`.
+     * @param {Uint8Array} key
+     * @param {string} header_json
+     */
+    constructor(key, header_json) {
+        const ptr0 = passArray8ToWasm0(key, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(header_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmstreamdecryptor_new(ptr0, len0, ptr1, len1);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        this.__wbg_ptr = ret[0] >>> 0;
+        WasmStreamDecryptorFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * Open a sealed chunk (exactly the JSON returned by `sealChunk`).
+     * Returns the plaintext bytes.
+     * @param {string} chunk_json
+     * @returns {Uint8Array}
+     */
+    openChunk(chunk_json) {
+        const ptr0 = passStringToWasm0(chunk_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmstreamdecryptor_openChunk(this.__wbg_ptr, ptr0, len0);
+        if (ret[3]) {
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v2;
+    }
+}
+if (Symbol.dispose) WasmStreamDecryptor.prototype[Symbol.dispose] = WasmStreamDecryptor.prototype.free;
+
+/**
+ * Stateful streaming encryptor. Create one per file, call `sealChunk`
+ * for each slice of plaintext, set `is_last=true` on the final slice.
+ */
+export class WasmStreamEncryptor {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        WasmStreamEncryptorFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_wasmstreamencryptor_free(ptr, 0);
+    }
+    /**
+     * @returns {number}
+     */
+    chunksSealed() {
+        const ret = wasm.wasmstreamencryptor_chunksSealed(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Get the stream header as JSON. Persist this alongside the sealed
+     * chunks and hand it to `WasmStreamDecryptor` on the read side.
+     * @returns {string}
+     */
+    headerJson() {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ret = wasm.wasmstreamencryptor_headerJson(this.__wbg_ptr);
+            var ptr1 = ret[0];
+            var len1 = ret[1];
+            if (ret[3]) {
+                ptr1 = 0; len1 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
+     * @returns {boolean}
+     */
+    isFinished() {
+        const ret = wasm.wasmstreamencryptor_isFinished(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * @param {Uint8Array} key
+     * @param {number} chunk_size
+     */
+    constructor(key, chunk_size) {
+        const ptr0 = passArray8ToWasm0(key, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmstreamencryptor_new(ptr0, len0, chunk_size);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        this.__wbg_ptr = ret[0] >>> 0;
+        WasmStreamEncryptorFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * Seal the next chunk. `is_last` MUST be true on the final chunk or
+     * the decryptor will report a truncation error at `finish()`.
+     * Returns JSON: `{"counter":N,"is_last":bool,"ciphertext_b64":"..."}`.
+     * @param {Uint8Array} plaintext
+     * @param {boolean} is_last
+     * @returns {string}
+     */
+    sealChunk(plaintext, is_last) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const ptr0 = passArray8ToWasm0(plaintext, wasm.__wbindgen_malloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ret = wasm.wasmstreamencryptor_sealChunk(this.__wbg_ptr, ptr0, len0, is_last);
+            var ptr2 = ret[0];
+            var len2 = ret[1];
+            if (ret[3]) {
+                ptr2 = 0; len2 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+        }
+    }
+}
+if (Symbol.dispose) WasmStreamEncryptor.prototype[Symbol.dispose] = WasmStreamEncryptor.prototype.free;
+
+/**
  * Create a new canary chain for an asset. Returns JSON.
  * @param {string} asset_id
  * @returns {string}
@@ -589,6 +759,13 @@ function __wbg_get_imports() {
         "env": import1,
     };
 }
+
+const WasmStreamDecryptorFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_wasmstreamdecryptor_free(ptr >>> 0, 1));
+const WasmStreamEncryptorFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_wasmstreamencryptor_free(ptr >>> 0, 1));
 
 function addToExternrefTable0(obj) {
     const idx = wasm.__externref_table_alloc();
