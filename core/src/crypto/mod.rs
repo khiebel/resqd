@@ -11,9 +11,11 @@ pub mod encrypt;
 pub mod kem;
 pub mod keys;
 pub mod share;
+pub mod stream;
 
 pub use hash::*;
 pub use encrypt::*;
 pub use kem::*;
 pub use keys::*;
 pub use share::*;
+pub use stream::*;
