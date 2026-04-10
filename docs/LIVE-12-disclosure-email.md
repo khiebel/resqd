@@ -36,12 +36,18 @@ The three bugs were:
    string `"admin"`, which the rest of the code accepted as a valid
    admin identity.
 
-3. The `RESQD_ORIGIN_SECRET` environment variable was never set in
-   the Lambda deploy script, so even the origin-check middleware that
-   DID exist silently no-op'd in production.
+3. The `RESQD_ORIGIN_SECRET` environment variable was not required
+   by the Lambda deploy script. It happened to be set in production
+   at the time of the finding (good), but any future re-deploy from
+   a shell without the variable exported would have silently emptied
+   it and converted the origin-check middleware into a no-op across
+   every non-admin route too. A latent one-unlucky-deploy-away
+   failure.
 
-Any one of those, fixed, would have broken the chain. All three
-together turned the direct-to-origin URL into a public admin console.
+Bugs 1 and 2 were sufficient on their own to enable the
+direct-to-origin admin takeover that Dave demonstrated — bug 3 is
+the safety net next to them that would have given way on the next
+re-deploy. All three are fixed together.
 
 ## What was actually exposed
 

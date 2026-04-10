@@ -99,18 +99,36 @@ Any request that reached the function — whether via a forged header
 or by omitting the header entirely — was treated as an authorized
 admin.
 
-### Bug 3 — `RESQD_ORIGIN_SECRET` never set in the deploy script
+### Bug 3 — `RESQD_ORIGIN_SECRET` handling in the deploy script (latent)
 
-`infra/lambda/deploy.sh` never exported `RESQD_ORIGIN_SECRET` into
-the Lambda environment, so the middleware's early return clause
+`infra/lambda/deploy.sh` did not require or fail-close on
+`RESQD_ORIGIN_SECRET`. The value happened to be present in the
+production Lambda environment at the time of the finding (set
+manually at some prior point), which is why the origin-secret
+middleware was actually enforcing on non-admin routes — the
+middleware's early return clause
+
 ```rust
 let Some(ref expected) = state.config.origin_secret else {
     return next.run(req).await;
 };
 ```
-fired on every request in production. In other words, even the
-non-exempted routes were not enforcing the origin secret — the
-middleware was a silent no-op for the entire Lambda.
+
+was **not** firing for this deploy. Bug 3 is therefore **not** a
+direct cause of the LIVE-12 exploit chain; bugs 1 and 2 alone were
+sufficient, because `/admin` was exempt from the enforcement layer
+regardless of the secret's state.
+
+Bug 3 is included in this advisory because it is a **latent
+resilience failure** with material security impact: the very next
+re-deploy of the Lambda from a shell without `RESQD_ORIGIN_SECRET`
+exported would have silently replaced the real secret with an empty
+string, converting the middleware into a no-op for every non-exempt
+route as well. In other words, the direct-to-origin protection that
+was quietly saving the non-admin surface area was one unlucky deploy
+away from disappearing. The fix for Bug 3 makes `RESQD_ORIGIN_SECRET`
+a required input to `deploy.sh` — the deploy aborts if it is missing
+rather than silently emptying it.
 
 ### The chain
 
@@ -120,12 +138,16 @@ Reproduction was a single curl:
 curl https://pjoq4jjjtb.execute-api.us-east-1.amazonaws.com/admin/users
 ```
 
-No headers, no auth, no CF Access cookie. Bug 3 meant the origin-secret
-middleware skipped the request. Bug 1 would have exempted it anyway.
-Bug 2 treated the missing-header case as "admin" identity and let the
-handler run. The handler returned the full users table.
+No headers, no auth, no CF Access cookie. Bug 1 exempted the request
+from the origin-secret middleware entirely. Bug 2 treated the
+missing-header case as the literal identity `"admin"` and let the
+handler run. The handler returned the full users table. Either of
+those two, fixed, would have broken the chain; both are fixed.
 
-Any single one of the three bugs, fixed, would have broken the chain.
+Bug 3 is the latent neighbour: it did not fire this time, but it
+meant the entire non-admin protection was one unlucky deploy away
+from collapsing too. Fixing it hardens the whole middleware against
+that mode.
 
 ## Discovery
 
