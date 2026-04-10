@@ -10,6 +10,9 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 
 use crate::error::{ResqdError, Result};
 
+pub mod stream;
+pub use stream::*;
+
 /// Default erasure coding parameters.
 pub const DATA_SHARDS: usize = 4;
 pub const PARITY_SHARDS: usize = 2;
