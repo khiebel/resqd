@@ -27,42 +27,56 @@ checklist.
 **Do these in order.** Each step has a verification command so you
 know it worked before moving to the next.
 
+Two ordering notes from Dave's review (2026-04-10):
+
+1. **Do not rotate the JWT secret until after you've verified that
+   the admin login still works with the new allowlist.** A bad
+   `RESQD_ADMIN_EMAILS` value would lock you out otherwise. The
+   checklist below splits the deploy into a "code + allowlist +
+   origin secret" deploy first, then a separate "rotate JWT secret"
+   deploy once you've confirmed admin access.
+2. **The WAFv2 IPSet needs a refresh job.** Cloudflare's IP ranges
+   evolve; freezing the set at deploy time means legitimate traffic
+   will eventually start returning 403. See step 14.
+
 ```
-[ ]  1. Generate new secrets                              (1 min)
+[ ]  1. Generate new ORIGIN_SECRET (not JWT yet)          (1 min)
 [ ]  2. Set Worker ORIGIN_SECRET to the new value         (2 min)
 [ ]  3. Verify Worker injection                           (1 min)
-[ ]  4. Export env vars for Lambda deploy                 (1 min)
+[ ]  4. Export env vars (keep current JWT_SECRET)         (1 min)
 [ ]  5. cargo lambda build                                (5 min)
-[ ]  6. ./infra/lambda/deploy.sh (Lambda redeploy)        (2 min)
-[ ]  7. Verify /admin is gated via the API Gateway URL    (1 min)
+[ ]  6. ./infra/lambda/deploy.sh (first deploy)           (2 min)
+[ ]  7. Verify /admin is 403 from direct origin URL       (1 min)
 [ ]  8. Verify /admin still works via api.resqd.ai        (1 min)
+       └── GATE: if this fails, fix RESQD_ADMIN_EMAILS
+           and re-run step 6 before continuing.
 [ ]  9. Create AWS WAFv2 Cloudflare IP set                (5 min)
 [ ] 10. Attach WebACL to the API Gateway stage            (2 min)
-[ ] 11. Verify direct-to-origin now returns 403           (1 min)
+[ ] 11. Verify direct-to-origin now returns 403 at WAF    (1 min)
 [ ] 12. Cloudflare Pages _headers CSP/HSTS                (3 min)
 [ ] 13. Purge Cloudflare cache                            (1 min)
-[ ] 14. Send disclosure email to Eric + Kevin             (2 min)
-[ ] 15. Publish GitHub security advisory                  (2 min)
+[ ] 14. Install CF IPs daily refresh GitHub Action        (2 min)
+[ ] 15. Rotate RESQD_JWT_SECRET (second deploy)           (2 min)
+[ ] 16. Ping Dave to re-run his verification probes       (1 min)
+[ ] 17. Send disclosure email to Eric + Kevin             (2 min)
+[ ] 18. Publish GitHub security advisory                  (2 min)
 ```
 
 ---
 
-## Step 1 — Generate new secrets
+## Step 1 — Generate a new ORIGIN_SECRET (JWT stays for now)
 
-Fresh values for `RESQD_JWT_SECRET` and `RESQD_ORIGIN_SECRET`. Rotating
-the JWT secret invalidates all existing sessions, which is the point —
-if anyone minted a forged token against the old secret, it stops
-working.
+Fresh value for `RESQD_ORIGIN_SECRET` only. The JWT secret is rotated
+in step 15 as a separate deploy, so we can verify admin access first
+with the current session cookie.
 
 ```sh
-export RESQD_JWT_SECRET=$(openssl rand -base64 48)
 export RESQD_ORIGIN_SECRET=$(openssl rand -base64 48)
-echo "JWT:    ${RESQD_JWT_SECRET:0:12}..."
 echo "ORIGIN: ${RESQD_ORIGIN_SECRET:0:12}..."
 ```
 
-Save both somewhere safe (`~/private/resqd-secrets.env` is fine) —
-you'll need them again on the next deploy.
+Save it in `~/private/resqd-secrets.env` — you'll need it again on
+the next deploy and it needs to match the Worker secret.
 
 ## Step 2 — Update the Cloudflare Worker secret
 
@@ -88,17 +102,31 @@ curl -i https://api.resqd.ai/health \
 Should return `200`. If it returns `403 origin_bypass`, the Worker
 redeploy hasn't propagated yet — wait 15 seconds and retry.
 
-## Step 4 — Export env vars for the Lambda deploy
+## Step 4 — Export env vars for the first Lambda deploy
 
 The updated `deploy.sh` requires all of these or it aborts.
 
+**Important:** the first deploy keeps the current `RESQD_JWT_SECRET`
+so your existing admin session cookie keeps working and you can
+verify step 8. Fetch the current value from the live Lambda:
+
 ```sh
 cd /Users/khiebel/CodeBucket/resqd
+export RESQD_JWT_SECRET=$(aws lambda get-function-configuration \
+  --function-name resqd-api --region us-east-1 \
+  --query 'Environment.Variables.RESQD_JWT_SECRET' --output text)
+
 export RESQD_CHAIN_SIGNER_KEY=$(cat infra/.chain-signer-key)   # wherever you keep it
-export RESQD_JWT_SECRET        # from step 1
 export RESQD_ORIGIN_SECRET     # from step 1
-export RESQD_ADMIN_EMAILS="khiebel@gmail.com"  # start minimal — expand per row below
+export RESQD_ADMIN_EMAILS="khiebel@gmail.com"  # start minimal — one entry
 ```
+
+**Who should be on the admin allowlist on day one:** only
+`khiebel@gmail.com`. Do NOT include any alpha testers yet — the
+tester allow-list on Cloudflare Access gates the main site, not the
+admin console. Expand `RESQD_ADMIN_EMAILS` only after a deliberate
+per-person decision. See the Admin vs user Access separation item
+in `project_resqd_next.md`.
 
 **Who should be on the admin allowlist on day one:** only `khiebel@gmail.com`.
 Add alpha testers to the allowlist only after explicit per-person decision.
@@ -116,7 +144,7 @@ cargo lambda build --release --arm64 --bin resqd-api-lambda
 Should finish in a few minutes. Output at
 `target/lambda/resqd-api-lambda/bootstrap`.
 
-## Step 6 — Redeploy the Lambda
+## Step 6 — First Lambda deploy (code + allowlist + origin secret)
 
 ```sh
 cd /Users/khiebel/CodeBucket/resqd
@@ -124,8 +152,10 @@ cd /Users/khiebel/CodeBucket/resqd
 ```
 
 This updates the function code AND environment variables in a single
-call — the new JWT secret, the new origin secret, and the admin
-allowlist all land at the same time.
+call — the new origin secret and the admin allowlist land together,
+but the JWT secret stays the same (you fetched the current value in
+step 4). Rotating the JWT is deferred to step 15 so you can verify
+admin access with your existing session first.
 
 ## Step 7 — Verify /admin is gated from the direct API Gateway URL
 
@@ -151,14 +181,26 @@ If either of those returns a 200, STOP. Something is wrong with the
 deploy. Check `aws lambda get-function-configuration --function-name resqd-api`
 and confirm `RESQD_ORIGIN_SECRET` is in the `Environment.Variables` map.
 
-## Step 8 — Verify /admin still works through api.resqd.ai
+## Step 8 — Verify /admin still works through api.resqd.ai  **← GATE**
 
 ```sh
 # Browser: https://resqd.ai/admin/ — should load the admin console
 # CLI (with your CF Access cookie from the browser session):
 curl -i https://api.resqd.ai/admin/users -b "CF_Authorization=$CF_ACCESS_COOKIE"
-# expect: HTTP/2 200
+# expect: HTTP/2 200 with {"count":N, ...}
 ```
+
+**If this fails with 403 `admin_denied` or `admin_misconfigured`**,
+your email isn't in `RESQD_ADMIN_EMAILS`. Fix:
+
+```sh
+export RESQD_ADMIN_EMAILS="khiebel@gmail.com"
+./infra/lambda/deploy.sh                          # second attempt
+```
+
+**Do not proceed to step 9 until this step returns 200.** The WAFv2
+attach in step 10 further narrows the reachable paths, so a broken
+admin login at this stage gets harder to recover from after step 10.
 
 ## Step 9 — Create a WAFv2 Cloudflare IP set
 
@@ -325,13 +367,88 @@ curl -X POST "https://api.cloudflare.com/client/v4/zones/20fc4a4faa1c0b70b0b5ff5
   -d '{"purge_everything":true}'
 ```
 
-## Step 14 — Send disclosure email
+## Step 14 — Install the Cloudflare IPs daily refresh job
+
+Cloudflare publishes the canonical IP ranges at
+<https://www.cloudflare.com/ips-v4/> and
+<https://www.cloudflare.com/ips-v6/>. These lists DO change. If the
+WAF IPSet is frozen at the value we set in step 9, legitimate traffic
+will eventually start returning 403 as Cloudflare brings new ranges
+online.
+
+A GitHub Actions workflow already lives at
+`.github/workflows/cloudflare-ips-refresh.yml` and runs daily at
+10:00 UTC. It:
+
+1. Downloads both canonical lists
+2. Updates the WAFv2 IPSets `cloudflare-ipv4` and `cloudflare-ipv6`
+   via `aws wafv2 update-ip-set`
+3. Reports a diff in the workflow run summary
+
+**To enable it:**
+
+```sh
+# One-time: set the repository secrets the workflow needs.
+gh secret set AWS_ACCESS_KEY_ID      --body "$AWS_ACCESS_KEY_ID"
+gh secret set AWS_SECRET_ACCESS_KEY  --body "$AWS_SECRET_ACCESS_KEY"
+gh secret set AWS_REGION             --body "us-east-1"
+```
+
+The IAM principal used here only needs
+`wafv2:GetIPSet` + `wafv2:UpdateIPSet` on the two IP set ARNs — use
+a scoped-down user, not the deploy role.
+
+Kick off a manual run to confirm it works:
+
+```sh
+gh workflow run cloudflare-ips-refresh.yml
+gh run watch
+```
+
+## Step 15 — Rotate RESQD_JWT_SECRET (second deploy)
+
+Now that admin access is verified, it's safe to invalidate all
+existing sessions.
+
+```sh
+export RESQD_JWT_SECRET=$(openssl rand -base64 48)
+cd /Users/khiebel/CodeBucket/resqd
+./infra/lambda/deploy.sh
+```
+
+Expected side effect: everyone is logged out, including you. Log
+back in with your passkey — the admin console should load again
+because `RESQD_ADMIN_EMAILS` is already in place from step 6.
+
+## Step 16 — Ping Dave to re-verify
+
+Dave offered to re-run his original proof-of-concept the moment the
+fix is live. The agreed probes are:
+
+```sh
+curl -i https://pjoq4jjjtb.execute-api.us-east-1.amazonaws.com/admin/users
+curl -i https://pjoq4jjjtb.execute-api.us-east-1.amazonaws.com/admin/users \
+  -H 'cf-access-authenticated-user-email: admin'
+curl -i https://pjoq4jjjtb.execute-api.us-east-1.amazonaws.com/admin/users \
+  -H 'cf-access-authenticated-user-email: admin@malicious.example'
+curl -i https://api.resqd.ai/admin/users
+```
+
+All four should be blocked — the first three at the WAFv2 layer
+(the direct origin URL is not on the CF IP allowlist), and the
+fourth inside the Lambda by `require_admin()` rejecting the spoofed
+email against the allowlist.
+
+Drop Dave a line when deploy is green and he'll send back one-line
+PASS/FAIL per probe the same hour.
+
+## Step 17 — Send disclosure email
 
 See `docs/LIVE-12-disclosure-email.md` for the draft. Two recipients:
 `a@byt.pw` (Eric) and `khiebel@gmail.com` (Kevin, as a receipt for the
 audit trail).
 
-## Step 15 — Publish GitHub security advisory
+## Step 18 — Publish GitHub security advisory
 
 See `docs/LIVE-12-advisory.md` for the draft. Since the repo is
 AGPL-3.0, publishing is the right call — it sets norms, credits Dave,

@@ -1,0 +1,100 @@
+name: Refresh Cloudflare IPs in WAFv2
+
+# Cloudflare publishes the canonical IP ranges for its edge at
+# https://www.cloudflare.com/ips-v4/ and /ips-v6/. These lists change
+# over time as Cloudflare adds edge capacity; when they do, the WAFv2
+# IPSets we use to restrict api.resqd.ai to CF-only traffic start
+# rejecting legitimate requests from new ranges. This workflow keeps
+# the IPSets in sync.
+#
+# Related advisory: LIVE-12 (2026-04-10). Without this job, the
+# WAFv2 belt on top of the RESQD Lambda becomes a liability instead
+# of a safety net. See docs/LIVE-12-runbook.md step 14 for the
+# one-time setup.
+
+on:
+  schedule:
+    # Daily at 10:00 UTC — well after Cloudflare's typical update windows.
+    - cron: "0 10 * * *"
+  workflow_dispatch: {} # allow manual runs from the Actions tab
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-ips-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      IPV4_IPSET_NAME: cloudflare-ipv4
+      IPV6_IPSET_NAME: cloudflare-ipv6
+    steps:
+      - name: Fetch canonical Cloudflare IP lists
+        run: |
+          set -euo pipefail
+          curl -fsS https://www.cloudflare.com/ips-v4/ -o /tmp/cf-ipv4.txt
+          curl -fsS https://www.cloudflare.com/ips-v6/ -o /tmp/cf-ipv6.txt
+          # Sanity: each list must be non-empty and parseable CIDRs only.
+          test -s /tmp/cf-ipv4.txt
+          test -s /tmp/cf-ipv6.txt
+          grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$' /tmp/cf-ipv4.txt
+          grep -Eq '^[0-9a-fA-F:]+/[0-9]{1,3}$'               /tmp/cf-ipv6.txt
+          echo "ipv4 entries: $(wc -l </tmp/cf-ipv4.txt)"
+          echo "ipv6 entries: $(wc -l </tmp/cf-ipv6.txt)"
+
+      - name: Resolve WAFv2 IPSet ids
+        id: ids
+        run: |
+          set -euo pipefail
+          V4=$(aws wafv2 list-ip-sets --scope REGIONAL --region "$AWS_REGION" \
+            --query "IPSets[?Name=='$IPV4_IPSET_NAME'].Id" --output text)
+          V6=$(aws wafv2 list-ip-sets --scope REGIONAL --region "$AWS_REGION" \
+            --query "IPSets[?Name=='$IPV6_IPSET_NAME'].Id" --output text)
+          test -n "$V4" || { echo "missing $IPV4_IPSET_NAME"; exit 1; }
+          test -n "$V6" || { echo "missing $IPV6_IPSET_NAME"; exit 1; }
+          echo "v4_id=$V4" >> "$GITHUB_OUTPUT"
+          echo "v6_id=$V6" >> "$GITHUB_OUTPUT"
+
+      - name: Update cloudflare-ipv4
+        run: |
+          set -euo pipefail
+          LOCK=$(aws wafv2 get-ip-set --scope REGIONAL --region "$AWS_REGION" \
+            --name "$IPV4_IPSET_NAME" --id "${{ steps.ids.outputs.v4_id }}" \
+            --query LockToken --output text)
+          ADDRS=$(jq -R -s 'split("\n") | map(select(length > 0))' /tmp/cf-ipv4.txt)
+          aws wafv2 update-ip-set --scope REGIONAL --region "$AWS_REGION" \
+            --name "$IPV4_IPSET_NAME" --id "${{ steps.ids.outputs.v4_id }}" \
+            --lock-token "$LOCK" \
+            --addresses "$ADDRS"
+
+      - name: Update cloudflare-ipv6
+        run: |
+          set -euo pipefail
+          LOCK=$(aws wafv2 get-ip-set --scope REGIONAL --region "$AWS_REGION" \
+            --name "$IPV6_IPSET_NAME" --id "${{ steps.ids.outputs.v6_id }}" \
+            --query LockToken --output text)
+          ADDRS=$(jq -R -s 'split("\n") | map(select(length > 0))' /tmp/cf-ipv6.txt)
+          aws wafv2 update-ip-set --scope REGIONAL --region "$AWS_REGION" \
+            --name "$IPV6_IPSET_NAME" --id "${{ steps.ids.outputs.v6_id }}" \
+            --lock-token "$LOCK" \
+            --addresses "$ADDRS"
+
+      - name: Diff summary
+        run: |
+          set -euo pipefail
+          V4_COUNT=$(wc -l </tmp/cf-ipv4.txt)
+          V6_COUNT=$(wc -l </tmp/cf-ipv6.txt)
+          {
+            echo "## Cloudflare IPs refreshed"
+            echo ""
+            echo "| Set              | Entries |"
+            echo "|------------------|---------|"
+            echo "| cloudflare-ipv4  | $V4_COUNT |"
+            echo "| cloudflare-ipv6  | $V6_COUNT |"
+          } >> "$GITHUB_STEP_SUMMARY"

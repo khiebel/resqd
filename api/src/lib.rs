@@ -283,13 +283,23 @@ pub async fn security_headers_middleware(req: Request, next: Next) -> Response {
         "Content-Security-Policy",
         HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'; base-uri 'none'"),
     );
+    // CORP: same-site allows the app.resqd.ai SPA to fetch from
+    // api.resqd.ai (both under *.resqd.ai) while still blocking truly
+    // cross-origin reads from other sites. Do NOT change this to
+    // "same-origin" — it would break the SPA, because api.resqd.ai
+    // and app.resqd.ai are different origins.
     h.insert(
         "Cross-Origin-Resource-Policy",
         HeaderValue::from_static("same-site"),
     );
+    // COOP: unsafe-none for a pure JSON API. A stricter value like
+    // "same-origin" is meaningless on API responses (there's nothing
+    // to open cross-origin) and would surprise us if an error page
+    // ever accidentally rendered in a browser tab. Per Dave's LIVE-12
+    // review, 2026-04-10.
     h.insert(
         "Cross-Origin-Opener-Policy",
-        HeaderValue::from_static("same-origin"),
+        HeaderValue::from_static("unsafe-none"),
     );
     h.insert(
         "Permissions-Policy",

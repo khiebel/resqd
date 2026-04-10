@@ -27,7 +27,12 @@ remote unauthenticated attacker, given knowledge of the raw AWS API
 Gateway URL (`pjoq4jjjtb.execute-api.us-east-1.amazonaws.com`), to
 call any endpoint under `/admin/*` and obtain the full users table —
 email addresses, display names, storage utilisation, identity key
-presence, and disabled-flag state — for every registered alpha tester.
+presence, and disabled-flag state — for every user registered with
+a passkey in the `resqd-users` DynamoDB table at the time the bug
+was exploited.
+
+**Scope at time of finding:** two (2) users registered — one alpha
+tester and the repository owner. Both have been notified.
 
 Vault contents, cryptographic keys, and passkey material were NOT
 exposed: every byte of user data is erasure-coded and encrypted in
@@ -125,11 +130,27 @@ Any single one of the three bugs, fixed, would have broken the chain.
 ## Discovery
 
 Reported on 2026-04-10 by **Dave Freeman** in a friendly red-team
-exercise. Dave had been intentionally added to the RESQD alpha
-tester list earlier the same day precisely so he could find this kind
-of issue before a real attacker did. He demonstrated the bug against
-the live alpha, captured the minimum evidence, and disclosed
-privately. The system worked as intended.
+exercise. Dave had been given Cloudflare Access to the RESQD alpha
+domain earlier the same day specifically so that he could exercise
+the live system and report findings like this before a hostile
+attacker did. He demonstrated the bug against production, captured
+only the minimum evidence needed to characterise the finding, and
+disclosed privately to the repository owner. The system worked as
+intended.
+
+**Timeline:**
+
+- 2026-04-10 ~14:00 UTC — Dave given CF Access to `resqd.ai` and
+  `resqd.ai/admin/` for alpha testing.
+- 2026-04-10 18:14 UTC — Dave dumps `/admin/users` directly from the
+  AWS API Gateway URL without any Cloudflare cookie or header; the
+  Lambda returns `{"count":2}` with the two rows then in the users
+  table.
+- 2026-04-10 ~19:30 UTC — Finding reported.
+- 2026-04-10 ~20:00 UTC — Fix committed as `54ed7ca`.
+- 2026-04-10 after deploy — Dave re-runs the original reproduction
+  commands; all four probes return 403 at either the WAF or the
+  Lambda middleware.
 
 ## Fix
 
@@ -175,11 +196,30 @@ The full runbook is in `docs/LIVE-12-runbook.md`.
 
 ## Data affected
 
-Five rows of the `resqd-users` DynamoDB table for the alpha testers
-who had registered at the time of the finding. No byte of user vault
-content was accessible; no key material was accessible.
+**Exactly two** rows of the `resqd-users` DynamoDB table — the two
+users who had registered a passkey at the moment Dave captured the
+`/admin/users` response (18:14 UTC, 2026-04-10). For each row, the
+following fields were readable:
 
-Affected testers have been notified privately.
+- `email`
+- `display_name`
+- `user_id`
+- `created_at`
+- `storage_used_bytes`
+- `has_x25519_identity` (boolean)
+- `disabled` (boolean)
+
+**No byte of user vault content was accessible** — every vault is
+erasure-coded and encrypted in the browser with keys derived from a
+WebAuthn PRF extension that never leaves the client device. **No key
+material was accessible** — the server is zero-knowledge to both
+the per-asset encryption keys and the passkey credentials.
+
+The two affected users have been notified privately. Neither is
+required to take any action; the JWT secret rotation in the fix
+will transparently log them out on next request, as a belt-and-
+suspenders invalidation of any session tokens that might have been
+forged against the old key (no evidence any were).
 
 ## CWE mappings
 
@@ -187,13 +227,22 @@ Affected testers have been notified privately.
 - **CWE-290** Authentication Bypass by Spoofing
 - **CWE-269** Improper Privilege Management
 - **CWE-863** Incorrect Authorization
+- **CWE-306** Missing Authentication for Critical Function — once
+  bugs 1 and 3 lined up, no authentication ran at all for the
+  `/admin/*` endpoints; this captures the "door wide open" shape
+  better than CWE-287 alone.
+- **CWE-1188** Initialization of a Resource with an Insecure
+  Default — Bug 3 is textbook 1188: `RESQD_ORIGIN_SECRET` absent
+  from the deploy environment defaulted to "middleware no-op"
+  instead of "fail closed." Useful grep target for readers who want
+  to audit their own deploy scripts for the same antipattern.
 
 ## Acknowledgements
 
-Thank you to **Dave Freeman** (@? — add GitHub handle if Dave has one)
-for the report, for the proof-of-concept, and for the friendly
-red-teaming posture that made this discovery possible on day one of
-alpha access instead of after launch.
+Thank you to **Dave Freeman** for the report, for the
+proof-of-concept, and for the friendly red-teaming posture that
+made this discovery possible on day one of alpha access instead of
+after launch.
 
 Thank you to the three other 2018 whiteboard co-inventors — Eric
 Hill, Jake Habel, Paul Manaloto — for being patient alpha testers

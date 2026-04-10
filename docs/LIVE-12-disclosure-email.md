@@ -45,17 +45,23 @@ together turned the direct-to-origin URL into a public admin console.
 
 ## What was actually exposed
 
-Only the metadata rows from the `resqd-users` DynamoDB table:
+At the moment Dave captured his proof-of-concept (18:14 UTC on
+2026-04-10), the `resqd-users` DynamoDB table contained **exactly
+two** registered users: you and me. Dave's `/admin/users` dump
+returned `{"count":2}`. No other alpha testers had registered a
+passkey yet.
 
-- your email address (a@byt.pw)
-- your display name ("Eric Hill")
-- your `storage_used_bytes`
-- whether you had minted an X25519 identity yet (boolean)
-- whether your account was disabled (boolean, no)
-- your `created_at` timestamp
+For each of the two rows, the following fields were readable:
 
-That's five alpha-tester emails and a handful of operational metadata
-fields. No secrets. No keys.
+- email address (yours: `a@byt.pw`, mine: `khiebel@gmail.com`)
+- display name
+- `storage_used_bytes`
+- `has_x25519_identity` (boolean)
+- `disabled` (boolean, no)
+- `created_at` timestamp
+
+Two email addresses and a handful of operational metadata fields.
+No secrets. No keys.
 
 ## What was NOT exposed
 
