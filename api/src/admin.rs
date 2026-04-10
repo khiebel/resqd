@@ -1,9 +1,16 @@
 //! Admin endpoints for the RESQD control plane.
 //!
-//! All handlers require the caller to be an authenticated admin user
-//! (currently hardcoded to `khiebel@gmail.com`; configurable via
-//! `RESQD_ADMIN_EMAILS` env var later). CF Access is the outer gate
-//! so these endpoints are never reachable by unauthenticated traffic.
+//! All handlers require the caller to be an authenticated admin user.
+//! Identity is carried in the `cf-access-authenticated-user-email`
+//! header that Cloudflare Access injects, and the email MUST appear in
+//! the comma-separated `RESQD_ADMIN_EMAILS` env var — which is the
+//! authoritative allowlist. CF Access is the outer gate; the allowlist
+//! + the origin-secret middleware in `lib.rs` are the two belts that
+//! defend against a direct-to-API-Gateway caller bypassing CF Access.
+//!
+//! **Security invariant:** if either the header is missing OR
+//! `RESQD_ADMIN_EMAILS` is empty OR the email is not in the list,
+//! the request is rejected with 403. There is no fallback identity.
 //!
 //! The admin API is read-only for now — it surfaces aggregate state
 //! that lets the operator understand the system without exposing
@@ -110,15 +117,70 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
     (y as i32, m, d)
 }
 
-/// Extract admin email from CF Access header. Falls back to "admin"
-/// when the header is absent (direct API GW calls from the CF Access-
-/// gated admin page on resqd.ai — the page itself is the auth gate).
+/// Enforce the admin allowlist.
+///
+/// Returns `Ok(email)` only if:
+///   1. `cf-access-authenticated-user-email` is present,
+///   2. `RESQD_ADMIN_EMAILS` is set and non-empty,
+///   3. the header email (case-insensitive) is in the allowlist.
+///
+/// Any failure returns a 403 Forbidden. There is no fallback identity —
+/// the previous behaviour of defaulting to the literal string `"admin"`
+/// when the header was missing (and thereby granting admin privileges
+/// to any request that reached this code path) is **removed**. That
+/// behaviour, combined with `/admin` being in the origin-secret
+/// exemption list, enabled an unauthenticated direct-to-API-Gateway
+/// caller to reach the admin endpoints with forged identity.
+/// See advisory LIVE-12 (2026-04-10).
 fn require_admin(headers: &HeaderMap) -> Result<String, Response> {
-    let email = headers
+    let email_from_header = headers
         .get("cf-access-authenticated-user-email")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("admin")
-        .to_string();
+        .map(|s| s.trim().to_ascii_lowercase());
+
+    let Some(email) = email_from_header.filter(|s| !s.is_empty()) else {
+        warn!("admin request rejected: missing cf-access-authenticated-user-email header");
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "admin identity header missing",
+                "code": "admin_no_identity",
+            })),
+        )
+            .into_response());
+    };
+
+    let raw = std::env::var("RESQD_ADMIN_EMAILS").unwrap_or_default();
+    let allowlist: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if allowlist.is_empty() {
+        warn!("admin request rejected: RESQD_ADMIN_EMAILS is unset (fail-closed)");
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "admin allowlist not configured",
+                "code": "admin_misconfigured",
+            })),
+        )
+            .into_response());
+    }
+
+    if !allowlist.iter().any(|e| e == &email) {
+        warn!(email = %email, "admin request rejected: email not in RESQD_ADMIN_EMAILS");
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "not an admin",
+                "code": "admin_denied",
+            })),
+        )
+            .into_response());
+    }
+
     Ok(email)
 }
 

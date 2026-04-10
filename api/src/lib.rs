@@ -167,6 +167,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             state.clone(),
             geo_block_middleware,
         ))
+        // Security headers wrap every response, including the 403s from
+        // origin_secret_middleware and the 451s from geo_block_middleware,
+        // but sit inside CORS so preflight responses still get the CORS
+        // headers they need. Added 2026-04-10 for advisory LIVE-12.
+        .layer(middleware::from_fn(security_headers_middleware))
         .layer(cors)
         .with_state(state)
 }
@@ -178,6 +183,15 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// direct-to-API-Gateway callers won't have it. OPTIONS (CORS preflight)
 /// and /health are exempt so the browser and Lambda warmup probes still
 /// work.
+///
+/// **Hardened 2026-04-10 for advisory LIVE-12.** `/admin` was previously
+/// in the exemption list based on the incorrect assumption that CF
+/// Access was an inner gate the admin endpoints could rely on. CF Access
+/// runs at the edge — if a caller reaches API Gateway directly they have
+/// already bypassed CF Access. Admin endpoints now require the origin
+/// secret just like any other protected route, and `require_admin()` in
+/// `admin.rs` enforces a server-side `RESQD_ADMIN_EMAILS` allowlist as
+/// the second belt. Both must be true to hit an admin handler.
 pub async fn origin_secret_middleware(
     State(state): State<Arc<AppState>>,
     req: Request,
@@ -188,15 +202,17 @@ pub async fn origin_secret_middleware(
         return next.run(req).await;
     };
 
-    // Always allow preflight, health, auth, and admin. Auth endpoints are
-    // called directly by the browser SPA (which hits the raw API GW URL,
-    // not the CF Worker), so they can't carry the origin secret. They have
-    // their own passkey/session security. Admin is gated by CF Access.
+    // Always allow preflight and health. Auth endpoints are called
+    // directly by the browser SPA (which hits the raw API GW URL, not
+    // the CF Worker), so they can't carry the origin secret — they
+    // have their own passkey/session security. Same for the vault and
+    // ring user-flow endpoints.
+    //
+    // NOTE: `/admin` is deliberately NOT exempt. See LIVE-12.
     let path = req.uri().path();
     if req.method() == Method::OPTIONS
         || path == "/health"
         || path.starts_with("/auth")
-        || path.starts_with("/admin")
         || path == "/vault"
         || path.starts_with("/vault/")
         || path.starts_with("/users/")
@@ -227,6 +243,59 @@ pub async fn origin_secret_middleware(
                 .into_response()
         }
     }
+}
+
+/// Attach defensive HTTP security headers to every response.
+///
+/// **Introduced 2026-04-10 for advisory LIVE-12.** The API is JSON-only
+/// — there is no HTML rendered from the api.resqd.ai origin, so the CSP
+/// is maximally restrictive: no scripts, no frames, no anything. The
+/// headers here protect against the degenerate case where an attacker
+/// convinces a browser to render an API response as HTML (e.g. via a
+/// content-type confusion) or embed the API in an iframe.
+///
+/// Headers set:
+///   - `Strict-Transport-Security`: 2 years + includeSubDomains
+///   - `X-Content-Type-Options: nosniff`
+///   - `X-Frame-Options: DENY`
+///   - `Referrer-Policy: strict-origin-when-cross-origin`
+///   - `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'; base-uri 'none'`
+///   - `Cross-Origin-Resource-Policy: same-site`
+///   - `Cross-Origin-Opener-Policy: same-origin`
+///   - `Permissions-Policy`: denies camera/mic/geolocation/payment
+pub async fn security_headers_middleware(req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    let h = response.headers_mut();
+    h.insert(
+        "Strict-Transport-Security",
+        HeaderValue::from_static("max-age=63072000; includeSubDomains; preload"),
+    );
+    h.insert(
+        "X-Content-Type-Options",
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert("X-Frame-Options", HeaderValue::from_static("DENY"));
+    h.insert(
+        "Referrer-Policy",
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    h.insert(
+        "Content-Security-Policy",
+        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'; base-uri 'none'"),
+    );
+    h.insert(
+        "Cross-Origin-Resource-Policy",
+        HeaderValue::from_static("same-site"),
+    );
+    h.insert(
+        "Cross-Origin-Opener-Policy",
+        HeaderValue::from_static("same-origin"),
+    );
+    h.insert(
+        "Permissions-Policy",
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=(), payment=()"),
+    );
+    response
 }
 
 /// Reject requests from countries on the block list.
