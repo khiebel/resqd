@@ -1,0 +1,16 @@
+# Cloudflare Pages _headers file — served on every response from
+# app.resqd.ai / resqd.ai / resqd-app.pages.dev.
+#
+# Added 2026-04-10 for advisory LIVE-12. The API (api.resqd.ai) has
+# a matching set of headers applied in api/src/lib.rs
+# security_headers_middleware; these headers cover the HTML-origin
+# side of the same defense.
+
+/*
+  Strict-Transport-Security: max-age=63072000; includeSubDomains; preload
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=()
+  Cross-Origin-Opener-Policy: same-origin
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://api.resqd.ai https://sepolia.base.org; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'
