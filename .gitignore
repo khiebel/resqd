@@ -13,3 +13,9 @@ contracts/out/
 contracts/cache/
 contracts/broadcast/
 contracts/lib/
+
+# Ephemeral SMTP operational scripts — each one reads the Gmail app
+# password from ~/private/ and hardcodes real recipient addresses for
+# a specific one-off send. They live in the working directory during
+# an incident or outreach task and are not meant to be tracked.
+send_*.py

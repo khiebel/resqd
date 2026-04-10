@@ -140,10 +140,11 @@ path — not just a middleware assumption that the path was taken.
 That's what the WAFv2 lockdown (coming in the runbook) is for: belt
 AND suspenders, not just one or the other.
 
-A full writeup is being published as a GitHub security advisory on
-`khiebel/resqd` — the repo is AGPL-3.0 and the community norm is to
-disclose, credit the finder, and document the fix commit. Dave will
-be credited in the acknowledgements.
+A full writeup is published as a GitHub security advisory at
+<https://github.com/khiebel/resqd/security/advisories/GHSA-3hw9-8qjf-4864>.
+The repo is AGPL-3.0 and the community norm is to disclose, credit
+the finder, and document the fix commit. Dave is credited by name
+in the acknowledgements.
 
 Thanks for being part of the alpha. The whole point of an alpha with
 four of the original whiteboard people is to let a friendly red-teamer
