@@ -19,6 +19,7 @@ pub mod auth;
 pub mod handlers;
 pub mod rings;
 pub mod state;
+pub mod stream;
 
 pub use state::{AppConfig, AppState};
 
@@ -104,6 +105,23 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/vault", get(handlers::list_vault).post(handlers::upload))
         .route("/vault/init", post(handlers::init))
         .route("/vault/{id}/commit", post(handlers::commit))
+        // Streaming upload path (Chunk 1.4) — S3 multipart for files
+        // larger than the single-shot ~200 MB ceiling. Kept separate
+        // from the legacy `/vault/init` + `/vault/{id}/commit` path so
+        // the smoke tests and small-file flows continue to work.
+        .route("/vault/stream/init", post(stream::stream_init))
+        .route(
+            "/vault/stream/{id}/presigned-parts",
+            post(stream::stream_presigned_parts),
+        )
+        .route(
+            "/vault/stream/{id}/commit",
+            post(stream::stream_commit),
+        )
+        .route(
+            "/vault/stream/{id}/abort",
+            post(stream::stream_abort),
+        )
         .route(
             "/vault/{id}",
             get(handlers::fetch).delete(handlers::delete_asset),

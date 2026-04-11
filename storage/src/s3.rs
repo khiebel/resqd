@@ -99,6 +99,156 @@ impl S3Store {
             })
             .collect())
     }
+
+    // ── S3 multipart upload support ──────────────────────────────────
+    //
+    // Added 2026-04-11 for Verimus streaming integration Chunk 1.4. Used
+    // by the sharded-stream vault path where each shard accumulates its
+    // erasure-coded bytes across many chunk groups before finalizing as
+    // a single S3 object. S3's multipart upload lets the client push a
+    // file much larger than Lambda's payload cap, and each part is
+    // uploaded directly from the browser via a presigned URL so bytes
+    // never flow through Lambda at all.
+    //
+    // S3 requires that every part except the final one be at least 5 MB.
+    // This layer is agnostic to that — the client's streaming buffer is
+    // responsible for batching smaller chunk-group pieces into ≥5 MB
+    // parts before requesting a presigned UploadPart URL.
+
+    /// Start a multipart upload. Returns the S3-assigned `upload_id`
+    /// that subsequent `UploadPart`, `CompleteMultipartUpload`, and
+    /// `AbortMultipartUpload` calls must reference.
+    pub async fn create_multipart_upload(
+        &self,
+        key: &str,
+        content_type: &str,
+    ) -> StorageResult<String> {
+        let resp = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .content_type(content_type)
+            .send()
+            .await
+            .map_err(|e| StorageError::S3(format!("create_multipart {key}: {e}")))?;
+
+        resp.upload_id()
+            .map(|s| s.to_string())
+            .ok_or_else(|| StorageError::S3("create_multipart: no upload_id in response".into()))
+    }
+
+    /// Presign an `UploadPart` URL so the browser can PUT one part
+    /// directly to S3, bypassing Lambda. The client must PUT at least
+    /// 5 MB per part (except the final one) or S3 will reject the
+    /// eventual `CompleteMultipartUpload`.
+    ///
+    /// Part numbers are 1-indexed per the S3 spec (part 0 is illegal).
+    pub async fn presign_upload_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        ttl: Duration,
+    ) -> StorageResult<String> {
+        let presigned = self
+            .client
+            .upload_part()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .presigned(
+                PresigningConfig::expires_in(ttl)
+                    .map_err(|e| StorageError::S3(format!("presign config: {e}")))?,
+            )
+            .await
+            .map_err(|e| {
+                StorageError::S3(format!(
+                    "presign upload_part {key} part {part_number}: {e}"
+                ))
+            })?;
+        Ok(presigned.uri().to_string())
+    }
+
+    /// Finalize a multipart upload. `parts` is a list of
+    /// `(part_number, etag)` pairs in the order they were uploaded.
+    /// Part numbers must be unique and strictly increasing per the S3
+    /// spec. Each ETag must exactly match the value S3 returned in the
+    /// UploadPart response (with quoting stripped — this helper adds
+    /// them back in).
+    pub async fn complete_multipart_upload(
+        &self,
+        key: &str,
+        upload_id: &str,
+        parts: Vec<(i32, String)>,
+    ) -> StorageResult<()> {
+        use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+
+        let completed_parts: Vec<CompletedPart> = parts
+            .into_iter()
+            .map(|(part_number, etag)| {
+                // S3 stores ETags with embedded quotes; the client may or
+                // may not strip them. Normalize by re-quoting if needed.
+                let etag_quoted = if etag.starts_with('"') && etag.ends_with('"') {
+                    etag
+                } else {
+                    format!("\"{etag}\"")
+                };
+                CompletedPart::builder()
+                    .part_number(part_number)
+                    .e_tag(etag_quoted)
+                    .build()
+            })
+            .collect();
+
+        let multipart_upload = CompletedMultipartUpload::builder()
+            .set_parts(Some(completed_parts))
+            .build();
+
+        self.client
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(multipart_upload)
+            .send()
+            .await
+            .map_err(|e| StorageError::S3(format!("complete_multipart {key}: {e}")))?;
+        Ok(())
+    }
+
+    /// Abort an in-flight multipart upload. Safe to call on an upload
+    /// that's already been aborted or completed — S3 returns 404 in
+    /// those cases, which this method treats as a no-op.
+    pub async fn abort_multipart_upload(
+        &self,
+        key: &str,
+        upload_id: &str,
+    ) -> StorageResult<()> {
+        match self
+            .client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // 404 on abort is fine — the upload is already gone.
+                let s = format!("{e}");
+                if s.contains("NoSuchUpload") || s.contains("NotFound") {
+                    Ok(())
+                } else {
+                    Err(StorageError::S3(format!(
+                        "abort_multipart {key}: {e}"
+                    )))
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
