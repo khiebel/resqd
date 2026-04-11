@@ -4938,6 +4938,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
+ "blake3",
  "bytes",
  "futures",
  "reqwest 0.12.28",

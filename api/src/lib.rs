@@ -175,6 +175,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/admin/anchor-retries", get(admin::anchor_retry_stats))
         .route("/admin/retry-anchors", post(admin::retry_anchors))
+        .route("/admin/reaper/scan", post(admin::reaper_scan))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(

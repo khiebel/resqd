@@ -285,12 +285,22 @@ pub struct CommitResponse {
 /// shards come back as `download_url: null` (any 4 of 6 suffice).
 #[derive(Serialize)]
 pub struct ShardedFetchResponse {
-    pub mode: &'static str, // always "sharded"
+    /// `"sharded"` for legacy single-shot uploads; `"sharded-stream"`
+    /// for streaming uploads (Track 1). Client branches on this to
+    /// pick the correct decoder pipeline.
+    pub mode: String,
     pub asset_id: String,
     pub original_len: u64,
     pub data_shards: u8,
     pub parity_shards: u8,
     pub shards: Vec<ShardDownloadSlot>,
+    /// Opaque `{stream_manifest, stream_header, ...}` passthrough from
+    /// the `_manifest/{id}.json` sidecar. Present only when
+    /// `mode == "sharded-stream"`. The client feeds the inner fields
+    /// directly to `WasmStreamDecoder::new(manifest_json)` and
+    /// `WasmStreamDecryptor::new(header_json)` on the read side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_info: Option<serde_json::Value>,
     pub canary_sequence: u64,
     pub canary_hash_hex: String,
     pub ttl_seconds: u64,
@@ -384,10 +394,18 @@ pub struct ShardDownloadSlot {
 /// or as inline bytes in the erasure-coded vault.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct AssetManifest {
-    mode: String, // "sharded"
+    mode: String, // "sharded" or "sharded-stream"
     original_len: u64,
     data_shards: u8,
     parity_shards: u8,
+    /// Present only for `mode == "sharded-stream"` — opaque JSON carrying
+    /// the full StreamManifest + StreamHeader the client needs to
+    /// drive `WasmStreamDecoder` and `WasmStreamDecryptor` on read.
+    /// Stays as `serde_json::Value` here so we don't have to import the
+    /// core types into this crate for a single field that's a
+    /// pass-through.
+    #[serde(default)]
+    stream_info: Option<serde_json::Value>,
     /// Owner of this asset (JWT `sub` of the user who committed it).
     /// `None` means the asset was uploaded in legacy anonymous mode,
     /// pre-auth. Those assets stay accessible to anyone with the id
@@ -437,6 +455,15 @@ pub enum ApiError {
         cap: u64,
         requested: u64,
     },
+    /// Track 2 Chunk 2.4 — server-side absorption check rejected the
+    /// stream commit. Returns 422 with a structured body so the client
+    /// can surface which shards failed and why. Shards are listed as
+    /// indices 0..5 matching `shard_index` in the commit request.
+    #[error("absorption failed: {reason}")]
+    AbsorptionFailed {
+        reason: String,
+        failed_shard_indices: Vec<usize>,
+    },
     #[error("auth: {0}")]
     Auth(#[from] crate::auth::AuthError),
     #[error("internal error: {0}")]
@@ -464,6 +491,23 @@ impl IntoResponse for ApiError {
                         "storage_used_bytes": used,
                         "storage_quota_bytes": cap,
                         "requested_bytes": requested,
+                    })),
+                )
+                    .into_response()
+            }
+            ApiError::AbsorptionFailed { reason, failed_shard_indices } => {
+                // 422 Unprocessable Entity — the request shape was
+                // valid but the server couldn't commit the vault
+                // because shards didn't absorb. Client should surface
+                // which indices failed and offer a re-upload, NOT an
+                // automatic retry of the same bytes.
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "error": self.to_string(),
+                        "code": "absorption_failed",
+                        "reason": reason,
+                        "failed_shard_indices": failed_shard_indices,
                     })),
                 )
                     .into_response()
@@ -981,12 +1025,17 @@ pub async fn fetch(
             }
 
             let resp = ShardedFetchResponse {
-                mode: "sharded",
+                // Surface the actual manifest mode so the client can
+                // branch: streaming-uploaded assets need the streaming
+                // decoder path (decode → per-chunk decrypt), not the
+                // single-shot one.
+                mode: manifest.mode.clone(),
                 asset_id: asset_id.clone(),
                 original_len: manifest.original_len,
                 data_shards: manifest.data_shards,
                 parity_shards: manifest.parity_shards,
                 shards: slots,
+                stream_info: manifest.stream_info.clone(),
                 canary_sequence: new_commitment.sequence,
                 canary_hash_hex: new_commitment.hash.to_hex(),
                 ttl_seconds: PRESIGN_TTL.as_secs(),

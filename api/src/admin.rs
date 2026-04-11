@@ -50,7 +50,12 @@ use tracing::{error, info, warn};
 
 /// Write an audit log entry to the `resqd-admin-audit` DynamoDB table.
 /// Non-fatal: errors are logged but never fail the request.
-async fn log_admin_action(
+///
+/// Crate-public so system-origin events (e.g. proof-of-absorption
+/// failures from `stream::stream_commit`) can land in the same audit
+/// stream as human admin actions. Callers should pass `"system"` for
+/// `admin_email` in that case so the admin console can filter on it.
+pub(crate) async fn log_admin_action(
     db: &aws_sdk_dynamodb::Client,
     admin_email: &str,
     action: &str,
@@ -1599,5 +1604,233 @@ pub async fn retry_anchors(
         succeeded,
         failed,
         errors,
+    }))
+}
+
+// ── Absorption reaper (Track 2 Chunk 2.6) ───────────────────────────
+//
+// Walks recently-committed streaming vaults and re-runs the full-shard
+// BLAKE3 absorption check. Catches first-hour S3 bit-rot, bugs in the
+// streaming upload loop, and any subtle drift that slipped past the
+// commit-time verification. Each scan is bounded by a lookback window
+// (defaults to 60 minutes) so the reaper stays cheap and predictable.
+//
+// For MVP there's no new scheduled Lambda — admins invoke this
+// endpoint manually from the admin console, or an EventBridge rule
+// can POST to it on an hourly schedule once Kevin's happy with the
+// shape.
+
+#[derive(Deserialize)]
+pub struct ReaperScanRequest {
+    /// How far back to look for recently-committed vaults. Defaults
+    /// to 60 minutes; cap at 24 hours so a malformed request can't
+    /// sweep the entire bucket.
+    #[serde(default)]
+    pub since_minutes: Option<u32>,
+}
+
+#[derive(Serialize)]
+pub struct ReaperScanResponse {
+    pub window_minutes: u32,
+    pub considered: usize,
+    pub checked: usize,
+    pub passed: usize,
+    pub failed: Vec<ReaperFailure>,
+    pub skipped_reasons: std::collections::BTreeMap<String, usize>,
+}
+
+#[derive(Serialize)]
+pub struct ReaperFailure {
+    pub asset_id: String,
+    pub reason: String,
+    pub failed_shard_indices: Vec<usize>,
+}
+
+const REAPER_WINDOW_DEFAULT_MIN: u32 = 60;
+const REAPER_WINDOW_MAX_MIN: u32 = 24 * 60;
+
+/// `POST /admin/reaper/scan` — one-shot absorption sweep over
+/// streaming vaults committed in the last `since_minutes` minutes.
+pub async fn reaper_scan(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<ReaperScanRequest>,
+) -> Result<Json<ReaperScanResponse>, Response> {
+    let admin_email = require_admin(&headers)?;
+    let window_minutes = req
+        .since_minutes
+        .unwrap_or(REAPER_WINDOW_DEFAULT_MIN)
+        .min(REAPER_WINDOW_MAX_MIN);
+    let window_secs = window_minutes as i64 * 60;
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let cutoff = now_secs - window_secs;
+
+    // List every `_manifest/*.json` key; the storage layer caps this
+    // at 1000 entries for now, which is generous for alpha. When the
+    // bucket grows past that, list_prefix gains pagination.
+    let listing = state
+        .s3
+        .list_prefix("_manifest/")
+        .await
+        .map_err(|e| {
+            error!(error = %e, "reaper: list_prefix failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "list failed").into_response()
+        })?;
+
+    let considered = listing.len();
+    let mut skipped: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut passed = 0usize;
+    let mut failed: Vec<ReaperFailure> = Vec::new();
+    let mut checked = 0usize;
+
+    for (key, modified) in listing {
+        // Outside the window → skip. We still count it in
+        // `considered` so the caller can see what the scan looked at.
+        if let Some(t) = modified
+            && t < cutoff
+        {
+            *skipped.entry("too_old".into()).or_insert(0) += 1;
+            continue;
+        }
+        if modified.is_none() {
+            *skipped.entry("no_modified".into()).or_insert(0) += 1;
+            continue;
+        }
+
+        // Pull the manifest and parse enough to find the stream info.
+        let bytes = match state.vault.get(&key).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(key = %key, error = %e, "reaper: manifest get failed");
+                *skipped.entry("manifest_get_failed".into()).or_insert(0) += 1;
+                continue;
+            }
+        };
+        let manifest: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) => {
+                *skipped.entry("manifest_parse_failed".into()).or_insert(0) += 1;
+                continue;
+            }
+        };
+        let mode = manifest.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+        if mode != "sharded-stream" {
+            *skipped.entry("not_streaming".into()).or_insert(0) += 1;
+            continue;
+        }
+        let stream_info = match manifest.get("stream_info") {
+            Some(v) => v,
+            None => {
+                *skipped.entry("no_stream_info".into()).or_insert(0) += 1;
+                continue;
+            }
+        };
+        let expected_hashes = match stream_info
+            .get("expected_shard_hashes_hex")
+            .and_then(|v| v.as_array())
+        {
+            Some(arr) if arr.len() == 6 => arr.clone(),
+            _ => {
+                *skipped.entry("no_expected_hashes".into()).or_insert(0) += 1;
+                continue;
+            }
+        };
+
+        // asset_id = the last path segment of the manifest key,
+        // sans `.json`. `_manifest/{id}.json` → `{id}`.
+        let asset_id = key
+            .trim_start_matches("_manifest/")
+            .trim_end_matches(".json")
+            .to_string();
+
+        // Run the full-shard BLAKE3 check for each of the six shards.
+        // Same machinery as the commit-time gate from Chunk 2.3.
+        let mut bad: Vec<usize> = Vec::new();
+        let mut any_error = false;
+        for i in 0..6usize {
+            let expected_hex = match expected_hashes[i].as_str() {
+                Some(s) => s.to_ascii_lowercase(),
+                None => {
+                    bad.push(i);
+                    continue;
+                }
+            };
+            let shard_key =
+                format!("{}{asset_id}/shard-{i}", crate::state::LARGE_BLOB_PREFIX);
+            match state.s3.blake3_hex(&shard_key).await {
+                Ok(Some(h)) if h.to_ascii_lowercase() == expected_hex => {}
+                Ok(_) => bad.push(i),
+                Err(e) => {
+                    warn!(
+                        asset_id = %asset_id,
+                        shard = i,
+                        error = %e,
+                        "reaper: blake3_hex errored"
+                    );
+                    any_error = true;
+                    break;
+                }
+            }
+        }
+
+        checked += 1;
+        if any_error {
+            *skipped.entry("blake3_error".into()).or_insert(0) += 1;
+            continue;
+        }
+        if bad.is_empty() {
+            passed += 1;
+        } else {
+            let reason = "blake3_mismatch".to_string();
+            failed.push(ReaperFailure {
+                asset_id: asset_id.clone(),
+                reason: reason.clone(),
+                failed_shard_indices: bad.clone(),
+            });
+            if let Some(auth) = state.auth.as_ref() {
+                let detail = serde_json::json!({
+                    "asset_id": asset_id,
+                    "source": "reaper",
+                    "reason": reason,
+                    "failed_shard_indices": bad,
+                    "window_minutes": window_minutes,
+                });
+                log_admin_action(
+                    &auth.dynamo,
+                    "system",
+                    "shard_absorption_failed",
+                    &asset_id,
+                    &detail,
+                )
+                .await;
+            }
+        }
+    }
+
+    // Log a summary entry under the admin's identity so the audit
+    // console shows who ran the sweep and what it returned.
+    if let Some(auth) = state.auth.as_ref() {
+        let detail = serde_json::json!({
+            "window_minutes": window_minutes,
+            "considered": considered,
+            "checked": checked,
+            "passed": passed,
+            "failed": failed.len(),
+        });
+        log_admin_action(&auth.dynamo, &admin_email, "reaper_scan", "", &detail).await;
+    }
+
+    Ok(Json(ReaperScanResponse {
+        window_minutes,
+        considered,
+        checked,
+        passed,
+        failed,
+        skipped_reasons: skipped,
     }))
 }

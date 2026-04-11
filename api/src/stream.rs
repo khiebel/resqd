@@ -57,6 +57,11 @@
 use crate::auth::{AuthUser, ConsumeStorageResult};
 use crate::handlers::ApiError;
 use crate::state::{AppState, LARGE_BLOB_PREFIX};
+// Bring the ObjectStore trait into scope so we can call `.delete()`
+// on `state.s3` (an `Arc<S3Store>`) in the Chunk 2.2/2.3 cleanup paths.
+// Without this, the trait methods on S3Store are invisible here.
+#[allow(unused_imports)]
+use resqd_storage::ObjectStore;
 use axum::{
     Json,
     extract::{Path, State},
@@ -263,6 +268,12 @@ pub struct StreamCommitRequest {
     /// contents. Stashed in the manifest for Track 2 to consume later.
     #[serde(default)]
     pub expected_shard_hashes_hex: Option<Vec<String>>,
+    /// Client-declared byte count per shard (sum of every byte
+    /// appended into that shard buffer). Verified server-side against
+    /// S3 HeadObject after CompleteMultipartUpload — commit is
+    /// rejected on mismatch. Part of Chunk 2.2 absorption defense.
+    #[serde(default)]
+    pub expected_shard_bytes: Option<Vec<u64>>,
     /// Wrapped per-asset key + encrypted filename/mime meta — same
     /// semantics as the single-shot path.
     #[serde(default)]
@@ -579,6 +590,85 @@ pub async fn stream_commit(
         )));
     }
 
+    // Chunk 2.2 — proof-of-absorption, first rung.
+    //
+    // Now that all six multiparts have been finalized into real S3
+    // objects, HeadObject each shard and verify its ContentLength
+    // against what the client said it sent. This catches truncated or
+    // extended uploads at the network layer before we anchor anything
+    // on-chain. If the client didn't send `expected_shard_bytes` (e.g.
+    // an older TS build), we skip the check rather than fail-closed.
+    if let Some(expected_bytes) = &req.expected_shard_bytes {
+        if expected_bytes.len() != TOTAL_SHARDS {
+            return Err(ApiError::BadRequest(format!(
+                "expected_shard_bytes must have {TOTAL_SHARDS} entries, got {}",
+                expected_bytes.len()
+            )));
+        }
+        let mut mismatches: Vec<(usize, u64, Option<u64>)> = Vec::new();
+        for i in 0..TOTAL_SHARDS {
+            let key = &sidecar.shards[i].s3_key;
+            let actual = state
+                .s3
+                .head_content_length(key)
+                .await
+                .map_err(|e| ApiError::Internal(anyhow::anyhow!("head shard {i}: {e}")))?;
+            match actual {
+                Some(n) if n == expected_bytes[i] => {}
+                Some(n) => mismatches.push((i, expected_bytes[i], Some(n))),
+                None => mismatches.push((i, expected_bytes[i], None)),
+            }
+        }
+        if !mismatches.is_empty() {
+            warn!(
+                asset_id = %asset_id,
+                user_id = %user.user_id,
+                mismatches = ?mismatches,
+                "stream_commit rejected: shard content length mismatch"
+            );
+            // Chunk 2.5 — every absorption verdict (pass OR fail)
+            // lands in the admin audit stream so the admin console's
+            // "Failed Absorptions (24h)" tile can show zero in steady
+            // state and red on any incident. Failures carry enough
+            // context (shard index, expected vs observed bytes) to
+            // drive a postmortem without digging through Lambda logs.
+            if let Some(auth_state) = state.auth.as_ref() {
+                let detail = serde_json::json!({
+                    "asset_id": asset_id,
+                    "user_id": user.user_id,
+                    "reason": "content_length_mismatch",
+                    "mismatches": mismatches.iter().map(|(idx, exp, got)| {
+                        serde_json::json!({
+                            "shard_index": idx,
+                            "expected_bytes": exp,
+                            "observed_bytes": got,
+                        })
+                    }).collect::<Vec<_>>(),
+                });
+                crate::admin::log_admin_action(
+                    &auth_state.dynamo,
+                    "system",
+                    "shard_absorption_failed",
+                    &asset_id,
+                    &detail,
+                ).await;
+            }
+            // Best-effort cleanup — delete each composite shard object
+            // so we don't leave orphans. The ownership sidecar is
+            // deleted on return by the standard `delete_sidecar` call
+            // at the bottom of the success path, but we need to
+            // remove it manually on this error path too.
+            for i in 0..TOTAL_SHARDS {
+                let _ = state.s3.delete(&sidecar.shards[i].s3_key).await;
+            }
+            delete_sidecar(&state, &asset_id).await;
+            return Err(ApiError::AbsorptionFailed {
+                reason: "content_length_mismatch".into(),
+                failed_shard_indices: mismatches.iter().map(|(i, _, _)| *i).collect(),
+            });
+        }
+    }
+
     // Build the stream_info metadata for the manifest. Optional client-
     // supplied expected hashes are converted into a fixed-size array
     // (Option<[String; 6]>). If the client didn't send any, store None.
@@ -590,6 +680,80 @@ pub async fn stream_commit(
             None
         }
     });
+
+    // Chunk 2.3 — proof-of-absorption, second rung.
+    //
+    // With a client-supplied full-shard hash in hand, verify each
+    // shard byte-for-byte by streaming its object body through
+    // BLAKE3 on the server side. This is stricter than the plan's
+    // "random 16 KB range" sketch — we hash EVERY byte — which
+    // makes the defense independent of whether the client committed
+    // to a Merkle tree. Memory stays bounded because the SDK body
+    // is read into a fixed 256 KB reusable buffer inside
+    // `S3Store::blake3_hex`, not collected into `Bytes`.
+    //
+    // Cost: O(total_bytes) per commit. For the alpha population
+    // where files are <100 MB, this adds <1 s to a commit. If we
+    // ever reach multi-GB typical files, Chunk 2.6 (background
+    // reaper) or a Merkle-based random-range scheme can take this
+    // off the commit path.
+    if let Some(ref expected_hashes) = expected_shard_hashes_hex {
+        let mut mismatches: Vec<usize> = Vec::new();
+        for i in 0..TOTAL_SHARDS {
+            let key = &sidecar.shards[i].s3_key;
+            let expected = expected_hashes[i].to_ascii_lowercase();
+            if expected.is_empty() {
+                continue;
+            }
+            let actual = state
+                .s3
+                .blake3_hex(key)
+                .await
+                .map_err(|e| ApiError::Internal(anyhow::anyhow!("blake3 shard {i}: {e}")))?;
+            match actual {
+                Some(a) if a.to_ascii_lowercase() == expected => {}
+                _ => mismatches.push(i),
+            }
+        }
+        if !mismatches.is_empty() {
+            warn!(
+                asset_id = %asset_id,
+                user_id = %user.user_id,
+                mismatches = ?mismatches,
+                "stream_commit rejected: shard BLAKE3 mismatch (post-commit absorption)"
+            );
+            // Chunk 2.5 — record the BLAKE3 mismatch in the admin
+            // audit stream. Carries the shard indices that failed so
+            // the admin console can show which shards drifted.
+            if let Some(auth_state) = state.auth.as_ref() {
+                let detail = serde_json::json!({
+                    "asset_id": asset_id,
+                    "user_id": user.user_id,
+                    "reason": "blake3_mismatch",
+                    "failed_shard_indices": mismatches,
+                });
+                crate::admin::log_admin_action(
+                    &auth_state.dynamo,
+                    "system",
+                    "shard_absorption_failed",
+                    &asset_id,
+                    &detail,
+                ).await;
+            }
+            // Same cleanup pattern as the Content-Length mismatch
+            // branch above — delete the composite shard objects so
+            // they don't orphan and remove the ownership sidecar
+            // before returning the error.
+            for i in 0..TOTAL_SHARDS {
+                let _ = state.s3.delete(&sidecar.shards[i].s3_key).await;
+            }
+            delete_sidecar(&state, &asset_id).await;
+            return Err(ApiError::AbsorptionFailed {
+                reason: "blake3_mismatch".into(),
+                failed_shard_indices: mismatches,
+            });
+        }
+    }
 
     let stream_info = StreamInfo {
         version: 1,
