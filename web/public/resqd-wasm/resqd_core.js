@@ -1,6 +1,115 @@
 /* @ts-self-types="./resqd_core.d.ts" */
 
 /**
+ * Streaming BLAKE3 hasher — call `update` repeatedly, then `finalizeHex`.
+ * Used by the client-side streaming uploader to compute each shard's
+ * expected content hash without holding the entire shard in memory.
+ * This is the first rung of Track 2 (proof-of-absorption): the client
+ * ships these hashes with the stream commit so a future server-side
+ * random-range re-read can verify them.
+ */
+export class WasmBlake3Hasher {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        WasmBlake3HasherFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_wasmblake3hasher_free(ptr, 0);
+    }
+    /**
+     * @returns {string}
+     */
+    finalizeHex() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.wasmblake3hasher_finalizeHex(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    constructor() {
+        const ret = wasm.wasmblake3hasher_new();
+        this.__wbg_ptr = ret >>> 0;
+        WasmBlake3HasherFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * @param {Uint8Array} data
+     */
+    update(data) {
+        const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.wasmblake3hasher_update(this.__wbg_ptr, ptr0, len0);
+    }
+}
+if (Symbol.dispose) WasmBlake3Hasher.prototype[Symbol.dispose] = WasmBlake3Hasher.prototype.free;
+
+export class WasmStreamDecoder {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        WasmStreamDecoderFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_wasmstreamdecoder_free(ptr, 0);
+    }
+    /**
+     * Decode the next group. `shards_json` is a JSON array of 6 entries,
+     * each either a base64 string or null (for a missing shard).
+     * @param {string} shards_json
+     * @returns {Uint8Array}
+     */
+    decodeGroup(shards_json) {
+        const ptr0 = passStringToWasm0(shards_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmstreamdecoder_decodeGroup(this.__wbg_ptr, ptr0, len0);
+        if (ret[3]) {
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v2;
+    }
+    finish() {
+        const ret = wasm.wasmstreamdecoder_finish(this.__wbg_ptr);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * @returns {number}
+     */
+    groupsDecoded() {
+        const ret = wasm.wasmstreamdecoder_groupsDecoded(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @param {string} manifest_json
+     */
+    constructor(manifest_json) {
+        const ptr0 = passStringToWasm0(manifest_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmstreamdecoder_new(ptr0, len0);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        this.__wbg_ptr = ret[0] >>> 0;
+        WasmStreamDecoderFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+}
+if (Symbol.dispose) WasmStreamDecoder.prototype[Symbol.dispose] = WasmStreamDecoder.prototype.free;
+
+/**
  * Stateful streaming decryptor. Create one per file, feed the same chunk
  * JSONs back in the order they were sealed, call `finish()` to assert
  * the stream was not truncated.
@@ -71,6 +180,101 @@ export class WasmStreamDecryptor {
     }
 }
 if (Symbol.dispose) WasmStreamDecryptor.prototype[Symbol.dispose] = WasmStreamDecryptor.prototype.free;
+
+export class WasmStreamEncoder {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        WasmStreamEncoderFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_wasmstreamencoder_free(ptr, 0);
+    }
+    /**
+     * @param {Uint8Array} input
+     * @returns {string}
+     */
+    encodeGroup(input) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const ptr0 = passArray8ToWasm0(input, wasm.__wbindgen_malloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ret = wasm.wasmstreamencoder_encodeGroup(this.__wbg_ptr, ptr0, len0);
+            var ptr2 = ret[0];
+            var len2 = ret[1];
+            if (ret[3]) {
+                ptr2 = 0; len2 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
+     * Consume the encoder and return the StreamManifest as JSON.
+     * Forward this verbatim to POST /vault/stream/commit. After calling
+     * `finish`, any other method on this instance returns an error.
+     * @returns {string}
+     */
+    finishJson() {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ret = wasm.wasmstreamencoder_finishJson(this.__wbg_ptr);
+            var ptr1 = ret[0];
+            var len1 = ret[1];
+            if (ret[3]) {
+                ptr1 = 0; len1 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
+     * @returns {number}
+     */
+    groupsEncoded() {
+        const ret = wasm.wasmstreamencoder_groupsEncoded(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    constructor() {
+        const ret = wasm.wasmstreamencoder_new();
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        this.__wbg_ptr = ret[0] >>> 0;
+        WasmStreamEncoderFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * Total input bytes. Returned as string because u64 doesn't round-trip
+     * through the JS Number type for files >2^53 bytes.
+     * @returns {string}
+     */
+    totalInputBytes() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.wasmstreamencoder_totalInputBytes(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+}
+if (Symbol.dispose) WasmStreamEncoder.prototype[Symbol.dispose] = WasmStreamEncoder.prototype.free;
 
 /**
  * Stateful streaming encryptor. Create one per file, call `sealChunk`
@@ -760,9 +964,18 @@ function __wbg_get_imports() {
     };
 }
 
+const WasmBlake3HasherFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_wasmblake3hasher_free(ptr >>> 0, 1));
+const WasmStreamDecoderFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_wasmstreamdecoder_free(ptr >>> 0, 1));
 const WasmStreamDecryptorFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_wasmstreamdecryptor_free(ptr >>> 0, 1));
+const WasmStreamEncoderFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_wasmstreamencoder_free(ptr >>> 0, 1));
 const WasmStreamEncryptorFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_wasmstreamencryptor_free(ptr >>> 0, 1));

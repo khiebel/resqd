@@ -27,6 +27,34 @@ pub fn hash_commit(data: &[u8], context: &[u8]) -> String {
     hash::AssetHash::commit(data, context).to_hex()
 }
 
+/// Streaming BLAKE3 hasher — call `update` repeatedly, then `finalizeHex`.
+/// Used by the client-side streaming uploader to compute each shard's
+/// expected content hash without holding the entire shard in memory.
+/// This is the first rung of Track 2 (proof-of-absorption): the client
+/// ships these hashes with the stream commit so a future server-side
+/// random-range re-read can verify them.
+#[wasm_bindgen]
+pub struct WasmBlake3Hasher {
+    inner: blake3::Hasher,
+}
+
+#[wasm_bindgen]
+impl WasmBlake3Hasher {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> WasmBlake3Hasher {
+        Self { inner: blake3::Hasher::new() }
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        self.inner.update(data);
+    }
+
+    #[wasm_bindgen(js_name = finalizeHex)]
+    pub fn finalize_hex(&self) -> String {
+        self.inner.finalize().to_hex().to_string()
+    }
+}
+
 // ── Encryption ───────────────────────────────────────────────────────
 
 /// Encrypt plaintext with a 32-byte key. Returns JSON {nonce, ciphertext} (base64).
@@ -245,6 +273,135 @@ impl WasmStreamDecryptor {
     #[wasm_bindgen(js_name = chunksOpened)]
     pub fn chunks_opened(&self) -> u32 {
         self.inner.chunks_opened()
+    }
+}
+
+// ── Streaming Erasure Coding ─────────────────────────────────────────
+//
+// Companion to `WasmStreamEncryptor`. The browser's upload loop
+// typically calls encrypt-chunk → encode-group → append-to-shards.
+// Each group yields 6 shard-chunks; the caller buffers shard i into
+// the S3 multipart upload for shard i.
+//
+// Wire format between the encoder and the TS `StreamingUploader`:
+//   encodeGroup(Uint8Array) → JSON:
+//     { "group_index": N, "shards_b64": [s0, s1, s2, s3, s4, s5] }
+//   finish() → manifest JSON (serde default on StreamManifest)
+//
+// The manifest blob is opaque to TS — it's forwarded verbatim to the
+// Lambda's `/vault/stream/commit` endpoint where it is parsed back
+// into `StreamManifest` on the server side.
+
+#[wasm_bindgen]
+pub struct WasmStreamEncoder {
+    inner: Option<erasure::StreamEncoder>,
+}
+
+#[wasm_bindgen]
+impl WasmStreamEncoder {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Result<WasmStreamEncoder, JsError> {
+        Ok(Self {
+            inner: Some(
+                erasure::StreamEncoder::new().map_err(|e| JsError::new(&e.to_string()))?,
+            ),
+        })
+    }
+
+    #[wasm_bindgen(js_name = encodeGroup)]
+    pub fn encode_group(&mut self, input: &[u8]) -> Result<String, JsError> {
+        let enc = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| JsError::new("encoder already finished"))?;
+        let group = enc
+            .encode_group(input)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        let shards_b64: Vec<String> = group.shards.iter().map(|s| base64_encode(s)).collect();
+
+        #[derive(serde::Serialize)]
+        struct WasmShardGroup {
+            group_index: u32,
+            shards_b64: Vec<String>,
+        }
+        serde_json::to_string(&WasmShardGroup {
+            group_index: group.group_index,
+            shards_b64,
+        })
+        .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    #[wasm_bindgen(js_name = groupsEncoded)]
+    pub fn groups_encoded(&self) -> u32 {
+        self.inner.as_ref().map(|e| e.groups_encoded()).unwrap_or(0)
+    }
+
+    /// Total input bytes. Returned as string because u64 doesn't round-trip
+    /// through the JS Number type for files >2^53 bytes.
+    #[wasm_bindgen(js_name = totalInputBytes)]
+    pub fn total_input_bytes(&self) -> String {
+        self.inner
+            .as_ref()
+            .map(|e| e.total_input_bytes().to_string())
+            .unwrap_or_else(|| "0".to_string())
+    }
+
+    /// Consume the encoder and return the StreamManifest as JSON.
+    /// Forward this verbatim to POST /vault/stream/commit. After calling
+    /// `finish`, any other method on this instance returns an error.
+    #[wasm_bindgen(js_name = finishJson)]
+    pub fn finish_json(&mut self) -> Result<String, JsError> {
+        let enc = self
+            .inner
+            .take()
+            .ok_or_else(|| JsError::new("encoder already finished"))?;
+        let manifest = enc.finish();
+        serde_json::to_string(&manifest).map_err(|e| JsError::new(&e.to_string()))
+    }
+}
+
+#[wasm_bindgen]
+pub struct WasmStreamDecoder {
+    inner: erasure::StreamDecoder,
+}
+
+#[wasm_bindgen]
+impl WasmStreamDecoder {
+    #[wasm_bindgen(constructor)]
+    pub fn new(manifest_json: &str) -> Result<WasmStreamDecoder, JsError> {
+        let manifest: erasure::StreamManifest = serde_json::from_str(manifest_json)
+            .map_err(|e| JsError::new(&format!("parse manifest: {e}")))?;
+        Ok(Self {
+            inner: erasure::StreamDecoder::new(manifest)
+                .map_err(|e| JsError::new(&e.to_string()))?,
+        })
+    }
+
+    /// Decode the next group. `shards_json` is a JSON array of 6 entries,
+    /// each either a base64 string or null (for a missing shard).
+    #[wasm_bindgen(js_name = decodeGroup)]
+    pub fn decode_group(&mut self, shards_json: &str) -> Result<Vec<u8>, JsError> {
+        let raw: Vec<Option<String>> = serde_json::from_str(shards_json)
+            .map_err(|e| JsError::new(&format!("parse shards: {e}")))?;
+        let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(raw.len());
+        for s in raw {
+            shards.push(match s {
+                Some(b64) => Some(base64_decode(&b64)?),
+                None => None,
+            });
+        }
+        self.inner
+            .decode_group(shards)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    #[wasm_bindgen(js_name = groupsDecoded)]
+    pub fn groups_decoded(&self) -> u32 {
+        self.inner.groups_decoded()
+    }
+
+    pub fn finish(&self) -> Result<(), JsError> {
+        self.inner.finish().map_err(|e| JsError::new(&e.to_string()))
     }
 }
 

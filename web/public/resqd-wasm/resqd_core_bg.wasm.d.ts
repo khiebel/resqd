@@ -1,7 +1,10 @@
 /* tslint:disable */
 /* eslint-disable */
 export const memory: WebAssembly.Memory;
+export const __wbg_wasmblake3hasher_free: (a: number, b: number) => void;
+export const __wbg_wasmstreamdecoder_free: (a: number, b: number) => void;
 export const __wbg_wasmstreamdecryptor_free: (a: number, b: number) => void;
+export const __wbg_wasmstreamencoder_free: (a: number, b: number) => void;
 export const __wbg_wasmstreamencryptor_free: (a: number, b: number) => void;
 export const canary_create: (a: number, b: number) => [number, number, number, number];
 export const canary_rotate: (a: number, b: number) => [number, number, number, number];
@@ -18,10 +21,22 @@ export const hash_commit: (a: number, b: number, c: number, d: number) => [numbe
 export const kem_decapsulate: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const kem_encapsulate: (a: number, b: number) => [number, number, number, number];
 export const kem_generate: () => [number, number, number, number];
+export const wasmblake3hasher_finalizeHex: (a: number) => [number, number];
+export const wasmblake3hasher_new: () => number;
+export const wasmblake3hasher_update: (a: number, b: number, c: number) => void;
+export const wasmstreamdecoder_decodeGroup: (a: number, b: number, c: number) => [number, number, number, number];
+export const wasmstreamdecoder_finish: (a: number) => [number, number];
+export const wasmstreamdecoder_groupsDecoded: (a: number) => number;
+export const wasmstreamdecoder_new: (a: number, b: number) => [number, number, number];
 export const wasmstreamdecryptor_chunksOpened: (a: number) => number;
 export const wasmstreamdecryptor_finish: (a: number) => [number, number];
 export const wasmstreamdecryptor_new: (a: number, b: number, c: number, d: number) => [number, number, number];
 export const wasmstreamdecryptor_openChunk: (a: number, b: number, c: number) => [number, number, number, number];
+export const wasmstreamencoder_encodeGroup: (a: number, b: number, c: number) => [number, number, number, number];
+export const wasmstreamencoder_finishJson: (a: number) => [number, number, number, number];
+export const wasmstreamencoder_groupsEncoded: (a: number) => number;
+export const wasmstreamencoder_new: () => [number, number, number];
+export const wasmstreamencoder_totalInputBytes: (a: number) => [number, number];
 export const wasmstreamencryptor_headerJson: (a: number) => [number, number, number, number];
 export const wasmstreamencryptor_isFinished: (a: number) => number;
 export const wasmstreamencryptor_new: (a: number, b: number, c: number) => [number, number, number];

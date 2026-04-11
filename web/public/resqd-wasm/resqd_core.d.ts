@@ -2,6 +2,35 @@
 /* eslint-disable */
 
 /**
+ * Streaming BLAKE3 hasher — call `update` repeatedly, then `finalizeHex`.
+ * Used by the client-side streaming uploader to compute each shard's
+ * expected content hash without holding the entire shard in memory.
+ * This is the first rung of Track 2 (proof-of-absorption): the client
+ * ships these hashes with the stream commit so a future server-side
+ * random-range re-read can verify them.
+ */
+export class WasmBlake3Hasher {
+    free(): void;
+    [Symbol.dispose](): void;
+    finalizeHex(): string;
+    constructor();
+    update(data: Uint8Array): void;
+}
+
+export class WasmStreamDecoder {
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Decode the next group. `shards_json` is a JSON array of 6 entries,
+     * each either a base64 string or null (for a missing shard).
+     */
+    decodeGroup(shards_json: string): Uint8Array;
+    finish(): void;
+    groupsDecoded(): number;
+    constructor(manifest_json: string);
+}
+
+/**
  * Stateful streaming decryptor. Create one per file, feed the same chunk
  * JSONs back in the order they were sealed, call `finish()` to assert
  * the stream was not truncated.
@@ -25,6 +54,25 @@ export class WasmStreamDecryptor {
      * Returns the plaintext bytes.
      */
     openChunk(chunk_json: string): Uint8Array;
+}
+
+export class WasmStreamEncoder {
+    free(): void;
+    [Symbol.dispose](): void;
+    encodeGroup(input: Uint8Array): string;
+    /**
+     * Consume the encoder and return the StreamManifest as JSON.
+     * Forward this verbatim to POST /vault/stream/commit. After calling
+     * `finish`, any other method on this instance returns an error.
+     */
+    finishJson(): string;
+    groupsEncoded(): number;
+    constructor();
+    /**
+     * Total input bytes. Returned as string because u64 doesn't round-trip
+     * through the JS Number type for files >2^53 bytes.
+     */
+    totalInputBytes(): string;
 }
 
 /**
@@ -170,7 +218,10 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
+    readonly __wbg_wasmblake3hasher_free: (a: number, b: number) => void;
+    readonly __wbg_wasmstreamdecoder_free: (a: number, b: number) => void;
     readonly __wbg_wasmstreamdecryptor_free: (a: number, b: number) => void;
+    readonly __wbg_wasmstreamencoder_free: (a: number, b: number) => void;
     readonly __wbg_wasmstreamencryptor_free: (a: number, b: number) => void;
     readonly canary_create: (a: number, b: number) => [number, number, number, number];
     readonly canary_rotate: (a: number, b: number) => [number, number, number, number];
@@ -187,10 +238,22 @@ export interface InitOutput {
     readonly kem_decapsulate: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly kem_encapsulate: (a: number, b: number) => [number, number, number, number];
     readonly kem_generate: () => [number, number, number, number];
+    readonly wasmblake3hasher_finalizeHex: (a: number) => [number, number];
+    readonly wasmblake3hasher_new: () => number;
+    readonly wasmblake3hasher_update: (a: number, b: number, c: number) => void;
+    readonly wasmstreamdecoder_decodeGroup: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly wasmstreamdecoder_finish: (a: number) => [number, number];
+    readonly wasmstreamdecoder_groupsDecoded: (a: number) => number;
+    readonly wasmstreamdecoder_new: (a: number, b: number) => [number, number, number];
     readonly wasmstreamdecryptor_chunksOpened: (a: number) => number;
     readonly wasmstreamdecryptor_finish: (a: number) => [number, number];
     readonly wasmstreamdecryptor_new: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly wasmstreamdecryptor_openChunk: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly wasmstreamencoder_encodeGroup: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly wasmstreamencoder_finishJson: (a: number) => [number, number, number, number];
+    readonly wasmstreamencoder_groupsEncoded: (a: number) => number;
+    readonly wasmstreamencoder_new: () => [number, number, number];
+    readonly wasmstreamencoder_totalInputBytes: (a: number) => [number, number];
     readonly wasmstreamencryptor_headerJson: (a: number) => [number, number, number, number];
     readonly wasmstreamencryptor_isFinished: (a: number) => number;
     readonly wasmstreamencryptor_new: (a: number, b: number, c: number) => [number, number, number];
