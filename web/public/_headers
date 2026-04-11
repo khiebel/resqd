@@ -13,4 +13,4 @@
   Referrer-Policy: strict-origin-when-cross-origin
   Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=()
   Cross-Origin-Opener-Policy: same-origin
-  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://api.resqd.ai https://pjoq4jjjtb.execute-api.us-east-1.amazonaws.com https://sepolia.base.org; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://api.resqd.ai https://pjoq4jjjtb.execute-api.us-east-1.amazonaws.com https://resqd-vault-64553a1a.s3.us-east-1.amazonaws.com https://resqd-vault-64553a1a.s3.amazonaws.com https://sepolia.base.org; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'
