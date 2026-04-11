@@ -41,6 +41,12 @@ export interface SessionUser {
   /** Populated by /auth/me (not by the login/signup responses). */
   storage_used_bytes?: number;
   storage_quota_bytes?: number;
+  /** Populated by /auth/me only. True when the user has a recovery
+   *  passphrase blob set on the server, meaning they can unlock the
+   *  vault from a non-PRF device (iOS Safari) by typing their
+   *  passphrase. Settings uses this to decide which recovery-passphrase
+   *  UI state to render. */
+  has_recovery_blob?: boolean;
 }
 
 // ── Base64url helpers ────────────────────────────────────────────────

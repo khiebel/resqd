@@ -11,6 +11,12 @@ import {
   type SessionUser,
 } from "../lib/passkey";
 import { exportRecoveryKit, type ExportProgress } from "../lib/recoveryKit";
+import {
+  setRecoveryPassphrase,
+  deleteRecoveryPassphrase,
+  estimatePassphraseStrength,
+  MIN_PASSPHRASE_LENGTH,
+} from "../lib/recovery";
 import { entropyToMnemonic } from "@scure/bip39";
 import { wordlist } from "@scure/bip39/wordlists/english.js";
 
@@ -53,6 +59,21 @@ export default function SettingsPage() {
   const [kitProgress, setKitProgress] = useState<ExportProgress | null>(null);
   const [kitBusy, setKitBusy] = useState(false);
 
+  // Recovery passphrase state.
+  const [passphraseOpen, setPassphraseOpen] = useState(false);
+  const [passphrase, setPassphrase] = useState("");
+  const [passphraseConfirm, setPassphraseConfirm] = useState("");
+  const [passphraseBusy, setPassphraseBusy] = useState(false);
+  const [passphraseError, setPassphraseError] = useState<string | null>(null);
+  const [passphraseRevealed, setPassphraseRevealed] = useState(false);
+  const passphraseStrength = estimatePassphraseStrength(passphrase);
+  const passphrasesMatch =
+    passphrase.length > 0 && passphrase === passphraseConfirm;
+  const canSubmitPassphrase =
+    !passphraseBusy &&
+    passphraseStrength.meetsMinimum &&
+    passphrasesMatch;
+
   const onExportKit = async () => {
     setKitBusy(true);
     setKitProgress({ phase: "init" });
@@ -60,6 +81,74 @@ export default function SettingsPage() {
       await exportRecoveryKit((p) => setKitProgress(p));
     } finally {
       setKitBusy(false);
+    }
+  };
+
+  const resetPassphraseForm = () => {
+    setPassphraseOpen(false);
+    setPassphrase("");
+    setPassphraseConfirm("");
+    setPassphraseError(null);
+    setPassphraseRevealed(false);
+  };
+
+  const onSetPassphrase = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setPassphraseError(null);
+    if (!passphraseStrength.meetsMinimum) {
+      setPassphraseError(
+        `Passphrase must be at least ${MIN_PASSPHRASE_LENGTH} characters.`,
+      );
+      return;
+    }
+    if (!passphrasesMatch) {
+      setPassphraseError("Passphrases do not match.");
+      return;
+    }
+    const mk = loadMasterKey();
+    if (!mk) {
+      setPassphraseError(
+        "Master key not in memory. Sign in again with your passkey before setting a passphrase.",
+      );
+      return;
+    }
+    setPassphraseBusy(true);
+    try {
+      await setRecoveryPassphrase(passphrase, mk);
+      // Refresh /auth/me so has_recovery_blob flips to true in the
+      // UI without requiring a full page reload.
+      const me = await fetchMe();
+      if (me) setUser(me);
+      resetPassphraseForm();
+    } catch (err) {
+      setPassphraseError(
+        err instanceof Error ? err.message : String(err),
+      );
+    } finally {
+      setPassphraseBusy(false);
+    }
+  };
+
+  const onRemovePassphrase = async () => {
+    if (
+      !window.confirm(
+        "Remove your recovery passphrase? You will no longer be able to unlock this vault from iPhone Safari or any other device without WebAuthn PRF support. This cannot be undone.",
+      )
+    ) {
+      return;
+    }
+    setPassphraseBusy(true);
+    setPassphraseError(null);
+    try {
+      await deleteRecoveryPassphrase();
+      const me = await fetchMe();
+      if (me) setUser(me);
+    } catch (err) {
+      setPassphraseError(
+        err instanceof Error ? err.message : String(err),
+      );
+    } finally {
+      setPassphraseBusy(false);
     }
   };
 
@@ -402,6 +491,235 @@ export default function SettingsPage() {
           </div>
         </section>
       )}
+
+      {/* ─────────────── Recovery passphrase ─────────────── */}
+
+      <section className="mt-10">
+        <h2 className="text-xl font-semibold mb-1">
+          Recovery passphrase — iPhone access
+        </h2>
+        <p className="text-xs text-slate-500 mb-4 leading-relaxed">
+          Safari on iPhone does not support the hardware passkey method
+          RESQD uses everywhere else. Without a recovery passphrase, your
+          vault cannot be unlocked from an iPhone at all. Set one here
+          and you gain the ability to sign in on any device — at the
+          cost of a weaker security floor.
+        </p>
+
+        {/* Security posture badge */}
+        <div
+          className={
+            user?.has_recovery_blob
+              ? "mb-4 bg-yellow-950/30 border border-yellow-900 rounded-lg p-3 text-xs text-yellow-300 leading-relaxed"
+              : "mb-4 bg-green-950/30 border border-green-900 rounded-lg p-3 text-xs text-green-300 leading-relaxed"
+          }
+        >
+          {user?.has_recovery_blob ? (
+            <>
+              <b>Security posture: hardware passkey + recovery passphrase.</b>{" "}
+              Your vault can be unlocked from any device using your
+              passphrase. Effective security is min(passkey, passphrase) —
+              so if your passphrase is weak, so is your vault. If you
+              generated it with a password manager, you&apos;re fine.
+            </>
+          ) : (
+            <>
+              <b>Security posture: hardware passkey only.</b> Your vault can
+              only be unlocked from devices that support the WebAuthn
+              PRF extension (Mac, PC, Android Chrome). You cannot sign
+              in on iPhone Safari.
+            </>
+          )}
+        </div>
+
+        {!passphraseOpen && !user?.has_recovery_blob && (
+          <button
+            onClick={() => setPassphraseOpen(true)}
+            disabled={!masterKeyB64}
+            className="rounded-lg bg-amber-500 text-slate-900 font-semibold px-5 py-2.5 text-sm disabled:opacity-30"
+          >
+            Set recovery passphrase
+          </button>
+        )}
+
+        {!passphraseOpen && user?.has_recovery_blob && (
+          <div className="flex gap-3">
+            <button
+              onClick={() => setPassphraseOpen(true)}
+              disabled={!masterKeyB64 || passphraseBusy}
+              className="rounded-lg bg-amber-500 text-slate-900 font-semibold px-5 py-2.5 text-sm disabled:opacity-30"
+            >
+              Change passphrase
+            </button>
+            <button
+              onClick={onRemovePassphrase}
+              disabled={passphraseBusy}
+              className="rounded-lg border border-red-900 text-red-400 font-semibold px-5 py-2.5 text-sm hover:bg-red-950/30 disabled:opacity-30"
+            >
+              Remove passphrase
+            </button>
+          </div>
+        )}
+
+        {passphraseOpen && (
+          <form onSubmit={onSetPassphrase} className="space-y-4">
+            <div className="bg-amber-950/30 border border-amber-900 rounded-lg p-4 text-xs text-amber-200 leading-relaxed space-y-2">
+              <p className="font-semibold text-amber-100">
+                Read this before choosing a passphrase
+              </p>
+              <ul className="list-disc list-inside space-y-1">
+                <li>
+                  On Mac / PC / Android, your master key is derived inside
+                  your device&apos;s secure hardware. An attacker who steals
+                  your session cannot decrypt your files without your
+                  biometric.
+                </li>
+                <li>
+                  With a passphrase, your master key is derived from what
+                  you type. An attacker who learns the passphrase — via a
+                  breach, keylogger, or shoulder-surfing — can decrypt
+                  everything.
+                </li>
+                <li>
+                  <b>If you forget your passphrase, your data is
+                    unrecoverable.</b>{" "}
+                  RESQD has no password reset. The whole point of the
+                  vault is that we can&apos;t see your keys.
+                </li>
+              </ul>
+              <p className="font-semibold text-amber-100 mt-3">
+                Strongly recommended
+              </p>
+              <ul className="list-disc list-inside space-y-1">
+                <li>
+                  Use a password manager (1Password, Bitwarden, iCloud
+                  Keychain) to generate a <b>20+ character random
+                    passphrase</b>. Save it in the manager.
+                </li>
+                <li>
+                  Whenever possible, sign in from a device with Touch ID /
+                  Face ID / fingerprint — those devices use the stronger
+                  hardware path automatically even when a passphrase is
+                  set.
+                </li>
+                <li>
+                  Print your Recovery Kit (below) as an offline backup
+                  independent of your passphrase.
+                </li>
+              </ul>
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-400 uppercase tracking-wide mb-1">
+                Passphrase
+              </label>
+              <div className="relative">
+                <input
+                  type={passphraseRevealed ? "text" : "password"}
+                  value={passphrase}
+                  onChange={(e) => setPassphrase(e.target.value)}
+                  placeholder={`At least ${MIN_PASSPHRASE_LENGTH} characters`}
+                  disabled={passphraseBusy}
+                  autoComplete="new-password"
+                  className="w-full bg-slate-900 border border-slate-800 rounded-lg p-3 text-sm font-mono"
+                />
+                <button
+                  type="button"
+                  onClick={() => setPassphraseRevealed(!passphraseRevealed)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-500 hover:text-slate-300"
+                  tabIndex={-1}
+                >
+                  {passphraseRevealed ? "Hide" : "Show"}
+                </button>
+              </div>
+
+              {/* Strength meter */}
+              {passphrase.length > 0 && (
+                <div className="mt-2">
+                  <div className="flex gap-1 h-1">
+                    {[1, 2, 3, 4].map((bar) => (
+                      <div
+                        key={bar}
+                        className={`flex-1 rounded ${
+                          bar <= passphraseStrength.score
+                            ? passphraseStrength.score <= 1
+                              ? "bg-red-500"
+                              : passphraseStrength.score === 2
+                                ? "bg-yellow-500"
+                                : passphraseStrength.score === 3
+                                  ? "bg-lime-500"
+                                  : "bg-green-500"
+                            : "bg-slate-800"
+                        }`}
+                      />
+                    ))}
+                  </div>
+                  <div className="flex justify-between mt-1 text-xs">
+                    <span
+                      className={
+                        passphraseStrength.meetsMinimum
+                          ? "text-slate-400"
+                          : "text-red-400"
+                      }
+                    >
+                      {passphraseStrength.label}
+                    </span>
+                    <span className="text-slate-500">
+                      ~{passphraseStrength.bits} bits
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-400 uppercase tracking-wide mb-1">
+                Confirm passphrase
+              </label>
+              <input
+                type={passphraseRevealed ? "text" : "password"}
+                value={passphraseConfirm}
+                onChange={(e) => setPassphraseConfirm(e.target.value)}
+                placeholder="Type it again"
+                disabled={passphraseBusy}
+                autoComplete="new-password"
+                className="w-full bg-slate-900 border border-slate-800 rounded-lg p-3 text-sm font-mono"
+              />
+              {passphraseConfirm.length > 0 && !passphrasesMatch && (
+                <p className="mt-1 text-xs text-red-400">
+                  Passphrases do not match.
+                </p>
+              )}
+            </div>
+
+            {passphraseError && (
+              <p className="text-sm text-red-400">{passphraseError}</p>
+            )}
+
+            <div className="flex gap-3">
+              <button
+                type="submit"
+                disabled={!canSubmitPassphrase}
+                className="rounded-lg bg-amber-500 text-slate-900 font-semibold px-5 py-2.5 text-sm disabled:opacity-30"
+              >
+                {passphraseBusy
+                  ? "Wrapping master key…"
+                  : user?.has_recovery_blob
+                    ? "Save new passphrase"
+                    : "Save passphrase"}
+              </button>
+              <button
+                type="button"
+                onClick={resetPassphraseForm}
+                disabled={passphraseBusy}
+                className="rounded-lg border border-slate-800 text-slate-400 font-semibold px-5 py-2.5 text-sm hover:bg-slate-900 disabled:opacity-30"
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        )}
+      </section>
 
       {/* ─────────────── Recovery Kit ─────────────── */}
 
