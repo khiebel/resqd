@@ -218,6 +218,74 @@ impl S3Store {
         Ok(())
     }
 
+    /// Stream the object's body through BLAKE3 and return the hex
+    /// digest. The body bytes are consumed in chunks so Lambda memory
+    /// stays bounded by the largest single SDK buffer, not the total
+    /// shard size. This is Track 2 Chunk 2.3 — the server-side
+    /// absorption check, stricter than "random range" because it
+    /// verifies every byte of the shard.
+    pub async fn blake3_hex(&self, key: &str) -> StorageResult<Option<String>> {
+        use tokio::io::AsyncReadExt;
+        let resp = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await;
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                let s = format!("{e}");
+                if s.contains("NoSuchKey") || s.contains("NotFound") || s.contains("404") {
+                    return Ok(None);
+                }
+                return Err(StorageError::S3(format!("get {key}: {e}")));
+            }
+        };
+        let mut reader = resp.body.into_async_read();
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .await
+                .map_err(|e| StorageError::S3(format!("read {key}: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(Some(hasher.finalize().to_hex().to_string()))
+    }
+
+    /// Fetch the content length of an object without downloading the
+    /// body. Used by the Track 2 proof-of-absorption path to verify
+    /// that a completed multipart upload assembled to the byte count
+    /// the client claimed it would. Returns `None` if the object
+    /// doesn't exist (treated by callers as a verification failure,
+    /// not a 500).
+    pub async fn head_content_length(&self, key: &str) -> StorageResult<Option<u64>> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(resp) => Ok(resp.content_length().map(|n| n.max(0) as u64)),
+            Err(e) => {
+                let s = format!("{e}");
+                if s.contains("NotFound") || s.contains("NoSuchKey") || s.contains("404") {
+                    Ok(None)
+                } else {
+                    Err(StorageError::S3(format!("head {key}: {e}")))
+                }
+            }
+        }
+    }
+
     /// Abort an in-flight multipart upload. Safe to call on an upload
     /// that's already been aborted or completed — S3 returns 404 in
     /// those cases, which this method treats as a no-op.
