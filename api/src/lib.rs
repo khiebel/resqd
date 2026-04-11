@@ -93,6 +93,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/auth/me", get(auth::me))
         .route("/auth/me/identity", axum::routing::put(auth::set_identity))
+        .route(
+            "/auth/me/recovery-blob",
+            get(auth::get_recovery_blob)
+                .put(auth::set_recovery_blob)
+                .delete(auth::delete_recovery_blob),
+        )
         .route("/auth/logout", post(auth::logout))
         .route(
             "/auth/tokens",

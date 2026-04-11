@@ -246,6 +246,28 @@ pub struct UserRow {
     /// sender's pubkey without a fresh passkey prompt.
     #[serde(default)]
     pub wrapped_privkey_x25519_b64: Option<String>,
+    /// The user's master key wrapped under a KEK derived from a
+    /// user-chosen passphrase via Argon2id. Opt-in. Set when the user
+    /// (on a PRF-capable device) adds a recovery passphrase from
+    /// Settings, or when an iPhone user signs up fresh and has no PRF
+    /// available. Lets clients that lack WebAuthn PRF (currently iOS
+    /// Safari) unlock the vault by downloading this blob and prompting
+    /// for the passphrase. Value is the base64 of the XChaCha20-Poly1305
+    /// envelope JSON produced by the core `encrypt_data` helper — same
+    /// shape as `wrapped_privkey_x25519_b64`, just with the master key
+    /// as the sealed plaintext instead of the X25519 private key.
+    #[serde(default)]
+    pub recovery_blob_b64: Option<String>,
+    /// 16-byte Argon2id salt for the recovery passphrase, base64. Must
+    /// be paired with `recovery_blob_b64` — both set or both absent.
+    #[serde(default)]
+    pub recovery_salt_b64: Option<String>,
+    /// KDF identifier for the recovery blob. Version tag so we can
+    /// migrate params later without breaking existing blobs. Currently
+    /// only `"argon2id-default"` is accepted — matches the default
+    /// `argon2::Argon2::default()` parameters used by `core::crypto::keys::derive_key`.
+    #[serde(default)]
+    pub recovery_kdf: Option<String>,
 }
 
 /// Row in `resqd-auth-challenges`. Stores the serialized webauthn state
@@ -408,6 +430,13 @@ pub struct MeResponse {
     /// it without the PRF-derived master key it has never seen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wrapped_privkey_x25519_b64: Option<String>,
+    /// Whether the user has a recovery passphrase blob set. Does NOT
+    /// include the blob itself — clients fetch it on-demand via
+    /// `GET /auth/me/recovery-blob` when PRF is unavailable. Surfaced
+    /// here so the Settings page can render the security-posture
+    /// badge and the "Set/Change/Remove recovery passphrase" UI in a
+    /// single round trip.
+    pub has_recovery_blob: bool,
 }
 
 /// Request body for `PUT /auth/me/identity`. Browser-generated X25519
@@ -422,6 +451,60 @@ pub struct SetIdentityRequest {
     pub pubkey_x25519_b64: String,
     pub wrapped_privkey_x25519_b64: String,
 }
+
+/// Request body for `PUT /auth/me/recovery-blob`. The three fields
+/// together constitute the user's passphrase-unlockable master-key
+/// envelope. All three are produced client-side; the server is a
+/// blind storage layer.
+///
+/// - `recovery_blob_b64`: base64 of the XChaCha20-Poly1305 envelope
+///   JSON that seals the 32-byte master key under
+///   `Argon2id(passphrase, recovery_salt)`. Same envelope shape as
+///   `wrapped_privkey_x25519_b64`.
+/// - `recovery_salt_b64`: base64 of a 16-byte random salt. Must
+///   decode to exactly 16 bytes (matches `core::crypto::keys::derive_key`).
+/// - `recovery_kdf`: version tag; currently only `"argon2id-default"`
+///   is accepted, pinned to the default `argon2::Argon2::default()`
+///   parameters used by the core derive_key helper.
+///
+/// Unlike `SetIdentityRequest`, this is NOT conditional — a user may
+/// rotate their recovery passphrase at will (re-wrapping the master
+/// key client-side and re-uploading). Rotation doesn't affect any
+/// stored data; only the recovery blob is replaced.
+#[derive(Deserialize)]
+pub struct SetRecoveryBlobRequest {
+    pub recovery_blob_b64: String,
+    pub recovery_salt_b64: String,
+    pub recovery_kdf: String,
+}
+
+/// Response body for `GET /auth/me/recovery-blob`. Returned only to
+/// the authenticated user themselves. Contains everything a client
+/// needs to unwrap the master key given the user's passphrase.
+/// Returns 404 if the user has no recovery blob set.
+#[derive(Serialize)]
+pub struct RecoveryBlobResponse {
+    pub recovery_blob_b64: String,
+    pub recovery_salt_b64: String,
+    pub recovery_kdf: String,
+}
+
+/// Pinned KDF identifier. Bump this and add the new variant to the
+/// allowlist in `set_recovery_blob` if the Argon2 parameters change.
+/// Old blobs stay readable because each blob carries its own tag.
+const RECOVERY_KDF_CURRENT: &str = "argon2id-default";
+
+/// Base64-decoded size the Argon2id salt must be for the default
+/// `core::crypto::keys::derive_key` signature. Changing this is a
+/// breaking change; bump `RECOVERY_KDF_CURRENT` alongside it.
+const RECOVERY_SALT_LEN: usize = 16;
+
+/// Upper bound on the base64 length of the recovery blob. A 32-byte
+/// master key sealed under XChaCha20-Poly1305 is ~48 bytes ciphertext
+/// + 24-byte nonce; after JSON serialization and base64 encoding it
+/// should land well under 400 bytes. 2048 leaves headroom for future
+/// envelope-format additions without capping legitimate values.
+const RECOVERY_BLOB_MAX_B64_LEN: usize = 2048;
 
 /// Response to `GET /users/lookup?email=X`. Exposes ONLY the public
 /// half of another user's long-term identity — enough for the caller
@@ -776,6 +859,15 @@ pub async fn get_user_by_email(auth: &AuthState, email: &str) -> AuthResult<Opti
         wrapped_privkey_x25519_b64: item
             .get("wrapped_privkey_x25519_b64")
             .and_then(|v| v.as_s().ok().cloned()),
+        recovery_blob_b64: item
+            .get("recovery_blob_b64")
+            .and_then(|v| v.as_s().ok().cloned()),
+        recovery_salt_b64: item
+            .get("recovery_salt_b64")
+            .and_then(|v| v.as_s().ok().cloned()),
+        recovery_kdf: item
+            .get("recovery_kdf")
+            .and_then(|v| v.as_s().ok().cloned()),
     }))
 }
 
@@ -1071,6 +1163,13 @@ pub async fn register_finish(
         // we can't pre-seal a privkey here.
         pubkey_x25519_b64: None,
         wrapped_privkey_x25519_b64: None,
+        // Recovery blob is opt-in and set out-of-band via
+        // PUT /auth/me/recovery-blob. iPhone-first signups set it
+        // right after registration; everyone else leaves it empty
+        // until they add a passphrase from Settings.
+        recovery_blob_b64: None,
+        recovery_salt_b64: None,
+        recovery_kdf: None,
     };
     put_user(auth, &user).await?;
 
@@ -1214,6 +1313,15 @@ async fn get_user_by_credential_id(
         wrapped_privkey_x25519_b64: item
             .get("wrapped_privkey_x25519_b64")
             .and_then(|v| v.as_s().ok().cloned()),
+        recovery_blob_b64: item
+            .get("recovery_blob_b64")
+            .and_then(|v| v.as_s().ok().cloned()),
+        recovery_salt_b64: item
+            .get("recovery_salt_b64")
+            .and_then(|v| v.as_s().ok().cloned()),
+        recovery_kdf: item
+            .get("recovery_kdf")
+            .and_then(|v| v.as_s().ok().cloned()),
     }))
 }
 
@@ -1312,6 +1420,10 @@ pub async fn me(
     let pubkey_x25519_b64 = row.as_ref().and_then(|u| u.pubkey_x25519_b64.clone());
     let wrapped_privkey_x25519_b64 =
         row.as_ref().and_then(|u| u.wrapped_privkey_x25519_b64.clone());
+    let has_recovery_blob = row
+        .as_ref()
+        .and_then(|u| u.recovery_blob_b64.as_ref())
+        .is_some();
     Ok(Json(MeResponse {
         user_id: user.user_id,
         email: user.email,
@@ -1320,6 +1432,7 @@ pub async fn me(
         storage_quota_bytes: QUOTA_BYTES,
         pubkey_x25519_b64,
         wrapped_privkey_x25519_b64,
+        has_recovery_blob,
     }))
 }
 
@@ -1401,6 +1514,178 @@ pub async fn set_identity(
             }
         }
     }
+}
+
+// ────────────────────────────────────────────────────────────────────
+//                   Recovery blob (mobile passphrase fallback)
+// ────────────────────────────────────────────────────────────────────
+//
+// iOS Safari doesn't support the WebAuthn PRF extension, so iPhone users
+// can't derive their master key from a hardware-backed passkey the same
+// way Chrome/Safari on macOS/PC can. The recovery blob is the escape
+// hatch: a client-side XChaCha20-Poly1305 envelope that seals the 32-byte
+// master key under a KEK derived from a user-chosen passphrase via
+// Argon2id. The server only ever sees the sealed blob — it cannot derive
+// the KEK, cannot read the plaintext master key, and cannot verify the
+// passphrase. "Can you decrypt this blob?" is the only oracle.
+//
+// Two journeys write the blob:
+//
+// 1. A PRF-capable user (Mac/PC/Android Chrome) opts in from Settings.
+//    They already hold the master key in sessionStorage. The browser
+//    wraps it under the passphrase and PUTs the blob. After this, they
+//    can log in on their iPhone by downloading the blob and typing the
+//    passphrase.
+//
+// 2. An iPhone-first signup generates a fresh random master key,
+//    immediately wraps it under the passphrase, and PUTs the blob as
+//    part of the registration flow. The account is passphrase-protected
+//    from day one, with no hardware passkey path until the user later
+//    adds one from another device.
+//
+// Unlike `/auth/me/identity`, this endpoint is idempotent and permits
+// rotation — passphrases can be changed at will. The server doesn't
+// care; it just stores whatever ciphertext the client hands it.
+
+/// `GET /auth/me/recovery-blob` — download the current user's wrapped
+/// master key. Returns 404 if no blob is set (the common case for
+/// PRF-only users who have never opted in to a recovery passphrase).
+///
+/// The client uses the 404 vs 200 distinction to decide whether to
+/// prompt for a passphrase on iOS Safari vs. fail with a helpful
+/// "sign in from a Mac first and add a recovery passphrase" message.
+pub async fn get_recovery_blob(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> AuthResult<Json<RecoveryBlobResponse>> {
+    let auth = state.auth.as_ref().ok_or(AuthError::Unauthorized)?;
+    let row = get_user_by_email(auth, &user.email)
+        .await?
+        .ok_or(AuthError::NotFound)?;
+
+    // All three fields must be present together — partial state would
+    // mean a client crashed mid-upload. Treat missing-any as not-set.
+    match (
+        row.recovery_blob_b64,
+        row.recovery_salt_b64,
+        row.recovery_kdf,
+    ) {
+        (Some(blob), Some(salt), Some(kdf)) => Ok(Json(RecoveryBlobResponse {
+            recovery_blob_b64: blob,
+            recovery_salt_b64: salt,
+            recovery_kdf: kdf,
+        })),
+        _ => Err(AuthError::NotFound),
+    }
+}
+
+/// `PUT /auth/me/recovery-blob` — set or rotate the current user's
+/// recovery passphrase envelope. All three fields are opaque blobs
+/// produced client-side; the server only validates structural bounds
+/// (base64-decodable, salt is exactly 16 bytes, kdf is an allowed tag,
+/// blob is under the size cap) before writing them to the user row.
+///
+/// Idempotent by design: rotating a passphrase is the same operation
+/// as setting one for the first time. The client is responsible for
+/// generating a fresh salt on every rotation so an attacker who
+/// captured an old blob cannot replay the old passphrase against the
+/// new one (salts differ → KEKs differ → Argon2id pre-computation is
+/// useless).
+pub async fn set_recovery_blob(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(req): Json<SetRecoveryBlobRequest>,
+) -> AuthResult<Json<serde_json::Value>> {
+    let auth = state.auth.as_ref().ok_or(AuthError::Unauthorized)?;
+
+    // --- Validate blob ---
+    let blob = req.recovery_blob_b64.trim();
+    if blob.is_empty() {
+        return Err(AuthError::BadRequest(
+            "recovery_blob_b64 required".into(),
+        ));
+    }
+    if blob.len() > RECOVERY_BLOB_MAX_B64_LEN {
+        return Err(AuthError::BadRequest(format!(
+            "recovery_blob_b64 too large: {} bytes (max {})",
+            blob.len(),
+            RECOVERY_BLOB_MAX_B64_LEN
+        )));
+    }
+    // Shape check: must be valid base64 (we don't care what's inside).
+    BASE64_STANDARD
+        .decode(blob)
+        .map_err(|e| AuthError::BadRequest(format!("recovery_blob_b64 not base64: {e}")))?;
+
+    // --- Validate salt ---
+    let salt = req.recovery_salt_b64.trim();
+    let salt_bytes = BASE64_STANDARD
+        .decode(salt)
+        .map_err(|e| AuthError::BadRequest(format!("recovery_salt_b64 not base64: {e}")))?;
+    if salt_bytes.len() != RECOVERY_SALT_LEN {
+        return Err(AuthError::BadRequest(format!(
+            "recovery_salt_b64 must decode to {} bytes, got {}",
+            RECOVERY_SALT_LEN,
+            salt_bytes.len()
+        )));
+    }
+
+    // --- Validate KDF tag ---
+    let kdf = req.recovery_kdf.trim();
+    if kdf != RECOVERY_KDF_CURRENT {
+        return Err(AuthError::BadRequest(format!(
+            "unsupported recovery_kdf: {kdf:?} (expected {RECOVERY_KDF_CURRENT:?})"
+        )));
+    }
+
+    // Write (or overwrite) the three fields. No conditional expression —
+    // passphrase rotation is an explicit user action and we want it to
+    // succeed even on the second and later calls.
+    auth.dynamo
+        .update_item()
+        .table_name(&auth.config.users_table)
+        .key("email", AttributeValue::S(user.email.clone()))
+        .update_expression(
+            "SET recovery_blob_b64 = :blob, recovery_salt_b64 = :salt, recovery_kdf = :kdf",
+        )
+        .expression_attribute_values(":blob", AttributeValue::S(blob.to_string()))
+        .expression_attribute_values(":salt", AttributeValue::S(salt.to_string()))
+        .expression_attribute_values(":kdf", AttributeValue::S(kdf.to_string()))
+        .send()
+        .await?;
+
+    info!(user_id = %user.user_id, "recovery blob set");
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// `DELETE /auth/me/recovery-blob` — clear the recovery passphrase.
+/// Called when a user decides to go hardware-only after having set a
+/// passphrase earlier (e.g. they added a Yubikey or graduated off
+/// iPhone as their primary device). Irreversible without re-setting.
+///
+/// Note: this does NOT touch any vault data. The user's master key is
+/// unchanged; only the passphrase-unlockable envelope is removed. If
+/// the user calls this and then loses their PRF-capable device, they
+/// are locked out — same consequence as losing a hardware key with no
+/// backup recovery kit.
+pub async fn delete_recovery_blob(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> AuthResult<Json<serde_json::Value>> {
+    let auth = state.auth.as_ref().ok_or(AuthError::Unauthorized)?;
+
+    auth.dynamo
+        .update_item()
+        .table_name(&auth.config.users_table)
+        .key("email", AttributeValue::S(user.email.clone()))
+        .update_expression(
+            "REMOVE recovery_blob_b64, recovery_salt_b64, recovery_kdf",
+        )
+        .send()
+        .await?;
+
+    info!(user_id = %user.user_id, "recovery blob deleted");
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 /// `GET /users/lookup?email=X` — resolve another user's **public**
@@ -1511,6 +1796,15 @@ pub async fn get_user_by_user_id(
                 .and_then(|v| v.as_s().ok().cloned()),
             wrapped_privkey_x25519_b64: item
                 .get("wrapped_privkey_x25519_b64")
+                .and_then(|v| v.as_s().ok().cloned()),
+            recovery_blob_b64: item
+                .get("recovery_blob_b64")
+                .and_then(|v| v.as_s().ok().cloned()),
+            recovery_salt_b64: item
+                .get("recovery_salt_b64")
+                .and_then(|v| v.as_s().ok().cloned()),
+            recovery_kdf: item
+                .get("recovery_kdf")
                 .and_then(|v| v.as_s().ok().cloned()),
         }));
     }
