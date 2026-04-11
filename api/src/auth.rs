@@ -220,6 +220,13 @@ pub struct UserRow {
     /// "not yet loaded"; the row itself defaults to 0 at registration.
     #[serde(default)]
     pub storage_used_bytes: Option<u64>,
+    /// Per-user storage cap in bytes. Set to `QUOTA_BYTES` at
+    /// registration so every row carries its own copy; billing will
+    /// mutate this on tier changes. `None` here means the row was
+    /// written before this field existed, in which case
+    /// `try_consume_storage` falls back to the global constant.
+    #[serde(default)]
+    pub storage_quota_bytes: Option<u64>,
     /// Long-term X25519 public identity (base64). Minted client-side on
     /// first login post-identity-rollout and PUT to
     /// `/auth/me/identity`. Used as the recipient pubkey when another
@@ -759,6 +766,10 @@ pub async fn get_user_by_email(auth: &AuthState, email: &str) -> AuthResult<Opti
             .get("storage_used_bytes")
             .and_then(|v| v.as_n().ok())
             .and_then(|s| s.parse().ok()),
+        storage_quota_bytes: item
+            .get("storage_quota_bytes")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|s| s.parse().ok()),
         pubkey_x25519_b64: item
             .get("pubkey_x25519_b64")
             .and_then(|v| v.as_s().ok().cloned()),
@@ -791,6 +802,14 @@ async fn put_user(auth: &AuthState, user: &UserRow) -> AuthResult<()> {
     // Initialize storage counter to zero at registration so later
     // conditional updates can rely on the attribute existing.
     item.insert("storage_used_bytes".into(), AttributeValue::N("0".into()));
+    // Stamp the per-user quota so billing tier changes can mutate
+    // just this field instead of having to read-modify-write the
+    // whole row. `try_consume_storage` reads this on every commit.
+    let quota_bytes = user.storage_quota_bytes.unwrap_or(QUOTA_BYTES);
+    item.insert(
+        "storage_quota_bytes".into(),
+        AttributeValue::N(quota_bytes.to_string()),
+    );
     auth.dynamo
         .put_item()
         .table_name(&auth.config.users_table)
@@ -831,9 +850,15 @@ pub enum ConsumeStorageResult {
 }
 
 /// Atomically add `bytes` to a user's `storage_used_bytes` counter, or
-/// return `Exceeded` if the addition would push them over `QUOTA_BYTES`.
+/// return `Exceeded` if the addition would push them over their cap.
 /// Uses a single conditional UpdateItem so two concurrent commits can't
 /// both see the same pre-update counter and both succeed.
+///
+/// The cap is the user's `storage_quota_bytes` field (written on signup
+/// and editable by admins), not a hardcoded constant. Legacy user rows
+/// without the field fall back to `QUOTA_BYTES`. This is the path
+/// billing will eventually drive — paid tiers bump the per-user field
+/// and this function automatically respects it.
 ///
 /// Legacy user rows that don't have `storage_used_bytes` yet (written
 /// before this feature landed) are treated as if they had 0 used — the
@@ -843,14 +868,24 @@ pub async fn try_consume_storage(
     email: &str,
     bytes: u64,
 ) -> AuthResult<ConsumeStorageResult> {
-    if bytes > QUOTA_BYTES {
+    // Read the user's per-row quota. Fall back to the legacy global
+    // constant if the field is missing on this row. We do the read
+    // BEFORE the conditional update because the condition needs the
+    // cap in its expression, and DynamoDB conditions can't reference
+    // other attributes on the same row as an unbound lookup.
+    let cap = get_user_by_email(auth, email)
+        .await?
+        .and_then(|u| u.storage_quota_bytes)
+        .unwrap_or(QUOTA_BYTES);
+
+    if bytes > cap {
         return Ok(ConsumeStorageResult::Exceeded {
             used: 0,
-            cap: QUOTA_BYTES,
+            cap,
             requested: bytes,
         });
     }
-    let max_before: i64 = QUOTA_BYTES as i64 - bytes as i64;
+    let max_before: i64 = cap as i64 - bytes as i64;
 
     let result = auth
         .dynamo
@@ -883,7 +918,7 @@ pub async fn try_consume_storage(
                     .unwrap_or(0);
                 Ok(ConsumeStorageResult::Exceeded {
                     used,
-                    cap: QUOTA_BYTES,
+                    cap,
                     requested: bytes,
                 })
             } else {
@@ -1025,6 +1060,10 @@ pub async fn register_finish(
         display_name,
         created_at: now_secs(),
         storage_used_bytes: Some(0),
+        // Stamp the global default quota on the row at registration
+        // so `try_consume_storage` always has a per-user cap to read.
+        // Billing mutates this field on tier changes.
+        storage_quota_bytes: Some(QUOTA_BYTES),
         // Identity is minted lazily by the browser on the first
         // PRF-capable login right after registration finishes, via
         // PUT /auth/me/identity. Registration itself doesn't have
@@ -1163,6 +1202,10 @@ async fn get_user_by_credential_id(
             .unwrap_or(0),
         storage_used_bytes: item
             .get("storage_used_bytes")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|s| s.parse().ok()),
+        storage_quota_bytes: item
+            .get("storage_quota_bytes")
             .and_then(|v| v.as_n().ok())
             .and_then(|s| s.parse().ok()),
         pubkey_x25519_b64: item
@@ -1457,6 +1500,10 @@ pub async fn get_user_by_user_id(
                 .unwrap_or(0),
             storage_used_bytes: item
                 .get("storage_used_bytes")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|s| s.parse().ok()),
+            storage_quota_bytes: item
+                .get("storage_quota_bytes")
                 .and_then(|v| v.as_n().ok())
                 .and_then(|s| s.parse().ok()),
             pubkey_x25519_b64: item

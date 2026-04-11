@@ -762,6 +762,10 @@ pub async fn commit(
         original_len: req.original_len,
         data_shards: 4,
         parity_shards: 2,
+        // Single-shot path never carries a streaming sidecar —
+        // `stream_info` only exists for `mode == "sharded-stream"`
+        // manifests written by `stream::stream_commit`.
+        stream_info: None,
         owner_id: owner_id.clone(),
         wrapped_key_b64: req.wrapped_key_b64.clone(),
         encrypted_meta_b64: req.encrypted_meta_b64.clone(),
