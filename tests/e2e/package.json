@@ -1,0 +1,13 @@
+{
+  "name": "resqd-e2e",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Playwright E2E test harness for RESQD. Runs against the live resqd.ai frontend using a CF Access service token + a virtual WebAuthn authenticator, so no human passkey tap is required.",
+  "scripts": {
+    "test": "node streaming_roundtrip.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.50.0"
+  }
+}
