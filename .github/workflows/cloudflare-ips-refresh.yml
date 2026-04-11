@@ -11,6 +11,18 @@ name: Refresh Cloudflare IPs in WAFv2
 # WAFv2 belt on top of the RESQD Lambda becomes a liability instead
 # of a safety net. See docs/LIVE-12-runbook.md step 14 for the
 # one-time setup.
+#
+# GRACEFUL DEGRADATION (2026-04-11). WAFv2 cannot currently be
+# attached to the resqd-api HTTP API — AWS WAFv2 only supports REST
+# APIs (v1), not HTTP APIs (v2). Until Kevin picks an architectural
+# path (REST API migration, CloudFront in front, or defer), the two
+# IPSets this workflow maintains do not exist. Rather than fail
+# loudly every morning at 10:00 UTC, the first step below does a
+# preflight check: if either the AWS credentials or the IPSets are
+# missing, the job exits cleanly with a clear warning, and the
+# remaining steps are skipped. When WAFv2 is eventually wired up
+# and the IPSets re-created under the names below, this workflow
+# auto-resumes with no code change.
 
 on:
   schedule:
@@ -35,7 +47,50 @@ jobs:
       IPV4_IPSET_NAME: cloudflare-ipv4
       IPV6_IPSET_NAME: cloudflare-ipv6
     steps:
+      - name: Preflight — check credentials and IPSets
+        id: preflight
+        run: |
+          set -uo pipefail
+          reason=""
+          # If the repo secrets aren't set, the aws CLI would crash
+          # with NoCredentialProviders. Detect early.
+          if [[ -z "${AWS_ACCESS_KEY_ID:-}" || -z "${AWS_SECRET_ACCESS_KEY:-}" || -z "${AWS_REGION:-}" ]]; then
+            reason="AWS credentials not configured (repo secrets missing)"
+          else
+            # Credentials present. Check that both IPSets actually
+            # exist. If either is missing, treat this as expected
+            # "WAFv2 not yet wired up" state and skip the refresh.
+            V4=$(aws wafv2 list-ip-sets --scope REGIONAL --region "$AWS_REGION" \
+              --query "IPSets[?Name=='$IPV4_IPSET_NAME'].Id" --output text 2>/dev/null || echo "")
+            V6=$(aws wafv2 list-ip-sets --scope REGIONAL --region "$AWS_REGION" \
+              --query "IPSets[?Name=='$IPV6_IPSET_NAME'].Id" --output text 2>/dev/null || echo "")
+            if [[ -z "$V4" || -z "$V6" ]]; then
+              reason="WAFv2 IPSets '$IPV4_IPSET_NAME' and/or '$IPV6_IPSET_NAME' do not exist"
+            else
+              echo "v4_id=$V4" >> "$GITHUB_OUTPUT"
+              echo "v6_id=$V6" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+          if [[ -n "$reason" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "reason=$reason" >> "$GITHUB_OUTPUT"
+            echo "::warning::Skipping refresh — $reason. See docs/LIVE-12-runbook.md and project_live12.md for the WAFv2 architectural decision."
+            {
+              echo "## Cloudflare IPs refresh — SKIPPED"
+              echo ""
+              echo "Reason: $reason."
+              echo ""
+              echo "This workflow auto-resumes once the WAFv2 IPSets"
+              echo "'\`$IPV4_IPSET_NAME\`' and '\`$IPV6_IPSET_NAME\`' exist in"
+              echo "the $AWS_REGION region. See \`docs/LIVE-12-runbook.md\` for setup."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Fetch canonical Cloudflare IP lists
+        if: steps.preflight.outputs.skip != 'true'
         run: |
           set -euo pipefail
           curl -fsS https://www.cloudflare.com/ips-v4/ -o /tmp/cf-ipv4.txt
@@ -48,44 +103,34 @@ jobs:
           echo "ipv4 entries: $(wc -l </tmp/cf-ipv4.txt)"
           echo "ipv6 entries: $(wc -l </tmp/cf-ipv6.txt)"
 
-      - name: Resolve WAFv2 IPSet ids
-        id: ids
-        run: |
-          set -euo pipefail
-          V4=$(aws wafv2 list-ip-sets --scope REGIONAL --region "$AWS_REGION" \
-            --query "IPSets[?Name=='$IPV4_IPSET_NAME'].Id" --output text)
-          V6=$(aws wafv2 list-ip-sets --scope REGIONAL --region "$AWS_REGION" \
-            --query "IPSets[?Name=='$IPV6_IPSET_NAME'].Id" --output text)
-          test -n "$V4" || { echo "missing $IPV4_IPSET_NAME"; exit 1; }
-          test -n "$V6" || { echo "missing $IPV6_IPSET_NAME"; exit 1; }
-          echo "v4_id=$V4" >> "$GITHUB_OUTPUT"
-          echo "v6_id=$V6" >> "$GITHUB_OUTPUT"
-
       - name: Update cloudflare-ipv4
+        if: steps.preflight.outputs.skip != 'true'
         run: |
           set -euo pipefail
           LOCK=$(aws wafv2 get-ip-set --scope REGIONAL --region "$AWS_REGION" \
-            --name "$IPV4_IPSET_NAME" --id "${{ steps.ids.outputs.v4_id }}" \
+            --name "$IPV4_IPSET_NAME" --id "${{ steps.preflight.outputs.v4_id }}" \
             --query LockToken --output text)
           ADDRS=$(jq -R -s 'split("\n") | map(select(length > 0))' /tmp/cf-ipv4.txt)
           aws wafv2 update-ip-set --scope REGIONAL --region "$AWS_REGION" \
-            --name "$IPV4_IPSET_NAME" --id "${{ steps.ids.outputs.v4_id }}" \
+            --name "$IPV4_IPSET_NAME" --id "${{ steps.preflight.outputs.v4_id }}" \
             --lock-token "$LOCK" \
             --addresses "$ADDRS"
 
       - name: Update cloudflare-ipv6
+        if: steps.preflight.outputs.skip != 'true'
         run: |
           set -euo pipefail
           LOCK=$(aws wafv2 get-ip-set --scope REGIONAL --region "$AWS_REGION" \
-            --name "$IPV6_IPSET_NAME" --id "${{ steps.ids.outputs.v6_id }}" \
+            --name "$IPV6_IPSET_NAME" --id "${{ steps.preflight.outputs.v6_id }}" \
             --query LockToken --output text)
           ADDRS=$(jq -R -s 'split("\n") | map(select(length > 0))' /tmp/cf-ipv6.txt)
           aws wafv2 update-ip-set --scope REGIONAL --region "$AWS_REGION" \
-            --name "$IPV6_IPSET_NAME" --id "${{ steps.ids.outputs.v6_id }}" \
+            --name "$IPV6_IPSET_NAME" --id "${{ steps.preflight.outputs.v6_id }}" \
             --lock-token "$LOCK" \
             --addresses "$ADDRS"
 
       - name: Diff summary
+        if: steps.preflight.outputs.skip != 'true'
         run: |
           set -euo pipefail
           V4_COUNT=$(wc -l </tmp/cf-ipv4.txt)
