@@ -33,12 +33,29 @@ type FetchState =
   | { phase: "error"; message: string };
 
 interface ShardedFetchResponse {
-  mode: "sharded";
+  /** `"sharded"` for legacy single-shot; `"sharded-stream"` for Track 1 uploads. */
+  mode: "sharded" | "sharded-stream";
   asset_id: string;
   original_len: number;
   data_shards: number;
   parity_shards: number;
   shards: { index: number; download_url: string | null }[];
+  /**
+   * Streaming uploads only. The inner shape mirrors the Rust
+   * `StreamInfo` — we treat it as opaque and forward `stream_manifest`
+   * + `stream_header` to the WASM decoders verbatim.
+   */
+  stream_info?: {
+    version: number;
+    stream_manifest: {
+      version: number;
+      data_shards: number;
+      parity_shards: number;
+      total_input_bytes: number;
+      groups: Array<{ data_len: number; shard_size: number; input_hash: number[] }>;
+    };
+    stream_header: { stream_id: number[]; chunk_size: number };
+  };
   canary_sequence: number;
   canary_hash_hex: string;
   ttl_seconds: number;
@@ -51,6 +68,8 @@ interface ShardedFetchResponse {
   role?: "owner" | "sharee" | "ring_member";
   /** Per-asset key — wrapping depends on `role`. */
   wrapped_key_b64?: string;
+  /** Filename + mime encrypted under the same key that wraps per-asset key. */
+  encrypted_meta_b64?: string;
   /** For sharee fetches only. */
   sender_pubkey_x25519_b64?: string;
   /** Ring asset fields. */
@@ -137,7 +156,7 @@ function FetchInner() {
 
       if (contentType.includes("application/json")) {
         const manifest: ShardedFetchResponse = await metaResp.json();
-        if (manifest.mode !== "sharded") {
+        if (manifest.mode !== "sharded" && manifest.mode !== "sharded-stream") {
           throw new Error(`unexpected mode: ${manifest.mode}`);
         }
 
@@ -159,6 +178,12 @@ function FetchInner() {
         //    HKDF info for per-asset domain separation.
         const crypto = await getCrypto();
         let assetKey: Uint8Array;
+        // `metaKey` is whatever unwrapped the per-asset key — master
+        // key for owners, ECDH wrap key for sharees and ring members.
+        // The streaming path uses it to decrypt `encrypted_meta_b64`
+        // for the filename; the single-shot path doesn't need it
+        // because the filename is framed inside the plaintext body.
+        let metaKey: Uint8Array = masterKey;
         if (!manifest.wrapped_key_b64) {
           assetKey = masterKey;
         } else if (manifest.role === "ring_member") {
@@ -181,6 +206,7 @@ function FetchInner() {
           const wrapKey = base64ToBytes(wrapKeyB64);
           const wrappedJson = atob(manifest.wrapped_key_b64);
           assetKey = crypto.decrypt_data(wrapKey, wrappedJson);
+          metaKey = wrapKey;
         } else if (manifest.role === "sharee") {
           if (!manifest.sender_pubkey_x25519_b64) {
             throw new Error("sharee fetch missing sender_pubkey_x25519_b64");
@@ -199,9 +225,167 @@ function FetchInner() {
           const wrapKey = base64ToBytes(wrapKeyB64);
           const wrappedJson = atob(manifest.wrapped_key_b64);
           assetKey = crypto.decrypt_data(wrapKey, wrappedJson);
+          metaKey = wrapKey;
         } else {
           const wrappedJson = atob(manifest.wrapped_key_b64);
           assetKey = crypto.decrypt_data(masterKey, wrappedJson);
+          metaKey = masterKey;
+        }
+
+        // ───────── STREAMING DOWNLOAD PATH ─────────
+        //
+        // For sharded-stream uploads we can't use the single-shot
+        // erasure_reconstruct + decrypt_data pair — the ciphertext
+        // format is per-chunk SealedChunks, not a single
+        // whole-file XChaCha20 blob. Instead we:
+        //
+        //   1. Download every shard fully (no range requests — MVP).
+        //   2. For each group in the stream manifest, slice the
+        //      corresponding bytes from each shard.
+        //   3. Hand the 6 slices to `WasmStreamDecoder.decodeGroup`
+        //      (Reed-Solomon reconstruct → per-chunk ciphertext).
+        //   4. Wrap that ciphertext in a `SealedChunk` JSON shape
+        //      (counter = group index, is_last = last group).
+        //   5. Hand the JSON to `WasmStreamDecryptor.openChunk` to
+        //      recover the plaintext bytes for that chunk.
+        //   6. Concatenate plaintext group-by-group into the output.
+        //   7. Call `decryptor.finish()` to assert the last chunk
+        //      was marked `is_last` — truncation detection.
+        //
+        // Filename/mime come from `encrypted_meta_b64` decrypted with
+        // `metaKey` (NOT the asset key — same key that unwraps the
+        // per-asset key).
+        if (manifest.mode === "sharded-stream") {
+          if (!manifest.stream_info) {
+            throw new Error("sharded-stream response missing stream_info");
+          }
+          if (!manifest.encrypted_meta_b64) {
+            throw new Error("sharded-stream response missing encrypted_meta_b64");
+          }
+
+          // Decrypt filename/mime.
+          const metaPlaintext = crypto.decrypt_data(
+            metaKey,
+            atob(manifest.encrypted_meta_b64),
+          );
+          const metaJson = JSON.parse(new TextDecoder().decode(metaPlaintext));
+          const name: string | null =
+            typeof metaJson.name === "string" ? metaJson.name : null;
+          const mime: string | null =
+            typeof metaJson.mime === "string" ? metaJson.mime : null;
+
+          // Download all six shards in parallel. The MVP holds them
+          // all in memory; a future pass can switch to per-group
+          // range requests to bound memory for multi-GB files.
+          const total = manifest.shards.length;
+          let done = 0;
+          setState({ phase: "downloading-shards", done, total });
+          const shardBytes: (Uint8Array | null)[] = await Promise.all(
+            manifest.shards.map(async (slot) => {
+              if (!slot.download_url) return null;
+              try {
+                const r = await fetch(slot.download_url);
+                if (!r.ok) throw new Error(`${r.status}`);
+                const bytes = new Uint8Array(await r.arrayBuffer());
+                done += 1;
+                setState({ phase: "downloading-shards", done, total });
+                return bytes;
+              } catch (e) {
+                console.warn(`shard ${slot.index} failed:`, e);
+                return null;
+              }
+            }),
+          );
+          const presentCount = shardBytes.filter((s) => s !== null).length;
+          if (presentCount < manifest.data_shards) {
+            throw new Error(
+              `only ${presentCount}/${manifest.data_shards} required shards available`,
+            );
+          }
+
+          setState({ phase: "reconstructing" });
+          // The WASM streaming decoder + decryptor constructors take
+          // JSON strings that serde emits for StreamManifest and
+          // StreamHeader — we received them verbatim in
+          // `manifest.stream_info`. The existing `getCrypto()` helper
+          // already loaded the WASM module; the streaming classes
+          // hang off the same module exports, so cast through
+          // `unknown` to get them.
+          const wasm = crypto as unknown as {
+            WasmStreamDecoder: new (manifestJson: string) => {
+              decodeGroup: (shardsJson: string) => Uint8Array;
+              finish: () => void;
+            };
+            WasmStreamDecryptor: new (
+              key: Uint8Array,
+              headerJson: string,
+            ) => {
+              openChunk: (sealedJson: string) => Uint8Array;
+              finish: () => void;
+            };
+          };
+          const decoder = new wasm.WasmStreamDecoder(
+            JSON.stringify(manifest.stream_info.stream_manifest),
+          );
+          // The Rust backend serializes `stream_id` as an array of 20
+          // numbers; the WASM `WasmStreamDecryptor` constructor
+          // expects a JSON object with `stream_id_b64` (base64) +
+          // `chunk_size`. Translate between the two shapes here.
+          const sid = manifest.stream_info.stream_header.stream_id;
+          const sidBytes = new Uint8Array(sid);
+          const headerForWasm = JSON.stringify({
+            stream_id_b64: bytesToBase64(sidBytes),
+            chunk_size: manifest.stream_info.stream_header.chunk_size,
+          });
+          const decryptor = new wasm.WasmStreamDecryptor(assetKey, headerForWasm);
+
+          // Iterate groups in order. Each group's shard slice is
+          // `shard_size` bytes long at `offset` = sum of prior groups'
+          // shard sizes. The erasure decoder accepts a JSON array of
+          // 6 base64 strings (or nulls for missing shards) — we
+          // convert here.
+          const groups = manifest.stream_info.stream_manifest.groups;
+          const plaintextChunks: Uint8Array[] = [];
+          let totalPlaintextLen = 0;
+          let offset = 0;
+          for (let g = 0; g < groups.length; g++) {
+            const gSize = groups[g].shard_size;
+            const isLast = g === groups.length - 1;
+            const slice: (string | null)[] = shardBytes.map((s) => {
+              if (!s) return null;
+              return bytesToBase64(s.subarray(offset, offset + gSize));
+            });
+            offset += gSize;
+
+            const ciphertext = decoder.decodeGroup(JSON.stringify(slice));
+            const sealedJson = JSON.stringify({
+              counter: g,
+              is_last: isLast,
+              ciphertext_b64: bytesToBase64(new Uint8Array(ciphertext)),
+            });
+            const plaintextChunk = decryptor.openChunk(sealedJson);
+            plaintextChunks.push(new Uint8Array(plaintextChunk));
+            totalPlaintextLen += plaintextChunk.length;
+          }
+          decryptor.finish();
+
+          // Stitch together the per-group plaintext slices.
+          const plainFull = new Uint8Array(totalPlaintextLen);
+          let writeOff = 0;
+          for (const chunk of plaintextChunks) {
+            plainFull.set(chunk, writeOff);
+            writeOff += chunk.length;
+          }
+
+          setState({
+            phase: "done",
+            bytes: plainFull,
+            name,
+            mime,
+            sequence,
+            canaryHash,
+          });
+          return;
         }
 
         const total = manifest.shards.length;

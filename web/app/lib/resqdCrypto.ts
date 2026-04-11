@@ -121,8 +121,10 @@ export function bytesToBase64(bytes: Uint8Array): string {
 }
 
 /**
- * The API endpoint to talk to. Configured via NEXT_PUBLIC_RESQD_API at
- * build time; falls back to localhost for dev.
+ * The API endpoint to talk to. All traffic flows through the
+ * resqd-api-proxy Worker on api.resqd.ai, which injects the origin
+ * secret and forwards to the Lambda. Override with NEXT_PUBLIC_RESQD_API
+ * for local dev against a cargo-lambda watch server.
  */
 export const API_URL =
-  process.env.NEXT_PUBLIC_RESQD_API || "http://127.0.0.1:8787";
+  process.env.NEXT_PUBLIC_RESQD_API || "https://api.resqd.ai";

@@ -9,12 +9,26 @@ import {
   type ErasureEncoded,
 } from "../lib/resqdCrypto";
 import {
+  uploadStream,
+  type CommitMeta,
+  type BandwidthSnapshot,
+} from "../lib/streamingUploader";
+import {
   loadMasterKey,
   fetchMe,
   loadX25519Identity,
   ensureRingPrivkey,
   type SessionUser,
 } from "../lib/passkey";
+
+/**
+ * Files above this threshold use the streaming upload path
+ * (`/vault/stream/*` + direct-to-S3 multipart). Smaller files use
+ * the legacy single-shot path which is fine for anything under
+ * roughly 200 MB — the WASM memory ceiling that the streaming path
+ * was built to escape.
+ */
+const STREAMING_THRESHOLD_BYTES = 100 * 1024 * 1024; // 100 MB
 
 interface RingSummary {
   ring_id: string;
@@ -32,7 +46,7 @@ type UploadState =
   | { phase: "encrypting" }
   | { phase: "erasure-coding" }
   | { phase: "init" }
-  | { phase: "uploading"; progress: number }
+  | { phase: "uploading"; progress: number; bandwidth?: BandwidthSnapshot }
   | { phase: "committing" }
   | {
       phase: "done";
@@ -40,7 +54,15 @@ type UploadState =
       originalLen: number;
       anchored: boolean;
     }
-  | { phase: "error"; message: string };
+  | {
+      phase: "error";
+      message: string;
+      /** When set, the structured server rejection — shown specially. */
+      absorption?: {
+        reason?: string;
+        failed_shard_indices?: number[];
+      };
+    };
 
 interface InitResponse {
   asset_id: string;
@@ -140,6 +162,76 @@ export default function UploadPage() {
       setState({ phase: "wrapping-key" });
       const crypto = await getCrypto();
       const perAssetKey = crypto.generate_random_key();
+
+      // ───────── LARGE FILE → STREAMING PATH ─────────
+      //
+      // Files above STREAMING_THRESHOLD_BYTES use `/vault/stream/*`
+      // and PUT shard-chunks directly to S3 multipart. The single-shot
+      // path below holds the whole file in WASM memory and caps out
+      // around 200 MB; the streaming path has no practical ceiling.
+      if (file.size > STREAMING_THRESHOLD_BYTES) {
+        setState({ phase: "uploading", progress: 0 });
+        const metaPlaintext = new TextEncoder().encode(
+          JSON.stringify({
+            name: file.name,
+            mime: file.type || "application/octet-stream",
+          }),
+        );
+
+        let lastBandwidth: BandwidthSnapshot | undefined;
+        const commit = await uploadStream(file, perAssetKey, API_URL, {
+          ringId: isRingUpload ? selectedRingId : undefined,
+          onProgress: (bytesProcessed, totalBytes) => {
+            setState({
+              phase: "uploading",
+              progress: totalBytes > 0 ? bytesProcessed / totalBytes : 0,
+              bandwidth: lastBandwidth,
+            });
+          },
+          onBandwidth: (snapshot) => {
+            lastBandwidth = snapshot;
+          },
+          prepareCommitMeta: (assetId): CommitMeta => {
+            // Ring uploads bind `asset_id` via HKDF in the wrap key,
+            // so this runs AFTER stream/init. Personal uploads could
+            // wrap earlier but go through the callback for symmetry.
+            if (isRingUpload && ringPubB64 && uploaderPubB64) {
+              const ident = loadX25519Identity()!;
+              const wrapKeyB64 = crypto.x25519_sender_wrap_key(
+                ident.privB64,
+                ringPubB64,
+                assetId,
+              );
+              const wrapKey = base64ToBytes(wrapKeyB64);
+              return {
+                wrappedKeyB64: btoa(
+                  crypto.encrypt_data(wrapKey, perAssetKey),
+                ),
+                encryptedMetaB64: btoa(
+                  crypto.encrypt_data(wrapKey, metaPlaintext),
+                ),
+                uploaderPubkeyX25519B64: uploaderPubB64,
+              };
+            }
+            return {
+              wrappedKeyB64: btoa(
+                crypto.encrypt_data(masterKey, perAssetKey),
+              ),
+              encryptedMetaB64: btoa(
+                crypto.encrypt_data(masterKey, metaPlaintext),
+              ),
+            };
+          },
+        });
+
+        setState({
+          phase: "done",
+          assetId: commit.asset_id,
+          originalLen: commit.total_input_bytes,
+          anchored: commit.anchored_on_chain,
+        });
+        return;
+      }
 
       // ───────── FRAME + ENCRYPT ─────────
       setState({ phase: "encrypting" });
@@ -276,10 +368,27 @@ export default function UploadPage() {
         anchored: commit.anchored_on_chain,
       });
     } catch (e) {
-      setState({
-        phase: "error",
-        message: e instanceof Error ? e.message : String(e),
-      });
+      // Track 2 Chunk 2.4 — the structured absorption-failed error
+      // thrown by `streamingUploader` carries a `code` field and an
+      // `absorption` payload with the shards that drifted. Surface
+      // those specifically; other errors fall through to the generic
+      // message path.
+      const err = e as Error & {
+        code?: string;
+        absorption?: { reason?: string; failed_shard_indices?: number[] };
+      };
+      if (err.code === "absorption_failed") {
+        setState({
+          phase: "error",
+          message: err.message,
+          absorption: err.absorption,
+        });
+      } else {
+        setState({
+          phase: "error",
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
   }, [selectedRingId]);
 
@@ -354,8 +463,14 @@ export default function UploadPage() {
           {state.phase === "erasure-coding" &&
             "Step 3/6 — Erasure-coding into 6 shards…"}
           {state.phase === "init" && "Step 4/6 — Requesting presigned upload URLs…"}
-          {state.phase === "uploading" &&
-            `Step 5/6 — Uploading shards (${Math.round(state.progress * 100)}%)…`}
+          {state.phase === "uploading" && (
+            <>
+              {`Step 5/6 — Uploading shards (${Math.round(state.progress * 100)}%)…`}
+              {state.bandwidth && (
+                <BandwidthBadge snapshot={state.bandwidth} />
+              )}
+            </>
+          )}
           {state.phase === "committing" &&
             "Step 6/6 — Anchoring canary on Base Sepolia…"}
           {state.phase === "done" && "Done — see details below"}
@@ -364,6 +479,44 @@ export default function UploadPage() {
           )}
         </p>
       </section>
+
+      {state.phase === "error" && state.absorption && (
+        <section className="mt-6 bg-red-950/30 border border-red-800 rounded-xl p-5">
+          <h2 className="text-sm font-semibold text-red-300 mb-2">
+            Proof-of-absorption failed
+          </h2>
+          <p className="text-xs text-slate-300 mb-3">
+            The server confirmed all shards reached S3, but the post-commit
+            integrity check detected drift. Nothing was stored — the shards
+            have been cleaned up. This can happen on a flaky network or a
+            corrupted file read. Try uploading again; if the same file
+            keeps failing, re-save a copy and try that.
+          </p>
+          <dl className="text-xs space-y-1 text-slate-400">
+            <div>
+              <dt className="inline text-slate-500">Reason:</dt>{" "}
+              <dd className="inline font-mono">
+                {state.absorption.reason ?? "unknown"}
+              </dd>
+            </div>
+            {state.absorption.failed_shard_indices && (
+              <div>
+                <dt className="inline text-slate-500">Failed shards:</dt>{" "}
+                <dd className="inline font-mono">
+                  {state.absorption.failed_shard_indices.join(", ")}
+                </dd>
+              </div>
+            )}
+          </dl>
+          <button
+            type="button"
+            onClick={() => setState({ phase: "idle" })}
+            className="mt-4 inline-block bg-amber-500 text-slate-900 font-semibold px-4 py-2 rounded text-sm"
+          >
+            Try again
+          </button>
+        </section>
+      )}
 
       {state.phase === "done" && (
         <section className="mt-8 bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-3">
@@ -405,5 +558,35 @@ export default function UploadPage() {
         </section>
       )}
     </main>
+  );
+}
+
+/**
+ * Polite-mode badge. Rendered during streaming uploads to show the
+ * adaptive bandwidth controller's current state + throughput. When the
+ * controller is backing off, surfaces a human-readable "yielding to
+ * other traffic" hint. Track 3 Chunk 3.4.
+ */
+function BandwidthBadge({ snapshot }: { snapshot: BandwidthSnapshot }) {
+  const mbps = (snapshot.overallThroughputBps / (1024 * 1024)).toFixed(1);
+  const hint =
+    snapshot.state === "backing_off"
+      ? "polite mode — yielding to other traffic"
+      : snapshot.state === "ramping"
+        ? "ramping up"
+        : snapshot.state === "calibrating"
+          ? "calibrating baseline"
+          : "steady";
+  const pillClass =
+    snapshot.state === "backing_off"
+      ? "bg-amber-900/40 text-amber-300 border-amber-700/50"
+      : "bg-slate-800 text-slate-400 border-slate-700";
+  return (
+    <span
+      className={`ml-3 inline-block rounded-full border px-2 py-0.5 text-xs ${pillClass}`}
+      title={`delay ${Math.round(snapshot.interBlockDelayMs)}ms`}
+    >
+      {mbps} MB/s · {hint}
+    </span>
   );
 }

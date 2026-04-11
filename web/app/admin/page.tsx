@@ -2,7 +2,14 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
-import { API_URL } from "../lib/resqdCrypto";
+
+// Admin XHRs go through the friendly hostname, NOT the raw API GW. The
+// path-scoped CF Access app at api.resqd.ai/admin injects the user-email
+// header that require_admin() requires, and the resqd-api-proxy Worker
+// adds the origin secret. The user-facing API_URL points directly at API
+// Gateway and bypasses both — that path is exempted from origin_secret
+// for /auth, /vault, /users, /rings only. /admin is intentionally not.
+const ADMIN_API_URL = "https://api.resqd.ai";
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -177,9 +184,24 @@ export default function AdminPage() {
   const [userSearch, setUserSearch] = useState("");
   const [auditFilter, setAuditFilter] = useState("all");
   const [actionLoading, setActionLoading] = useState<string | null>(null);
+  // Dedicated count of absorption failures surfaced on the dashboard
+  // tile without waiting for the Audit tab's lazy-loaded full entries.
+  const [absorptionFailureCount, setAbsorptionFailureCount] = useState<
+    number | null
+  >(null);
+  // Track 2 Chunk 2.6 — absorption reaper state
+  const [reaperRunning, setReaperRunning] = useState(false);
+  const [reaperResult, setReaperResult] = useState<{
+    window_minutes: number;
+    considered: number;
+    checked: number;
+    passed: number;
+    failed: { asset_id: string; reason: string; failed_shard_indices: number[] }[];
+    skipped_reasons: Record<string, number>;
+  } | null>(null);
 
   const fetchAdmin = useCallback(async (path: string) => {
-    const resp = await fetch(`${API_URL}${path}`, {
+    const resp = await fetch(`${ADMIN_API_URL}${path}`, {
       credentials: "include",
     });
     if (resp.status === 403) {
@@ -195,7 +217,7 @@ export default function AdminPage() {
   }, []);
 
   const postAdmin = useCallback(async (path: string) => {
-    const resp = await fetch(`${API_URL}${path}`, {
+    const resp = await fetch(`${ADMIN_API_URL}${path}`, {
       method: "POST",
       credentials: "include",
     });
@@ -207,18 +229,22 @@ export default function AdminPage() {
   useEffect(() => {
     (async () => {
       try {
-        const [s, u, r, audit, sec] = await Promise.all([
+        const [s, u, r, audit, sec, absorption] = await Promise.all([
           fetchAdmin("/admin/stats"),
           fetchAdmin("/admin/users"),
           fetchAdmin("/admin/rings"),
           fetchAdmin("/admin/audit?limit=10").catch(() => ({ entries: [] })),
           fetchAdmin("/admin/security").catch(() => null),
+          fetchAdmin(
+            "/admin/audit?limit=100&action=shard_absorption_failed",
+          ).catch(() => ({ entries: [] })),
         ]);
         setStats(s);
         setUsers(u.users);
         setRings(r.rings);
         setRecentAudit(audit.entries || []);
         if (sec) setSecurity(sec);
+        setAbsorptionFailureCount((absorption.entries || []).length);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       } finally {
@@ -301,7 +327,7 @@ export default function AdminPage() {
     setUnlocking(true);
     try {
       const resp = await fetch(
-        `${API_URL}/admin/rings/${encodeURIComponent(ringId)}/unlock-executor/${encodeURIComponent(executorEmail)}`,
+        `${ADMIN_API_URL}/admin/rings/${encodeURIComponent(ringId)}/unlock-executor/${encodeURIComponent(executorEmail)}`,
         { method: "POST", credentials: "include" },
       );
       if (!resp.ok) throw new Error(await resp.text());
@@ -328,6 +354,7 @@ export default function AdminPage() {
 
   // Audit row color
   const auditRowClass = (action: string) => {
+    if (action === "shard_absorption_failed") return "bg-red-500/10";
     if (action.includes("disable") || action.includes("unlock")) return "bg-red-500/5";
     if (action.includes("reset-quota")) return "bg-amber-500/5";
     return "";
@@ -335,6 +362,14 @@ export default function AdminPage() {
 
   // Unique audit actions for filter dropdown
   const auditActions = Array.from(new Set(auditEntries.map((e) => e.action)));
+
+  // Track 2 visibility — count absorption failures in the recent window.
+  // Prefer the dedicated-fetch number; fall back to whatever's already
+  // loaded in the full audit entries slice if the dedicated fetch
+  // hasn't resolved yet.
+  const absorptionFailures24h =
+    absorptionFailureCount ??
+    auditEntries.filter((e) => e.action === "shard_absorption_failed").length;
 
   if (loading) {
     return (
@@ -435,6 +470,15 @@ export default function AdminPage() {
               label="Audit actions"
               value={recentAudit.length}
               sub="last 10 entries loaded"
+            />
+            <StatCard
+              label="Failed absorptions"
+              value={absorptionFailures24h}
+              sub={
+                absorptionFailures24h > 0
+                  ? "investigate in audit log"
+                  : "steady state"
+              }
             />
           </div>
 
@@ -818,7 +862,7 @@ export default function AdminPage() {
               </div>
 
               {/* Coming soon placeholders */}
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
                 {["Failed Auth Attempts", "Rate Limit Violations", "Geo-Block Events"].map((section) => (
                   <div
                     key={section}
@@ -835,6 +879,103 @@ export default function AdminPage() {
                     <div className="text-2xl font-bold text-slate-600">\u2014</div>
                   </div>
                 ))}
+              </div>
+
+              {/* Absorption reaper — Track 2 Chunk 2.6 */}
+              <div className="bg-slate-900 border border-slate-800 rounded-lg p-5">
+                <div className="flex items-center justify-between mb-3">
+                  <div>
+                    <h3 className="text-sm font-semibold">
+                      Absorption Reaper
+                    </h3>
+                    <p className="text-xs text-slate-500 mt-1 max-w-xl">
+                      Walks streaming vaults committed in the window and
+                      re-runs the full-shard BLAKE3 absorption check.
+                      Catches first-hour bit-rot. Failures are logged to
+                      the audit stream as `shard_absorption_failed`.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={reaperRunning}
+                    onClick={async () => {
+                      setReaperRunning(true);
+                      setReaperResult(null);
+                      try {
+                        const res = await postAdmin("/admin/reaper/scan");
+                        setReaperResult(res);
+                      } catch (e) {
+                        setError(e instanceof Error ? e.message : String(e));
+                      } finally {
+                        setReaperRunning(false);
+                      }
+                    }}
+                    className={`px-4 py-2 rounded text-sm font-medium ${
+                      reaperRunning
+                        ? "bg-slate-800 text-slate-500"
+                        : "bg-amber-500 text-slate-900 hover:bg-amber-400"
+                    }`}
+                  >
+                    {reaperRunning ? "Scanning\u2026" : "Run scan"}
+                  </button>
+                </div>
+                {reaperResult && (
+                  <div className="mt-4 text-sm">
+                    <div className="grid grid-cols-4 gap-3 mb-3">
+                      <StatCard
+                        label="Considered"
+                        value={reaperResult.considered}
+                      />
+                      <StatCard
+                        label="Checked"
+                        value={reaperResult.checked}
+                      />
+                      <StatCard
+                        label="Passed"
+                        value={reaperResult.passed}
+                      />
+                      <StatCard
+                        label="Failed"
+                        value={reaperResult.failed.length}
+                        sub={
+                          reaperResult.failed.length > 0
+                            ? "investigate"
+                            : "steady state"
+                        }
+                      />
+                    </div>
+                    {reaperResult.failed.length > 0 ? (
+                      <div className="bg-red-950/30 border border-red-800 rounded p-3">
+                        <h4 className="text-xs uppercase tracking-wider text-red-300 mb-2">
+                          Failed absorptions
+                        </h4>
+                        <ul className="space-y-1 font-mono text-xs">
+                          {reaperResult.failed.map((f) => (
+                            <li key={f.asset_id}>
+                              <span className="text-red-300">
+                                {f.asset_id}
+                              </span>{" "}
+                              — {f.reason} · shards{" "}
+                              {f.failed_shard_indices.join(", ")}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : (
+                      <p className="text-green-400 text-xs">
+                        \u2713 All checked vaults passed absorption.
+                      </p>
+                    )}
+                    {Object.keys(reaperResult.skipped_reasons).length > 0 && (
+                      <p className="text-xs text-slate-500 mt-2">
+                        Skipped:{" "}
+                        {Object.entries(reaperResult.skipped_reasons)
+                          .map(([k, v]) => `${k}=${v}`)
+                          .join(", ")}
+                      </p>
+                    )}
+                  </div>
+                )}
               </div>
             </>
           )}
