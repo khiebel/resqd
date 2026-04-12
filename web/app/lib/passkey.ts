@@ -274,7 +274,7 @@ export async function ensureRingPrivkey(
  *    happen in practice — would mean the master key rotated, which we
  *    don't support). Logs a warning and continues without identity.
  */
-async function ensureIdentity(masterKey: Uint8Array): Promise<void> {
+export async function ensureIdentity(masterKey: Uint8Array): Promise<void> {
   try {
     const crypto = await getCrypto();
 
@@ -436,14 +436,10 @@ export async function registerWithPasskey(email: string): Promise<SessionUser> {
   })) as PublicKeyCredential | null;
   if (!cred) throw new Error("passkey creation was cancelled");
 
-  const prfKey = extractPrfKey(cred);
-  if (!prfKey) {
-    throw new Error(
-      "your authenticator does not support the PRF extension — try a platform authenticator (Touch ID, Windows Hello) in Chrome or Safari",
-    );
-  }
-  saveMasterKey(prfKey);
-
+  // Always complete registration/finish so the server creates the
+  // user row and issues a session cookie, regardless of whether PRF
+  // came back. iPhone Safari can't produce a PRF output — if we
+  // bailed out here we'd strand the account without a session.
   const finishResp = await fetch(`${API_URL}/auth/register/finish`, {
     method: "POST",
     credentials: "include",
@@ -455,11 +451,37 @@ export async function registerWithPasskey(email: string): Promise<SessionUser> {
   });
   if (!finishResp.ok) throw new Error(await readError(finishResp));
   const session = (await finishResp.json()) as SessionUser;
-  await ensureIdentity(prfKey);
+
+  // Best-effort PRF. If the authenticator returned a PRF output, we
+  // use it as the master key and mint the X25519 identity right
+  // away. If not (iPhone Safari), we leave the master key unset and
+  // let the signup page route into the passphrase-setup flow, which
+  // will generate a fresh random master key and wrap it under a
+  // user-chosen passphrase.
+  const prfKey = extractPrfKey(cred);
+  if (prfKey) {
+    saveMasterKey(prfKey);
+    await ensureIdentity(prfKey);
+  }
+
   return session;
 }
 
-/** Log in with an existing passkey. */
+/** Log in with an existing passkey.
+ *
+ * PRF is best-effort: if the authenticator returns a PRF output we
+ * stash it as the master key and run `ensureIdentity`. If not (the
+ * iOS Safari case), the ceremony still completes server-side and
+ * issues a session cookie, but the master key is NOT populated.
+ * The caller should check `loadMasterKey()` after this returns and
+ * fall through to a passphrase prompt via `fetchRecoveryBlob()` +
+ * `unwrapMasterKey()` if the master key is missing.
+ *
+ * Previously this threw on missing PRF, which prevented iPhone
+ * users from ever getting a session cookie — they couldn't reach
+ * the passphrase fallback path because the ceremony bailed out
+ * before `login/finish` was called.
+ */
 export async function loginWithPasskey(email: string): Promise<SessionUser> {
   if (!isPasskeySupported()) {
     throw new Error("passkeys are not supported in this browser");
@@ -486,12 +508,9 @@ export async function loginWithPasskey(email: string): Promise<SessionUser> {
   })) as PublicKeyCredential | null;
   if (!cred) throw new Error("passkey login was cancelled");
 
-  const prfKey = extractPrfKey(cred);
-  if (!prfKey) {
-    throw new Error("your authenticator did not return a PRF output");
-  }
-  saveMasterKey(prfKey);
-
+  // Always run login/finish first so the server issues a session
+  // cookie regardless of whether PRF was available. Without the
+  // session cookie, the client can't download the recovery blob.
   const finishResp = await fetch(`${API_URL}/auth/login/finish`, {
     method: "POST",
     credentials: "include",
@@ -503,7 +522,17 @@ export async function loginWithPasskey(email: string): Promise<SessionUser> {
   });
   if (!finishResp.ok) throw new Error(await readError(finishResp));
   const session = (await finishResp.json()) as SessionUser;
-  await ensureIdentity(prfKey);
+
+  // Best-effort PRF. If the authenticator returned a PRF output,
+  // stash it as the master key and mint the X25519 identity on
+  // demand. Otherwise, leave the master key alone and let the
+  // caller handle the passphrase fallback.
+  const prfKey = extractPrfKey(cred);
+  if (prfKey) {
+    saveMasterKey(prfKey);
+    await ensureIdentity(prfKey);
+  }
+
   return session;
 }
 
