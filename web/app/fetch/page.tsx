@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useCallback, useEffect, useState } from "react";
+import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import {
@@ -22,11 +22,48 @@ type FetchState =
   | { phase: "downloading-shards"; done: number; total: number }
   | { phase: "reconstructing" }
   | { phase: "decrypting" }
+  // Streaming-mode assets pause here after the manifest has been
+  // decrypted but before any shards are fetched. We need a user
+  // gesture to call `showSaveFilePicker` (File System Access API),
+  // so the download waits until the user clicks "Save to disk."
+  // The streaming context is carried via a ref, not state, to
+  // avoid serializing WASM handles and large byte buffers through
+  // React state. See `streamingCtxRef`.
+  | {
+      phase: "metadata-ready";
+      name: string | null;
+      mime: string | null;
+      size: number;
+      totalGroups: number;
+    }
+  // Per-group progress during range-based streaming download.
+  // `current` counts groups processed (0-indexed during fetch,
+  // last group when complete). `bytesWritten` tracks plaintext
+  // bytes delivered to the sink.
+  | {
+      phase: "streaming-group";
+      current: number;
+      total: number;
+      bytesWritten: number;
+      sinkKind: "fsa" | "memory";
+    }
   | {
       phase: "done";
       bytes: Uint8Array;
       name: string | null;
       mime: string | null;
+      sequence: string | null;
+      canaryHash: string | null;
+    }
+  // Streamed directly to disk via File System Access API. No
+  // plaintext in memory — just confirmation + metadata. Distinct
+  // phase from `done` so the UI can skip the in-memory preview and
+  // Blob download button.
+  | {
+      phase: "done-streamed";
+      name: string | null;
+      mime: string | null;
+      size: number;
       sequence: string | null;
       canaryHash: string | null;
     }
@@ -77,6 +114,89 @@ interface ShardedFetchResponse {
   uploader_pubkey_x25519_b64?: string;
 }
 
+/**
+ * Minimal WASM streaming decoder/decryptor types the fetch page
+ * uses. These live on the same module the positive fetch path
+ * already casts through, so we re-declare them here to keep the
+ * range-based download self-contained.
+ */
+interface WasmStreamDecoder {
+  decodeGroup: (shardsJson: string) => Uint8Array;
+  finish: () => void;
+}
+interface WasmStreamDecryptor {
+  openChunk: (sealedJson: string) => Uint8Array;
+  finish: () => void;
+}
+
+/**
+ * Everything `streamDownload()` needs to pick up where the manifest
+ * fetch left off. Held in a `useRef` (not state) because some of
+ * these fields are WASM handles or large byte buffers that don't
+ * belong in the React render graph, and because we need synchronous
+ * access when the user clicks "Save to disk" — the handler must
+ * call `showSaveFilePicker` before hitting its first `await` to
+ * preserve user activation.
+ */
+interface StreamingContext {
+  manifest: ShardedFetchResponse;
+  decoder: WasmStreamDecoder;
+  decryptor: WasmStreamDecryptor;
+  groups: { data_len: number; shard_size: number; input_hash: number[] }[];
+  sequence: string | null;
+  canaryHash: string | null;
+  name: string | null;
+  mime: string | null;
+}
+
+/**
+ * Fetch a half-open byte range `[start, end)` from a presigned
+ * S3 URL. Returns the raw bytes. S3 returns `206 Partial Content`
+ * on success; we accept `200` too because a whole-object GET is a
+ * valid fallback if the server ignores the Range header for any
+ * reason.
+ *
+ * AWS signs presigned URLs based on the canonical resource and
+ * method — NOT the Range header — so adding a Range header to a
+ * signed GET is always valid. The signature survives.
+ */
+async function rangeGetShard(
+  downloadUrl: string,
+  start: number,
+  end: number,
+): Promise<Uint8Array> {
+  const resp = await fetch(downloadUrl, {
+    headers: { Range: `bytes=${start}-${end - 1}` },
+  });
+  if (!resp.ok && resp.status !== 206) {
+    throw new Error(`range GET ${start}-${end - 1} -> ${resp.status}`);
+  }
+  return new Uint8Array(await resp.arrayBuffer());
+}
+
+/** Feature-detect File System Access API (Chrome, Edge, Opera).
+ *  Returns false in Firefox + Safari as of 2026-04.
+ *
+ *  Also honors a `window.__resqdForceMemorySink` test escape hatch
+ *  so headless Chromium — where `showSaveFilePicker` exists but has
+ *  no UI to display the picker — can exercise the in-memory
+ *  fallback path deterministically. Setting the flag in a Playwright
+ *  `addInitScript` forces the memory path without affecting
+ *  production users. */
+function hasFsaApi(): boolean {
+  if (typeof window === "undefined") return false;
+  if (
+    (window as unknown as { __resqdForceMemorySink?: boolean })
+      .__resqdForceMemorySink
+  ) {
+    return false;
+  }
+  return (
+    typeof (window as unknown as { showSaveFilePicker?: unknown })
+      .showSaveFilePicker === "function"
+  );
+}
+
 /** Unwrap the {v:1, name, mime} plaintext frame the upload page writes. */
 function unwrapFrame(plaintext: Uint8Array): {
   body: Uint8Array;
@@ -113,6 +233,13 @@ function FetchInner() {
   const params = useSearchParams();
   const [assetId, setAssetId] = useState(params.get("id") || "");
   const [state, setState] = useState<FetchState>({ phase: "idle" });
+
+  // Streaming download context. Populated by `fetchAndDecrypt()`
+  // for sharded-stream assets after the manifest is decrypted;
+  // consumed by `streamDownload()` when the user clicks "Save to
+  // disk." Using a ref instead of state keeps WASM handles out of
+  // React's render graph.
+  const streamingCtxRef = useRef<StreamingContext | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -274,55 +401,18 @@ function FetchInner() {
           const mime: string | null =
             typeof metaJson.mime === "string" ? metaJson.mime : null;
 
-          // Download all six shards in parallel. The MVP holds them
-          // all in memory; a future pass can switch to per-group
-          // range requests to bound memory for multi-GB files.
-          const total = manifest.shards.length;
-          let done = 0;
-          setState({ phase: "downloading-shards", done, total });
-          const shardBytes: (Uint8Array | null)[] = await Promise.all(
-            manifest.shards.map(async (slot) => {
-              if (!slot.download_url) return null;
-              try {
-                const r = await fetch(slot.download_url);
-                if (!r.ok) throw new Error(`${r.status}`);
-                const bytes = new Uint8Array(await r.arrayBuffer());
-                done += 1;
-                setState({ phase: "downloading-shards", done, total });
-                return bytes;
-              } catch (e) {
-                console.warn(`shard ${slot.index} failed:`, e);
-                return null;
-              }
-            }),
-          );
-          const presentCount = shardBytes.filter((s) => s !== null).length;
-          if (presentCount < manifest.data_shards) {
-            throw new Error(
-              `only ${presentCount}/${manifest.data_shards} required shards available`,
-            );
-          }
-
-          setState({ phase: "reconstructing" });
-          // The WASM streaming decoder + decryptor constructors take
-          // JSON strings that serde emits for StreamManifest and
-          // StreamHeader — we received them verbatim in
-          // `manifest.stream_info`. The existing `getCrypto()` helper
-          // already loaded the WASM module; the streaming classes
-          // hang off the same module exports, so cast through
-          // `unknown` to get them.
+          // Build the WASM decoder + decryptor once, up front, so
+          // the user-gesture path in `streamDownload()` can go
+          // straight into per-group range fetches without any
+          // async construction in the critical showSaveFilePicker
+          // window. These objects own internal WASM state — pass
+          // them through the ref, not React state.
           const wasm = crypto as unknown as {
-            WasmStreamDecoder: new (manifestJson: string) => {
-              decodeGroup: (shardsJson: string) => Uint8Array;
-              finish: () => void;
-            };
+            WasmStreamDecoder: new (manifestJson: string) => WasmStreamDecoder;
             WasmStreamDecryptor: new (
               key: Uint8Array,
               headerJson: string,
-            ) => {
-              openChunk: (sealedJson: string) => Uint8Array;
-              finish: () => void;
-            };
+            ) => WasmStreamDecryptor;
           };
           const decoder = new wasm.WasmStreamDecoder(
             JSON.stringify(manifest.stream_info.stream_manifest),
@@ -337,53 +427,36 @@ function FetchInner() {
             stream_id_b64: bytesToBase64(sidBytes),
             chunk_size: manifest.stream_info.stream_header.chunk_size,
           });
-          const decryptor = new wasm.WasmStreamDecryptor(assetKey, headerForWasm);
+          const decryptor = new wasm.WasmStreamDecryptor(
+            assetKey,
+            headerForWasm,
+          );
 
-          // Iterate groups in order. Each group's shard slice is
-          // `shard_size` bytes long at `offset` = sum of prior groups'
-          // shard sizes. The erasure decoder accepts a JSON array of
-          // 6 base64 strings (or nulls for missing shards) — we
-          // convert here.
           const groups = manifest.stream_info.stream_manifest.groups;
-          const plaintextChunks: Uint8Array[] = [];
-          let totalPlaintextLen = 0;
-          let offset = 0;
-          for (let g = 0; g < groups.length; g++) {
-            const gSize = groups[g].shard_size;
-            const isLast = g === groups.length - 1;
-            const slice: (string | null)[] = shardBytes.map((s) => {
-              if (!s) return null;
-              return bytesToBase64(s.subarray(offset, offset + gSize));
-            });
-            offset += gSize;
 
-            const ciphertext = decoder.decodeGroup(JSON.stringify(slice));
-            const sealedJson = JSON.stringify({
-              counter: g,
-              is_last: isLast,
-              ciphertext_b64: bytesToBase64(new Uint8Array(ciphertext)),
-            });
-            const plaintextChunk = decryptor.openChunk(sealedJson);
-            plaintextChunks.push(new Uint8Array(plaintextChunk));
-            totalPlaintextLen += plaintextChunk.length;
-          }
-          decryptor.finish();
-
-          // Stitch together the per-group plaintext slices.
-          const plainFull = new Uint8Array(totalPlaintextLen);
-          let writeOff = 0;
-          for (const chunk of plaintextChunks) {
-            plainFull.set(chunk, writeOff);
-            writeOff += chunk.length;
-          }
-
-          setState({
-            phase: "done",
-            bytes: plainFull,
-            name,
-            mime,
+          // Stash everything `streamDownload()` will need and
+          // hand control back to the UI. The user must click
+          // "Save to disk" or "Download to memory" to proceed —
+          // this is a deliberate pause so the eventual
+          // `showSaveFilePicker` call lands in a user-activation
+          // context (Chrome refuses to open a Save As dialog
+          // without one).
+          streamingCtxRef.current = {
+            manifest,
+            decoder,
+            decryptor,
+            groups,
             sequence,
             canaryHash,
+            name,
+            mime,
+          };
+          setState({
+            phase: "metadata-ready",
+            name,
+            mime,
+            size: manifest.original_len,
+            totalGroups: groups.length,
           });
           return;
         }
@@ -462,6 +535,227 @@ function FetchInner() {
     URL.revokeObjectURL(url);
   }, [state, assetId]);
 
+  /**
+   * Range-based streaming download for sharded-stream assets.
+   *
+   * Call site must be a user gesture (click handler) — the first
+   * `await` in this function is `handle.createWritable()`, which
+   * only gets user activation if the preceding
+   * `window.showSaveFilePicker()` call is synchronous with the
+   * click. If you add more work before the picker call, Chrome
+   * will reject the picker with `NotAllowedError: Must be
+   * handling a user gesture`. Watch for that if you refactor.
+   *
+   * Peak memory during this path is bounded to one group × 6
+   * shards in raw shard bytes, plus the single plaintext chunk
+   * being written, plus whatever buffering the File System
+   * Access writable does internally. For a typical 64 KB chunk
+   * size and 6-way RS, that's well under 100 MB regardless of
+   * the total file size.
+   *
+   * Falls back to in-memory accumulation + Blob download when
+   * the File System Access API is unavailable (Firefox, Safari
+   * as of 2026-04). The fallback path still benefits from
+   * range-based fetches because each group's raw shard bytes are
+   * discarded after decoding, capping shard-side peak memory.
+   * The plaintext accumulator still grows to the full file size,
+   * which matches current fetch behavior.
+   */
+  const streamDownload = useCallback(async () => {
+    const ctx = streamingCtxRef.current;
+    if (!ctx) {
+      setState({
+        phase: "error",
+        message: "streaming context missing — reload the page and try again",
+      });
+      return;
+    }
+
+    // Critical: call `showSaveFilePicker` synchronously from the
+    // click handler before any await, so user activation survives.
+    let writable:
+      | {
+          write: (data: Uint8Array) => Promise<void>;
+          close: () => Promise<void>;
+          abort: () => Promise<void>;
+        }
+      | null = null;
+    let sinkKind: "fsa" | "memory" = "memory";
+
+    if (hasFsaApi()) {
+      try {
+        const picker = (
+          window as unknown as {
+            showSaveFilePicker: (opts: {
+              suggestedName?: string;
+              types?: unknown;
+            }) => Promise<{
+              createWritable: () => Promise<{
+                write: (data: Uint8Array) => Promise<void>;
+                close: () => Promise<void>;
+                abort: () => Promise<void>;
+              }>;
+            }>;
+          }
+        ).showSaveFilePicker;
+        const handle = await picker({
+          suggestedName:
+            ctx.name || `resqd-${assetId.slice(0, 8)}.bin`,
+        });
+        writable = await handle.createWritable();
+        sinkKind = "fsa";
+      } catch (err) {
+        // User cancelled the Save As dialog → transition back to
+        // metadata-ready so they can retry without losing the
+        // decrypted metadata.
+        if (err instanceof DOMException && err.name === "AbortError") {
+          setState({
+            phase: "metadata-ready",
+            name: ctx.name,
+            mime: ctx.mime,
+            size: ctx.manifest.original_len,
+            totalGroups: ctx.groups.length,
+          });
+          return;
+        }
+        // Other picker errors (e.g. SecurityError because we lost
+        // user activation) fall through to the memory path so the
+        // download still works.
+        console.warn("showSaveFilePicker unavailable, using memory sink:", err);
+      }
+    }
+
+    try {
+      const plaintextChunks: Uint8Array[] = sinkKind === "memory" ? [] : [];
+      let bytesWritten = 0;
+      let offset = 0;
+
+      setState({
+        phase: "streaming-group",
+        current: 0,
+        total: ctx.groups.length,
+        bytesWritten: 0,
+        sinkKind,
+      });
+
+      for (let g = 0; g < ctx.groups.length; g++) {
+        const gSize = ctx.groups[g].shard_size;
+        const isLast = g === ctx.groups.length - 1;
+        const rangeStart = offset;
+        const rangeEnd = offset + gSize;
+
+        // Fetch this group's slice from each shard in parallel.
+        // A failure on up to `parity_shards` shards is tolerable
+        // because Reed-Solomon can reconstruct from any 4 of 6
+        // — we pass nulls for missing slices and the WASM
+        // decoder handles the gaps.
+        const shardSlices: (Uint8Array | null)[] = await Promise.all(
+          ctx.manifest.shards.map(async (slot) => {
+            if (!slot.download_url) return null;
+            try {
+              return await rangeGetShard(
+                slot.download_url,
+                rangeStart,
+                rangeEnd,
+              );
+            } catch (e) {
+              console.warn(
+                `shard ${slot.index} group ${g} range fetch failed:`,
+                e,
+              );
+              return null;
+            }
+          }),
+        );
+
+        const present = shardSlices.filter((s) => s !== null).length;
+        if (present < ctx.manifest.data_shards) {
+          throw new Error(
+            `group ${g}: only ${present}/${ctx.manifest.data_shards} shards available`,
+          );
+        }
+
+        const sliceJson: (string | null)[] = shardSlices.map((s) =>
+          s ? bytesToBase64(s) : null,
+        );
+        const ciphertext = ctx.decoder.decodeGroup(JSON.stringify(sliceJson));
+        const sealedJson = JSON.stringify({
+          counter: g,
+          is_last: isLast,
+          ciphertext_b64: bytesToBase64(new Uint8Array(ciphertext)),
+        });
+        const plaintextChunk = new Uint8Array(
+          ctx.decryptor.openChunk(sealedJson),
+        );
+
+        if (sinkKind === "fsa" && writable) {
+          await writable.write(plaintextChunk);
+        } else {
+          plaintextChunks.push(plaintextChunk);
+        }
+        bytesWritten += plaintextChunk.length;
+        offset += gSize;
+
+        setState({
+          phase: "streaming-group",
+          current: g + 1,
+          total: ctx.groups.length,
+          bytesWritten,
+          sinkKind,
+        });
+      }
+
+      ctx.decryptor.finish();
+      ctx.decoder.finish();
+
+      if (sinkKind === "fsa" && writable) {
+        await writable.close();
+        setState({
+          phase: "done-streamed",
+          name: ctx.name,
+          mime: ctx.mime,
+          size: bytesWritten,
+          sequence: ctx.sequence,
+          canaryHash: ctx.canaryHash,
+        });
+      } else {
+        // In-memory assembly for browsers without File System
+        // Access API. Behavior matches the pre-range code path
+        // as far as the user can see — one Blob at the end,
+        // click Download — but shard memory is now bounded to
+        // the last group.
+        const plainFull = new Uint8Array(bytesWritten);
+        let writeOff = 0;
+        for (const chunk of plaintextChunks) {
+          plainFull.set(chunk, writeOff);
+          writeOff += chunk.length;
+        }
+        setState({
+          phase: "done",
+          bytes: plainFull,
+          name: ctx.name,
+          mime: ctx.mime,
+          sequence: ctx.sequence,
+          canaryHash: ctx.canaryHash,
+        });
+      }
+    } catch (err) {
+      // Best-effort abort the writable so we don't leave a
+      // half-written file on disk when the download errors out.
+      if (writable) {
+        try {
+          await writable.abort();
+        } catch {
+          // Swallow — we're already in the error path.
+        }
+      }
+      setState({
+        phase: "error",
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }, [assetId]);
+
   const preview =
     state.phase === "done" && state.bytes.length < 4096
       ? new TextDecoder("utf-8", { fatal: false }).decode(state.bytes)
@@ -526,6 +820,88 @@ function FetchInner() {
         )}
         {state.phase === "decrypting" && (
           <p className="text-slate-400 text-sm">Decrypting in browser…</p>
+        )}
+        {state.phase === "metadata-ready" && (
+          <div className="space-y-3 text-sm">
+            <p className="text-green-400">
+              ✓ metadata decrypted — ready to stream
+            </p>
+            {state.name && (
+              <p className="text-xs text-slate-400">
+                filename:{" "}
+                <span className="font-mono text-amber-300">{state.name}</span>
+                {state.mime && (
+                  <span className="text-slate-500"> ({state.mime})</span>
+                )}
+              </p>
+            )}
+            <p className="text-xs text-slate-400">
+              size:{" "}
+              <span className="font-mono text-amber-300">
+                {state.size.toLocaleString()}
+              </span>{" "}
+              bytes in {state.totalGroups} group
+              {state.totalGroups === 1 ? "" : "s"}
+            </p>
+            <p className="text-xs text-slate-500 leading-relaxed">
+              Large files stream to disk group by group so your browser
+              tab never holds the whole file in memory at once.
+              {hasFsaApi()
+                ? " Click below to pick a save location."
+                : " This browser doesn't support streaming to disk — the file will be assembled in memory and offered as a download at the end."}
+            </p>
+            <button
+              onClick={streamDownload}
+              className="rounded-lg bg-amber-500 text-slate-900 font-semibold px-5 py-2 text-sm"
+            >
+              {hasFsaApi() ? "Save to disk…" : "Download to memory"}
+            </button>
+          </div>
+        )}
+        {state.phase === "streaming-group" && (
+          <div className="space-y-2 text-sm">
+            <p className="text-slate-400">
+              {state.sinkKind === "fsa"
+                ? "Streaming to disk"
+                : "Assembling in memory"}{" "}
+              — group {state.current}/{state.total}
+            </p>
+            <div className="h-1 bg-slate-800 rounded overflow-hidden">
+              <div
+                className="h-full bg-amber-500 transition-all"
+                style={{
+                  width: `${Math.round(
+                    (state.current / Math.max(1, state.total)) * 100,
+                  )}%`,
+                }}
+              />
+            </div>
+            <p className="text-xs text-slate-500 font-mono">
+              {state.bytesWritten.toLocaleString()} bytes written
+            </p>
+          </div>
+        )}
+        {state.phase === "done-streamed" && (
+          <div className="space-y-3 text-sm">
+            <p className="text-green-400">
+              ✓ streamed {state.size.toLocaleString()} bytes to disk
+            </p>
+            {state.name && (
+              <p className="text-xs text-slate-400">
+                filename:{" "}
+                <span className="font-mono text-amber-300">{state.name}</span>
+                {state.mime && (
+                  <span className="text-slate-500"> ({state.mime})</span>
+                )}
+              </p>
+            )}
+            <p className="text-xs text-slate-400">
+              canary sequence after rotation:{" "}
+              <span className="font-mono text-amber-300">
+                {state.sequence}
+              </span>
+            </p>
+          </div>
         )}
         {state.phase === "error" && (
           <p className="text-red-400 text-sm">Error: {state.message}</p>

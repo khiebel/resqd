@@ -200,6 +200,18 @@ async function main() {
     // app.resqd.ai, though unused here). api.resqd.ai is `bypass`
     // mode and doesn't need them.
   });
+
+  // Force the memory-sink fallback on the fetch page's range-based
+  // streaming download. Headless Chromium ships `showSaveFilePicker`
+  // but has no UI to render its dialog, so a direct call would hang
+  // or throw. The escape hatch in `web/app/fetch/page.tsx::hasFsaApi`
+  // lets the test skip the File System Access API path and exercise
+  // the in-memory assembly path instead — which is what Firefox and
+  // Safari users get anyway, so it's still a real production code
+  // path, just not the Chrome happy path.
+  await context.addInitScript(() => {
+    window.__resqdForceMemorySink = true;
+  });
   await context.route("**/*", async (route) => {
     const url = route.request().url();
     const host = new URL(url).hostname;
@@ -336,18 +348,40 @@ async function main() {
     waitUntil: "networkidle",
   });
 
-  // Wait for decoded download to be ready; the page transitions to
-  // phase=done and offers a "Download" button.
-  log("fetch", "waiting for decrypt to finish (up to 5 minutes)");
-  await page.locator("text=/Downloaded|Decrypted|Save|Download/i").first().waitFor({ timeout: 5 * 60_000 });
+  // Post-range-download rewrite (2026-04-11): the fetch page now
+  // pauses at `metadata-ready` for streaming-mode assets before
+  // any shards are downloaded, waiting for a user gesture. Click
+  // the "Download to memory" button (which the
+  // __resqdForceMemorySink init script forces the UI to show in
+  // place of "Save to disk") to kick off the range-based group
+  // loop.
+  log("fetch", "waiting for metadata-ready phase");
+  await page
+    .locator("text=/metadata decrypted/i")
+    .first()
+    .waitFor({ timeout: 30_000 });
+  log("fetch", "clicking Download to memory to start streaming-group loop");
+  await page
+    .getByRole("button", { name: /download to memory/i })
+    .first()
+    .click();
 
-  // Extract the decrypted bytes via JS — the fetch page stores
-  // plaintextBytes in React state; we'll grab them via a
-  // purpose-built window hook. Simpler: use the download button and
-  // let Playwright capture the file.
+  // The streaming-group phase advances one group at a time; wait
+  // for phase=done which puts the plaintext Blob behind a
+  // Download button. This can take several minutes for large
+  // files because each group is a sequential Reed-Solomon decode
+  // + XChaCha20 decrypt step.
+  log("fetch", "waiting for ✓ decrypted (up to 5 minutes)");
+  await page
+    .locator("text=/✓ decrypted/i")
+    .first()
+    .waitFor({ timeout: 5 * 60_000 });
+
+  // Now click the Blob Download button and let Playwright capture
+  // the file.
   const [dl] = await Promise.all([
     page.waitForEvent("download", { timeout: 60_000 }),
-    page.getByRole("button", { name: /download/i }).first().click(),
+    page.getByRole("button", { name: /^Download$/ }).first().click(),
   ]);
 
   const outPath = path.join(__dirname, "test-output", "roundtrip-output.bin");
