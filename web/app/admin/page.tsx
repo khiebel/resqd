@@ -201,9 +201,21 @@ export default function AdminPage() {
   } | null>(null);
 
   const fetchAdmin = useCallback(async (path: string) => {
-    const resp = await fetch(`${ADMIN_API_URL}${path}`, {
-      credentials: "include",
-    });
+    let resp: Response;
+    try {
+      resp = await fetch(`${ADMIN_API_URL}${path}`, {
+        credentials: "include",
+      });
+    } catch {
+      // TypeError from CORS failure — CF Access on api.resqd.ai/admin
+      // tried to redirect to cloudflareaccess.com which doesn't have
+      // the right CORS headers.  Bounce through the Worker to establish
+      // the CF_Authorization cookie via SSO, then come back.
+      const bounceUrl = `${ADMIN_API_URL}/admin/bounce?return_url=${encodeURIComponent(window.location.href)}`;
+      window.location.href = bounceUrl;
+      // Hang so no further fetches fire while navigating away.
+      return new Promise(() => {});
+    }
     if (resp.status === 403) {
       throw new Error("admin access denied \u2014 your email is not in the admin list");
     }

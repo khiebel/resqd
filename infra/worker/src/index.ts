@@ -17,6 +17,21 @@ export interface Env {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+
+    // Admin auth bounce — by the time we reach this handler, CF Access
+    // has already authenticated the user and set the CF_Authorization
+    // cookie on api.resqd.ai.  Just redirect back to the admin page so
+    // subsequent cross-origin fetches carry the cookie.
+    if (url.pathname === "/admin/bounce") {
+      const returnUrl =
+        url.searchParams.get("return_url") || "https://resqd.ai/admin/";
+      // Only allow redirects to resqd.ai origins.
+      if (!returnUrl.startsWith("https://resqd.ai/")) {
+        return new Response("invalid return_url", { status: 400 });
+      }
+      return Response.redirect(returnUrl, 302);
+    }
+
     url.hostname = env.UPSTREAM_HOST;
     url.protocol = "https:";
     url.port = "";
